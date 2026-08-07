@@ -1,0 +1,25 @@
+# Maven, Cargo, and local reference-server outputs
+target/
+bin/
+dev/references/go/server
+dev/tools/mixedload/mixedload
+
+# Historical locally built native dependencies. These are ignored and are not
+# inputs to Cardigan's build or release process.
+.deps/
+
+# Profiling and crash diagnostics
+perf.data*
+*.jfr
+cardigan_jit.log
+server_stdout.log
+hs_err_pid*
+replay_pid*
+
+# Generated benchmark client files retained by interrupted legacy runs
+post.lua
+
+# Python smoke-test cache
+__pycache__/
+*.py[cod]
+*.swp

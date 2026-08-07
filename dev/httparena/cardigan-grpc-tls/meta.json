@@ -1,0 +1,16 @@
+{
+  "display_name": "Cardigan",
+  "language": "Java",
+  "type": "engine",
+  "engine": "io_uring",
+  "description": "Cardigan's direct gRPC wire engine over OpenSSL/Panama TLS 1.3 and HTTP/2.",
+  "repo": "https://github.com/phjeltman/cardigan",
+  "enabled": true,
+  "tests": [
+    "unary-grpc-tls",
+    "stream-grpc-tls"
+  ],
+  "maintainers": [
+    "per"
+  ]
+}

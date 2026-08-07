@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>dev.cardigan.internal</groupId>
+    <artifactId>cardigan-development</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>Cardigan development workspace</name>
+
+    <properties>
+        <maven.deploy.skip>true</maven.deploy.skip>
+    </properties>
+
+    <!--
+        This reactor exists only for contributors. The framework project is
+        deliberately outside the development hierarchy and is the sole
+        Maven Central artifact.
+    -->
+    <modules>
+        <module>..</module>
+        <module>example-server</module>
+        <module>benchmarks</module>
+        <module>httparena</module>
+    </modules>
+</project>

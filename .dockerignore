@@ -1,0 +1,15 @@
+.git
+.deps
+.debug
+target
+**/target
+dev/references
+perf.data*
+**/perf.data*
+*.jfr
+*.log
+server_stdout.log
+hs_err_pid*
+replay_pid*
+__pycache__
+*.pyc
