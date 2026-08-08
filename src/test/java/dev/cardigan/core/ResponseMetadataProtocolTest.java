@@ -106,6 +106,36 @@ class ResponseMetadataProtocolTest {
     }
 
     @Test
+    void writesKnownLengthStreamingBodyAndTrailers()
+            throws Exception {
+        try (Socket socket = connectHttp2()) {
+            OutputStream output = socket.getOutputStream();
+            output.write(frame(
+                Http2Frames.HEADERS,
+                Http2Frames.FLAG_END_HEADERS | Http2Frames.FLAG_END_STREAM,
+                1,
+                getBlock("/known-stream-metadata")));
+            output.flush();
+
+            Frame headers = readFrame(socket.getInputStream());
+            Frame data = readFrame(socket.getInputStream());
+            Frame trailers = readFrame(socket.getInputStream());
+
+            assertEquals(Http2Frames.HEADERS, headers.type);
+            assertField(headers.payload, "x-stream", "known");
+            assertEquals(Http2Frames.DATA, data.type);
+            assertEquals(
+                "known-body",
+                new String(data.payload, StandardCharsets.UTF_8));
+            assertEquals(0, data.flags & Http2Frames.FLAG_END_STREAM);
+            assertEquals(Http2Frames.HEADERS, trailers.type);
+            assertTrue((trailers.flags & Http2Frames.FLAG_END_HEADERS) != 0);
+            assertTrue((trailers.flags & Http2Frames.FLAG_END_STREAM) != 0);
+            assertField(trailers.payload, "grpc-status", "0");
+        }
+    }
+
+    @Test
     void preservesMetadataAcrossUnknownLengthStreaming() throws Exception {
         try (Socket socket = new Socket("127.0.0.1", PORT)) {
             socket.setSoTimeout(4_000);
@@ -236,6 +266,34 @@ class ResponseMetadataProtocolTest {
                         return length;
                     }))
                 .withHeader("x-stream", "yes")
+                .withTrailer("grpc-status", "0");
+        }
+
+        @Get("/known-stream-metadata")
+        public Response knownStreamMetadata() {
+            byte[] bytes = "known-body".getBytes(StandardCharsets.UTF_8);
+            int[] offset = {0};
+            return Response.stream(
+                    "application/octet-stream",
+                    StreamingBody.of(bytes.length, destination -> {
+                        int remaining = bytes.length - offset[0];
+                        if (remaining == 0) {
+                            return -1;
+                        }
+                        int length = Math.min(
+                            Math.min(3, remaining),
+                            Math.toIntExact(destination.byteSize()));
+                        MemorySegment.copy(
+                            bytes,
+                            offset[0],
+                            destination,
+                            ValueLayout.JAVA_BYTE,
+                            0,
+                            length);
+                        offset[0] += length;
+                        return length;
+                    }))
+                .withHeader("x-stream", "known")
                 .withTrailer("grpc-status", "0");
         }
     }

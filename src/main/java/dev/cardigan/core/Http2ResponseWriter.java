@@ -39,6 +39,9 @@ final class Http2ResponseWriter {
     private static final int MAX_INLINE_CONTENT_TYPE_LENGTH = 192;
     private static final int MAX_RECORD_BUFFER_SIZE = 2 * 1024 * 1024;
     private static final int STREAM_QUEUE_FLUSH_BYTES = 64 * 1024;
+    private static final int COMPACT_NOT_APPLICABLE = 0;
+    private static final int COMPACT_SENT = 1;
+    private static final int COMPACT_FAILED = -1;
     private static final long STREAM_EOF = 1L << 32;
     private static final long STREAM_FAILURE = Long.MIN_VALUE;
     private static final long ASCII_HIGH_BITS = 0x8080_8080_8080_8080L;
@@ -192,6 +195,11 @@ final class Http2ResponseWriter {
         ResponseHeaders trailers = response.trailers();
         int bodyLength = body.length();
         try {
+            int compactResult = trySendCompactMetadataStreamingResponse(
+                streamId, response, body, bodyLength, trailers, flowControl);
+            if (compactResult != COMPACT_NOT_APPLICABLE) {
+                return compactResult == COMPACT_SENT;
+            }
             if (!sendMetadataHeaders(
                     streamId, response, bodyLength,
                     bodyLength == 0 && trailers.isEmpty())) {
@@ -245,6 +253,102 @@ final class Http2ResponseWriter {
         } finally {
             body.close();
         }
+    }
+
+    private int trySendCompactMetadataStreamingResponse(
+            int streamId,
+            Response response,
+            StreamingBody body,
+            int bodyLength,
+            ResponseHeaders trailers,
+            FlowControl flowControl) {
+        if (!body.hasKnownLength() || bodyLength <= 0 || trailers.isEmpty()
+            || bodyLength > peerMaxFrameSize
+            || response.contentType().length()
+                > MAX_INLINE_CONTENT_TYPE_LENGTH) {
+            return COMPACT_NOT_APPLICABLE;
+        }
+
+        long maximumLength = (long) bodyLength
+            + 3L * Http2Frames.HEADER_SIZE
+            + response.contentType().length()
+            + response.headers().byteSize()
+            + trailers.byteSize()
+            + 7L * (response.headers().size() + trailers.size())
+            + 32;
+        if (maximumLength > UringEventLoop.EGRESS_FRAME_SIZE) {
+            return COMPACT_NOT_APPLICABLE;
+        }
+
+        int reserved = flowControl.reserve(bodyLength);
+        if (reserved != bodyLength) {
+            flowControl.refund(reserved);
+            return reserved <= 0 && flowControl.cancelled()
+                ? COMPACT_FAILED
+                : COMPACT_NOT_APPLICABLE;
+        }
+
+        UringEventLoop loop = writer.eventLoop();
+        int egressId = loop.acquireEgressBuffer();
+        if (egressId < 0) {
+            flowControl.refund(bodyLength);
+            return COMPACT_NOT_APPLICABLE;
+        }
+
+        MemorySegment output = loop.getEgressBufferSegment(egressId);
+        int dataFrameOffset;
+        int dataOffset;
+        int trailerFrameOffset;
+        int totalLength;
+        try {
+            int headerBlockLength = HpackEncoder.writeResponseHeaders(
+                output,
+                Http2Frames.HEADER_SIZE,
+                response.statusCode(),
+                response.contentType(),
+                bodyLength,
+                response.headers());
+            dataFrameOffset = Http2Frames.HEADER_SIZE + headerBlockLength;
+            dataOffset = dataFrameOffset + Http2Frames.HEADER_SIZE;
+            trailerFrameOffset = dataOffset + bodyLength;
+            int trailerBlockLength = HpackEncoder.writeFields(
+                output,
+                trailerFrameOffset + Http2Frames.HEADER_SIZE,
+                trailers);
+            totalLength = trailerFrameOffset
+                + Http2Frames.HEADER_SIZE + trailerBlockLength;
+
+            Http2Frames.writeHeader(
+                output, 0, headerBlockLength, Http2Frames.HEADERS,
+                Http2Frames.FLAG_END_HEADERS, streamId);
+            Http2Frames.writeHeader(
+                output, dataFrameOffset, bodyLength, Http2Frames.DATA,
+                0, streamId);
+            Http2Frames.writeHeader(
+                output, trailerFrameOffset, trailerBlockLength,
+                Http2Frames.HEADERS,
+                Http2Frames.FLAG_END_HEADERS | Http2Frames.FLAG_END_STREAM,
+                streamId);
+
+            if (flowControl.cancelled()
+                || !fillStreamingBody(
+                    body, output.asSlice(dataOffset, bodyLength))
+                || flowControl.cancelled()) {
+                loop.releaseEgressBuffer(egressId);
+                flowControl.refund(bodyLength);
+                return COMPACT_FAILED;
+            }
+        } catch (Throwable failure) {
+            loop.releaseEgressBuffer(egressId);
+            flowControl.refund(bodyLength);
+            throw failure;
+        }
+
+        if (!writer.enqueue(egressId, totalLength)) {
+            flowControl.refund(bodyLength);
+            return COMPACT_FAILED;
+        }
+        return COMPACT_SENT;
     }
 
     private boolean sendMetadataUnknownStreaming(
