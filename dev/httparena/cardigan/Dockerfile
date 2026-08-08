@@ -2,13 +2,11 @@ FROM maven:3.9-eclipse-temurin-26 AS build
 
 WORKDIR /src
 COPY pom.xml ./
-COPY LICENSE THIRD_PARTY_NOTICES.md ./
-COPY LICENSES ./LICENSES
+RUN mvn -q -DskipTests dependency:go-offline
+COPY LICENSE ./
 COPY src ./src
-COPY dev/httparena/pom.xml ./dev/httparena/pom.xml
-COPY dev/httparena/src ./dev/httparena/src
-RUN mvn -q -DskipTests install
-RUN mvn -q -f dev/httparena/pom.xml -DskipTests package
+RUN mvn -q -DskipTests package dependency:copy-dependencies \
+    -DincludeScope=runtime -DoutputDirectory=/deps
 
 FROM eclipse-temurin:26-jre
 
@@ -20,8 +18,8 @@ ARG CARDIGAN_HTTPARENA_MODE=h1
 ENV CARDIGAN_HTTPARENA_MODE=${CARDIGAN_HTTPARENA_MODE}
 
 WORKDIR /app
-COPY --from=build /src/target/cardigan-0.1.0-alpha1.jar ./cardigan.jar
-COPY --from=build /src/dev/httparena/target/cardigan-httparena-0.1.0-SNAPSHOT.jar ./cardigan-httparena.jar
+COPY --from=build /src/target/cardigan-httparena.jar ./cardigan-httparena.jar
+COPY --from=build /deps ./lib
 
 EXPOSE 8080 8081 8082 8443
 
@@ -33,5 +31,5 @@ ENTRYPOINT ["java", \
     "-Xms512m", "-Xmx512m", \
     "-XX:MaxInlineSize=150", \
     "-XX:FreqInlineSize=600", \
-    "-cp", "/app/cardigan.jar:/app/cardigan-httparena.jar", \
+    "-cp", "/app/cardigan-httparena.jar:/app/lib/*", \
     "dev.cardigan.httparena.HttpArenaMain"]

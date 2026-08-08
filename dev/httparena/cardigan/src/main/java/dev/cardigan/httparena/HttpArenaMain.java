@@ -38,14 +38,15 @@ public final class HttpArenaMain {
             default -> throw new IllegalArgumentException(
                 "Unknown HttpArena mode: " + mode);
         };
-        TlsConfig tls = switch (mode) {
-            case "json-tls", "h2", "grpc-tls" -> new TlsConfig(
-                environmentPath(
-                    "CARDIGAN_CERTIFICATE", "/certs/server.crt"),
-                environmentPath(
-                    "CARDIGAN_PRIVATE_KEY", "/certs/server.key"));
-            default -> null;
-        };
+        Path certificate = environmentPath(
+            "CARDIGAN_CERTIFICATE", "/certs/server.crt");
+        Path privateKey = environmentPath(
+            "CARDIGAN_PRIVATE_KEY", "/certs/server.key");
+        boolean tlsMode = mode.equals("json-tls")
+            || mode.equals("h2") || mode.equals("grpc-tls");
+        TlsConfig tls = tlsMode
+            ? new TlsConfig(certificate, privateKey)
+            : null;
         ProtocolMode protocol = switch (mode) {
             case "h2", "h2c", "grpc", "grpc-tls" ->
                 ProtocolMode.HTTP2_ONLY;
@@ -75,11 +76,29 @@ public final class HttpArenaMain {
             builder.routes(new HttpArenaGrpcController());
         }
 
-        try (CardiganServer server = builder.build()) {
+        CardiganServer plaintext = mode.equals("json-tls")
+            ? CardiganServer.builder()
+                .port(8080)
+                .eventLoops(1)
+                .protocol(ProtocolMode.HTTP1_ONLY)
+                .plaintext()
+                .routes(new HttpArenaController())
+                .build()
+            : null;
+        try (plaintext; CardiganServer server = builder.build()) {
             Runtime.getRuntime().addShutdownHook(
                 Thread.ofPlatform()
                     .name("cardigan-httparena-shutdown")
-                    .unstarted(server::close));
+                    .unstarted(() -> {
+                        server.close();
+                        if (plaintext != null) plaintext.close();
+                    }));
+            if (plaintext != null) {
+                plaintext.start();
+                System.out.println(
+                    "Cardigan HttpArena baseline readiness is listening"
+                        + " on 8080");
+            }
             server.start();
             System.out.println(
                 "Cardigan HttpArena mode " + mode

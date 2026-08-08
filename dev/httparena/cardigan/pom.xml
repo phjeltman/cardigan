@@ -33,13 +33,13 @@
     </dependencies>
 
     <build>
+        <finalName>cardigan-httparena</finalName>
         <resources>
             <resource>
-                <directory>${project.basedir}/../..</directory>
+                <directory>${project.basedir}</directory>
                 <targetPath>META-INF</targetPath>
                 <includes>
                     <include>LICENSE</include>
-                    <include>THIRD_PARTY_NOTICES.md</include>
                 </includes>
             </resource>
         </resources>
@@ -75,6 +75,11 @@
                         </manifest>
                     </archive>
                 </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <version>3.8.1</version>
             </plugin>
         </plugins>
     </build>
