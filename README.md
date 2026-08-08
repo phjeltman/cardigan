@@ -22,6 +22,16 @@ correctness, resource bounds, and performance.
 - OpenSSL 3 at runtime when TLS is enabled.
 - `wrk` and `h2load` for live benchmarks; `h2spec` for HTTP/2 conformance.
 
+## Maven
+
+```xml
+<dependency>
+    <groupId>dev.cardigan</groupId>
+    <artifactId>cardigan</artifactId>
+    <version>0.1.0-alpha1</version>
+</dependency>
+```
+
 ## Build and test
 
 Compile and run the portable unit tier:

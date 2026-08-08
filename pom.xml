@@ -6,7 +6,7 @@
 
     <groupId>dev.cardigan</groupId>
     <artifactId>cardigan</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
+    <version>0.1.0-alpha1</version>
     <name>Cardigan</name>
     <description>Experimental Java HTTP framework optimized for Loom and io_uring</description>
     <url>https://github.com/phjeltman/cardigan</url>
@@ -16,7 +16,7 @@
         <connection>scm:git:https://github.com/phjeltman/cardigan.git</connection>
         <developerConnection>scm:git:ssh://git@github.com/phjeltman/cardigan.git</developerConnection>
         <url>https://github.com/phjeltman/cardigan</url>
-        <tag>HEAD</tag>
+        <tag>v0.1.0-alpha1</tag>
     </scm>
 
     <issueManagement>
@@ -88,9 +88,20 @@
                     <compilerArgs>
                         <arg>--add-modules</arg>
                         <arg>jdk.incubator.vector</arg>
-                        <arg>--enable-preview</arg>
                     </compilerArgs>
                 </configuration>
+                <executions>
+                    <execution>
+                        <id>default-testCompile</id>
+                        <configuration>
+                            <compilerArgs combine.self="override">
+                                <arg>--add-modules</arg>
+                                <arg>jdk.incubator.vector</arg>
+                                <arg>--enable-preview</arg>
+                            </compilerArgs>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
 
             <!-- Surefire test runner plugin -->
@@ -147,7 +158,6 @@
                         <configuration>
                             <release>26</release>
                             <additionalOptions>
-                                <additionalOption>--enable-preview</additionalOption>
                                 <additionalOption>--add-modules</additionalOption>
                                 <additionalOption>jdk.incubator.vector</additionalOption>
                             </additionalOptions>

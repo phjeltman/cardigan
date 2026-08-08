@@ -11,6 +11,18 @@ mvn -Ppublication -Dgpg.skip=true clean verify
 
 VERSION=$(mvn -q -DforceStdout help:evaluate \
     -Dexpression=project.version)
+SCM_TAG=$(mvn -q -DforceStdout help:evaluate \
+    -Dexpression=project.scm.tag)
+
+if [[ "$VERSION" == *-SNAPSHOT ]]; then
+    echo "Refusing to verify a snapshot as a release candidate: $VERSION" >&2
+    exit 1
+fi
+if [ "$SCM_TAG" != "v$VERSION" ]; then
+    echo "SCM tag $SCM_TAG does not match release version $VERSION" >&2
+    exit 1
+fi
+
 MAIN_JAR="target/cardigan-$VERSION.jar"
 SOURCES_JAR="target/cardigan-$VERSION-sources.jar"
 JAVADOC_JAR="target/cardigan-$VERSION-javadoc.jar"

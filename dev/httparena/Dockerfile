@@ -20,7 +20,7 @@ ARG CARDIGAN_HTTPARENA_MODE=h1
 ENV CARDIGAN_HTTPARENA_MODE=${CARDIGAN_HTTPARENA_MODE}
 
 WORKDIR /app
-COPY --from=build /src/target/cardigan-0.1.0-SNAPSHOT.jar ./cardigan.jar
+COPY --from=build /src/target/cardigan-0.1.0-alpha1.jar ./cardigan.jar
 COPY --from=build /src/dev/httparena/target/cardigan-httparena-0.1.0-SNAPSHOT.jar ./cardigan-httparena.jar
 
 EXPOSE 8080 8081 8082 8443
