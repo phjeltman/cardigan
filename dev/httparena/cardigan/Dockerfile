@@ -28,7 +28,7 @@ ENTRYPOINT ["java", \
     "--enable-native-access=ALL-UNNAMED", \
     "--add-opens", "java.base/java.lang=ALL-UNNAMED", \
     "--add-modules", "jdk.incubator.vector", \
-    "-Xms512m", "-Xmx512m", \
+    "-Xms512m", "-Xmx2g", \
     "-XX:MaxInlineSize=150", \
     "-XX:FreqInlineSize=600", \
     "-cp", "/app/cardigan-httparena.jar:/app/lib/*", \
