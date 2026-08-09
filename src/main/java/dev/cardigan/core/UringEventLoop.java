@@ -18,11 +18,33 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.ArrayDeque;
 
 public class UringEventLoop implements AutoCloseable, java.util.concurrent.Executor {
+    private static final int EINTR = 4;
     private static final boolean TASK_POOL_STATS_ENABLED =
         Boolean.getBoolean("cardigan.uring.task.stats");
     private static final boolean LOCAL_READY_QUEUE_ENABLED =
         Boolean.parseBoolean(System.getProperty(
             "cardigan.scheduler.localReady", "true"));
+    private static final boolean BOUNDED_TURNS_ENABLED =
+        Boolean.parseBoolean(System.getProperty(
+            "cardigan.scheduler.boundedTurns", "true"));
+    private static final boolean SCHEDULER_STATS_ENABLED =
+        Boolean.getBoolean("cardigan.scheduler.stats");
+    private static final boolean FIXED_FILE_STATS_ENABLED =
+        Boolean.getBoolean("cardigan.fixed.files.stats");
+    private static final int CQE_TURN_BUDGET = schedulerBudget(
+        "cardigan.scheduler.cqesPerTurn", 256);
+    private static final int COMPLETION_TURN_BUDGET = schedulerBudget(
+        "cardigan.scheduler.completionsPerTurn", 256);
+    private static final int PROTOCOL_TURN_BUDGET = schedulerBudget(
+        "cardigan.scheduler.protocolTasksPerTurn", 128);
+    private static final int HANDLER_TURN_BUDGET = schedulerBudget(
+        "cardigan.scheduler.handlerContinuationsPerTurn", 32);
+    private static final int EGRESS_TURN_BUDGET = schedulerBudget(
+        "cardigan.scheduler.egressTasksPerTurn", 256);
+    private static final int EXTERNAL_TURN_BUDGET = schedulerBudget(
+        "cardigan.scheduler.externalTasksPerTurn", 64);
+    private static final long PROTOCOL_QUANTUM_NANOS =
+        schedulerQuantumNanos();
     private static final VarHandle INT_HANDLE = ValueLayout.JAVA_INT.varHandle();
     private static final VarHandle SHORT_HANDLE = ValueLayout.JAVA_SHORT.varHandle();
     private static final VarHandle TASK_THREAD_HANDLE;
@@ -50,6 +72,13 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         void onCompletion(int result, int flags, boolean terminal);
     }
 
+    /** Stable marker used to retain the handler lane across an external wake. */
+    @FunctionalInterface
+    interface HandlerContinuation extends Runnable {}
+
+    /** Stable marker used to retain the egress lane across an external wake. */
+    interface EgressTask extends Runnable {}
+
     private final int cpuId;
     private final Arena arena;
     private RawUring ring;
@@ -64,14 +93,20 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private long taskPoolExhaustions;
 
     private final Thread loopThread;
+    private final CarrierDomain carrierDomain;
 
-    /**
-     * Scheduler submissions made while the owning platform thread dispatches
-     * CQEs do not need the CAS, fence, or eventfd protocol used by external
-     * producers. Other loop-thread submissions are batched through readyTasks.
-     */
-    private final ArrayDeque<Runnable> localReadyTasks =
+    /** Continuations made runnable by the current CQE batch. */
+    private final ArrayDeque<Runnable> completionReadyTasks =
+        new ArrayDeque<>(256);
+    /** Connection/protocol and generic owner-domain continuations. */
+    private final ArrayDeque<Runnable> protocolReadyTasks =
         new ArrayDeque<>(1024);
+    /** Exchange worker continuations, separate from protocol progress. */
+    private final ArrayDeque<Runnable> handlerReadyTasks =
+        new ArrayDeque<>(256);
+    /** Connections with newly publishable output. */
+    private final ArrayDeque<Runnable> egressReadyTasks =
+        new ArrayDeque<>(256);
     private final MpscArrayQueue<Runnable> readyTasks = new MpscArrayQueue<>(131072);
     private boolean dispatchingCompletions;
     private final java.util.concurrent.ThreadFactory virtualThreadFactory;
@@ -110,56 +145,69 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
     public static final class MpscArrayQueue<T> {
         private static final VarHandle ARRAY_HANDLE = MethodHandles.arrayElementVarHandle(Object[].class);
+        private static final VarHandle SEQUENCE_HANDLE = MethodHandles.arrayElementVarHandle(long[].class);
         private final Object[] buffer;
+        private final long[] sequences;
         private final int mask;
-        private final java.util.concurrent.atomic.AtomicLong head = new java.util.concurrent.atomic.AtomicLong(0);
         private final java.util.concurrent.atomic.AtomicLong tail = new java.util.concurrent.atomic.AtomicLong(0);
+        private long head;
 
-        @SuppressWarnings("unchecked")
         public MpscArrayQueue(int capacity) {
             int cap = 1;
             while (cap < capacity) {
                 cap <<= 1;
             }
             this.buffer = new Object[cap];
+            this.sequences = new long[cap];
             this.mask = cap - 1;
+            for (int i = 0; i < cap; i++) {
+                sequences[i] = i;
+            }
         }
 
         public boolean offer(T value) {
             if (value == null) throw new NullPointerException();
             while (true) {
                 long t = tail.get();
-                long h = head.get();
-                if (t - h >= buffer.length) {
+                int index = (int) (t & mask);
+                long sequence = (long) SEQUENCE_HANDLE.getAcquire(
+                    sequences, index);
+                long difference = sequence - t;
+                if (difference < 0) {
                     return false;
                 }
-                if (tail.compareAndSet(t, t + 1)) {
-                    int index = (int) (t & mask);
-                    ARRAY_HANDLE.setRelease(buffer, index, value);
+                if (difference == 0 && tail.compareAndSet(t, t + 1)) {
+                    ARRAY_HANDLE.set(buffer, index, value);
+                    SEQUENCE_HANDLE.setRelease(sequences, index, t + 1);
                     return true;
                 }
+                Thread.onSpinWait();
             }
         }
 
         @SuppressWarnings("unchecked")
         public T poll() {
-            long h = head.get();
-            if (h == tail.get()) {
+            long h = head;
+            int index = (int) (h & mask);
+            long sequence = (long) SEQUENCE_HANDLE.getAcquire(
+                sequences, index);
+            if (sequence != h + 1) {
                 return null;
             }
-            int index = (int) (h & mask);
-            Object value;
-            // A producer reserves its tail position before publishing the slot.
-            while ((value = ARRAY_HANDLE.getAcquire(buffer, index)) == null) {
-                Thread.onSpinWait();
-            }
-            ARRAY_HANDLE.setRelease(buffer, index, null);
-            head.lazySet(h + 1);
+            Object value = ARRAY_HANDLE.get(buffer, index);
+            ARRAY_HANDLE.set(buffer, index, null);
+            SEQUENCE_HANDLE.setRelease(
+                sequences, index, h + buffer.length);
+            head = h + 1;
             return (T) value;
         }
 
         public boolean isEmpty() {
-            return head.get() == tail.get();
+            long h = head;
+            int index = (int) (h & mask);
+            long sequence = (long) SEQUENCE_HANDLE.getAcquire(
+                sequences, index);
+            return sequence != h + 1;
         }
     }
     
@@ -169,6 +217,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private final MemorySegment ringBuffers;
     private final MemorySegment[] ringBufferSegments;
     private final ArrayDeque<Runnable> inboundBufferWaiters = new ArrayDeque<>();
+    private final int[] returnedInboundBufferIds;
+    private int returnedInboundBufferCount;
     private short pbufTail = 0;
     private final boolean ktlsReceiveBuffers;
     private final MemorySegment ktlsBufRingSegment;
@@ -176,6 +226,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private final MemorySegment[] ktlsRingBufferSegments;
     private final MemorySegment ktlsRecvmsgHeader;
     private final ArrayDeque<Runnable> ktlsBufferWaiters = new ArrayDeque<>();
+    private final int[] returnedKtlsBufferIds;
+    private int returnedKtlsBufferCount;
     private short ktlsPbufTail;
 
     /**
@@ -202,15 +254,38 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private int evfd = -1;
     private final MemorySegment evfdBuf;
     private final MemorySegment wakeupBuf;
+    private final AtomicInteger wakeupPending = new AtomicInteger();
+    private final AtomicInteger wakeupWriteFailures = new AtomicInteger();
+    private volatile Throwable wakeupFailure;
     
-    public static final int MAX_FIXED_FILES = 8192;
+    public static final int MAX_FIXED_FILES = Math.max(
+        1,
+        Integer.getInteger("cardigan.fixed.files.capacity", 8192));
     private final MemorySegment registeredFds;
     private final MemorySegment emptyFdSegment;
     private final IntIdPool freeFixedSlots;
+    private final MemorySegment fileUpdateValues;
+    private final ArrayDeque<Runnable> fixedFileWaiters = new ArrayDeque<>();
+    private int activeFixedFiles;
+    private int peakActiveFixedFiles;
+    private long fixedFileCapacityMisses;
     private boolean useFixedFiles;
 
     private volatile boolean closed = false;
+    private boolean resourcesClosed;
     private volatile boolean isSleeping = false;
+
+    private long schedulerTurns;
+    private long schedulerCqes;
+    private long schedulerCompletionTasks;
+    private long schedulerProtocolTasks;
+    private long schedulerHandlerTasks;
+    private long schedulerEgressTasks;
+    private long schedulerExternalTasks;
+    private long schedulerTaskWorkEnters;
+    private long schedulerSubmits;
+    private long schedulerWaits;
+    private long protocolDeadlineNanos = Long.MAX_VALUE;
 
     public UringEventLoop(int cpuId, int entries) {
         this(cpuId, entries, Math.max(entries, 512), false);
@@ -236,8 +311,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         this.wakeupBuf.set(ValueLayout.JAVA_LONG, 0, 1L);
 
         this.ringBuffers = arena.allocate((long) this.numBuffers * BUFFER_SIZE);
-        this.ringBuffers.fill((byte) 0);
         this.ringBufferSegments = new MemorySegment[this.numBuffers];
+        this.returnedInboundBufferIds = new int[this.numBuffers];
         for (int i = 0; i < this.numBuffers; i++) {
             ringBufferSegments[i] = ringBuffers.asSlice(
                 (long) i * BUFFER_SIZE, BUFFER_SIZE);
@@ -260,6 +335,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                 (long) this.numBuffers * 16, 4096);
             this.ktlsBufRingSegment.fill((byte) 0);
             this.ktlsRecvmsgHeader = arena.allocate(MSGHDR_SIZE, 8);
+            this.returnedKtlsBufferIds = new int[this.numBuffers];
             this.ktlsRecvmsgHeader.fill((byte) 0);
             this.ktlsRecvmsgHeader.set(
                 ValueLayout.JAVA_LONG, MSGHDR_CONTROL_LENGTH_OFFSET,
@@ -269,11 +345,11 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             this.ktlsRingBufferSegments = null;
             this.ktlsBufRingSegment = MemorySegment.NULL;
             this.ktlsRecvmsgHeader = MemorySegment.NULL;
+            this.returnedKtlsBufferIds = null;
         }
 
         this.numEgressBuffers = Math.max(this.numBuffers, 4096);
         this.egressBufferRing = arena.allocate((long) this.numEgressBuffers * EGRESS_FRAME_SIZE);
-        this.egressBufferRing.fill((byte) 0);
         this.egressBufferSegments =
             new MemorySegment[this.numEgressBuffers];
         for (int i = 0; i < this.numEgressBuffers; i++) {
@@ -305,6 +381,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         for (int i = 0; i < numTasks; i++) {
             tasks[i] = new UringTask(i);
         }
+        this.fileUpdateValues = arena.allocate((long) numTasks * 4, 4);
 
         this.freeFixedSlots = new IntIdPool(MAX_FIXED_FILES);
         this.registeredFds = arena.allocate((long) MAX_FIXED_FILES * 4);
@@ -320,7 +397,9 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         this.loopThread = Thread.ofPlatform()
             .daemon(true)
             .name("cardigan-loop-" + cpuId)
-            .start(() -> runLoop(entries, initLatch, initError));
+            .unstarted(() -> runLoop(entries, initLatch, initError));
+        this.carrierDomain = new CarrierDomain(loopThread);
+        loopThread.start();
 
         try {
             initLatch.await();
@@ -357,7 +436,10 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             System.out.println(
                 "Pinned cardigan-loop-" + cpuId + " to Linux CPU " + cpuId);
 
-            int flags = Opcodes.IORING_SETUP_SINGLE_ISSUER | Opcodes.IORING_SETUP_DEFER_TASKRUN;
+            int flags = Opcodes.IORING_SETUP_SINGLE_ISSUER
+                | Opcodes.IORING_SETUP_SUBMIT_ALL
+                | Opcodes.IORING_SETUP_DEFER_TASKRUN
+                | Opcodes.IORING_SETUP_TASKRUN_FLAG;
             this.ring = new RawUring(arena, entries, flags);
 
             this.evfd = (int) Libc.eventfd.invokeExact(0, 0);
@@ -404,59 +486,194 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
         initLatch.countDown();
 
-        while (!closed) {
+        while (!closed && wakeupFailure == null) {
             try {
-                if (LOCAL_READY_QUEUE_ENABLED) {
-                    Runnable localTask;
-                    while ((localTask = localReadyTasks.pollFirst()) != null) {
-                        try {
-                            localTask.run();
-                        } catch (Throwable t) {
-                            t.printStackTrace();
-                        }
+                runSchedulerTurn();
+                if (hasSchedulerWork()) {
+                    if (sqePending || ring.hasPendingSubmissions()) {
+                        submitPendingOperations();
                     }
-                }
-
-                Runnable vtTask;
-                while ((vtTask = readyTasks.poll()) != null) {
-                    try {
-                        vtTask.run();
-                    } catch (Throwable t) {
-                        t.printStackTrace();
-                    }
-                }
-
-                if (sqePending) {
-                    submitPendingOperations();
-                }
-
-                if (hasCompletions()) {
-                    reapCompletions();
+                    continue;
                 }
 
                 // Pair sleeping publication with execute()'s fence before
-                // rechecking all work queues and entering the kernel wait.
+                // rechecking every readiness source. SQEs are deliberately
+                // not submitted above when the loop is quiescent: the one
+                // blocking enter below both publishes them and waits.
                 isSleeping = true;
                 VarHandle.fullFence();
 
-                if ((LOCAL_READY_QUEUE_ENABLED && !localReadyTasks.isEmpty())
-                    || !readyTasks.isEmpty() || hasCompletions()) {
+                if (hasSchedulerWork()) {
                     isSleeping = false;
                     continue;
                 }
 
                 try {
-                    int ret = ring.submitAndWait(1);
-                    if (ret >= 0) {
-                        reapCompletions();
+                    boolean submitted = sqePending
+                        || ring.hasPendingSubmissions();
+                    int ret;
+                    try {
+                        ret = ring.submitAndWait(1);
+                    } finally {
+                        sqePending = ring.hasPendingSubmissions();
                     }
+                    schedulerWaits++;
+                    if (submitted) {
+                        schedulerSubmits++;
+                    }
+                    checkEnterResult(ret, "waiting for io_uring completions");
                 } finally {
                     isSleeping = false;
                 }
             } catch (Throwable t) {
-                if (closed) break;
+                if (closed || wakeupFailure != null) break;
                 System.err.println("Error in event loop for CPU " + cpuId + ": " + t.getMessage());
             }
+        }
+    }
+
+    /**
+     * Runs one weighted reactor turn. No lane is drained exhaustively, so a
+     * Loom continuation that yields back to this executor cannot keep the
+     * carrier away from io_uring indefinitely.
+     */
+    private void runSchedulerTurn() {
+        schedulerTurns++;
+
+        int reaped = reapCompletions(CQE_TURN_BUDGET);
+        schedulerCqes += reaped;
+
+        // DEFER_TASKRUN may leave completions in issuer task_work, and a full
+        // CQ may leave them on the kernel overflow list. Neither condition is
+        // necessarily visible through cq.head/cq.tail. Enter exactly as
+        // liburing's peek path does, without requiring a new SQE.
+        if (reaped < CQE_TURN_BUDGET
+            && (ring.taskWorkPending() || ring.overflowPending())) {
+            boolean submitted = sqePending
+                || ring.hasPendingSubmissions();
+            int result;
+            try {
+                result = ring.enterGetEvents();
+            } finally {
+                sqePending = ring.hasPendingSubmissions();
+            }
+            schedulerTaskWorkEnters++;
+            if (submitted) {
+                schedulerSubmits++;
+            }
+            checkEnterResult(result, "running deferred io_uring task work");
+            schedulerCqes += reapCompletions(CQE_TURN_BUDGET - reaped);
+        }
+
+        schedulerExternalTasks += drainExternalTasks(EXTERNAL_TURN_BUDGET);
+        schedulerCompletionTasks += drainReadyTasks(
+            completionReadyTasks, COMPLETION_TURN_BUDGET, true, false);
+        schedulerProtocolTasks += drainReadyTasks(
+            protocolReadyTasks, PROTOCOL_TURN_BUDGET, true, false);
+        schedulerHandlerTasks += drainReadyTasks(
+            handlerReadyTasks, HANDLER_TURN_BUDGET, false, true);
+        flushReturnedBuffers();
+        schedulerEgressTasks += drainReadyTasks(
+            egressReadyTasks, EGRESS_TURN_BUDGET, false, false);
+    }
+
+    private int drainExternalTasks(int budget) {
+        int count = 0;
+        Runnable task;
+        while (count < budget && (task = readyTasks.poll()) != null) {
+            if (task instanceof HandlerContinuation) {
+                handlerReadyTasks.addLast(task);
+            } else if (task instanceof EgressTask) {
+                egressReadyTasks.addLast(task);
+            } else {
+                protocolReadyTasks.addLast(task);
+            }
+            count++;
+        }
+        return count;
+    }
+
+    private int drainReadyTasks(
+            ArrayDeque<Runnable> tasks, int budget,
+            boolean protocolQuantum, boolean includeAppended) {
+        // A continuation that yields or unparks itself belongs to the next
+        // reactor turn for protocol/control lanes. Handler workers are the
+        // deliberate exception: their existing 64-exchange batch is much
+        // smaller than a useful high-throughput ring turn, so the explicit
+        // handler-continuation budget may consume several batches while still
+        // placing a hard ceiling on the phase.
+        int turnSize = includeAppended
+            ? budget
+            : Math.min(budget, tasks.size());
+        int count = 0;
+        Runnable task;
+        while (count < turnSize && (task = tasks.pollFirst()) != null) {
+            runReadyTask(task, protocolQuantum);
+            count++;
+        }
+        return count;
+    }
+
+    private void runReadyTask(Runnable task, boolean protocolQuantum) {
+        long previousDeadline = protocolDeadlineNanos;
+        if (protocolQuantum) {
+            protocolDeadlineNanos = System.nanoTime()
+                + PROTOCOL_QUANTUM_NANOS;
+        }
+        try {
+            task.run();
+        } catch (Throwable failure) {
+            failure.printStackTrace();
+        } finally {
+            if (protocolQuantum) {
+                protocolDeadlineNanos = previousDeadline;
+            }
+        }
+    }
+
+    /**
+     * Cooperative safe-point for connection pumps. The check is cheap while
+     * the connection owns the only runnable work, and yields only after its
+     * time quantum when another lane or kernel work needs the carrier.
+     */
+    void protocolCheckpoint() {
+        if (!BOUNDED_TURNS_ENABLED || !inCarrierDomain()) {
+            return;
+        }
+        boolean kernelUrgent = hasCompletions()
+            || ring.taskWorkPending()
+            || ring.overflowPending();
+        boolean competingWork = !completionReadyTasks.isEmpty()
+            || !protocolReadyTasks.isEmpty()
+            || !handlerReadyTasks.isEmpty()
+            || !egressReadyTasks.isEmpty()
+            || !readyTasks.isEmpty()
+            || sqePending
+            || ring.hasPendingSubmissions();
+        if ((kernelUrgent || competingWork)
+            && System.nanoTime() - protocolDeadlineNanos >= 0) {
+            Thread.yield();
+        }
+    }
+
+    private boolean hasSchedulerWork() {
+        return !completionReadyTasks.isEmpty()
+            || !protocolReadyTasks.isEmpty()
+            || !handlerReadyTasks.isEmpty()
+            || !egressReadyTasks.isEmpty()
+            || !readyTasks.isEmpty()
+            || returnedInboundBufferCount != 0
+            || returnedKtlsBufferCount != 0
+            || hasCompletions()
+            || ring.hasPendingSubmissions()
+            || ring.taskWorkPending()
+            || ring.overflowPending();
+    }
+
+    private static void checkEnterResult(int result, String operation) {
+        if (result < 0) {
+            throw new IllegalStateException(
+                operation + " failed with error " + result);
         }
     }
 
@@ -469,7 +686,15 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private void submitEvfdRead() {
         MemorySegment sqeRaw = ring.getSqe();
         if (sqeRaw.equals(MemorySegment.NULL)) {
-            int unusedSubmit = ring.submit();
+            int submitResult;
+            try {
+                submitResult = ring.submit();
+            } finally {
+                sqePending = ring.hasPendingSubmissions();
+            }
+            schedulerSubmits++;
+            checkEnterResult(
+                submitResult, "making room for the eventfd wakeup read");
             sqeRaw = ring.getSqe();
             if (sqeRaw.equals(MemorySegment.NULL)) {
                 throw new IllegalStateException(
@@ -484,13 +709,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         sqe.set(ValueLayout.JAVA_LONG, 16, evfdBuf.address());
         sqe.set(ValueLayout.JAVA_INT, 24, 8);
         sqe.set(ValueLayout.JAVA_LONG, 32, -99L);
-
-        int submitResult = ring.submit();
-        if (submitResult < 0) {
-            throw new IllegalStateException(
-                "Submitting the eventfd wakeup read failed: "
-                    + submitResult);
-        }
+        sqePending = true;
     }
 
     private void initProvidedBuffers() {
@@ -551,87 +770,131 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         }
     }
 
-    private void reapCompletions() {
-        if (!LOCAL_READY_QUEUE_ENABLED) {
-            reapCompletionBatch();
-            return;
+    private int reapCompletions(int budget) {
+        if (budget <= 0 || !hasCompletions()) {
+            return 0;
         }
         dispatchingCompletions = true;
         try {
-            reapCompletionBatch();
+            return reapCompletionBatch(budget);
         } finally {
             dispatchingCompletions = false;
         }
     }
 
-    private void reapCompletionBatch() {
+    private int reapCompletionBatch(int budget) {
         int head = (int) INT_HANDLE.getAcquire(kheadSegment, 0L);
         int tail = (int) INT_HANDLE.getAcquire(ktailSegment, 0L);
         int mask = kmask;
 
         int count = 0;
-        while (head != tail) {
-            int index = head & mask;
-            long cqeOffset = index * 16L;
+        try {
+            while (head != tail && count < budget) {
+                int index = head & mask;
+                long cqeOffset = index * 16L;
 
-            long userData = cqesSegment.get(ValueLayout.JAVA_LONG, cqeOffset + 0);
-            int res = cqesSegment.get(ValueLayout.JAVA_INT, cqeOffset + 8);
-            int flags = cqesSegment.get(ValueLayout.JAVA_INT, cqeOffset + 12);
+                long userData = cqesSegment.get(
+                    ValueLayout.JAVA_LONG, cqeOffset);
+                int res = cqesSegment.get(
+                    ValueLayout.JAVA_INT, cqeOffset + 8);
+                int flags = cqesSegment.get(
+                    ValueLayout.JAVA_INT, cqeOffset + 12);
 
-            if (userData == -99L) {
-                submitEvfdRead();
-            } else if (userData != -88L) {
-                int taskId = (int) userData;
-                if (taskId >= 0 && taskId < tasks.length) {
-                    UringTask task = tasks[taskId];
-                    if (task.userData == userData) {
-                        task.result = res;
-                        task.flags = flags;
-                        CompletionHandler completionHandler = task.completionHandler;
-                        Thread vt = (Thread) TASK_THREAD_HANDLE.getAcquire(task);
+                // The CQE values are now local. Consume it before invoking a
+                // callback so an exception cannot make the same completion
+                // run twice on the next turn.
+                head++;
+                count++;
 
-                        if (completionHandler != null && task.vectorSlot >= 0) {
-                            handleAsyncVectorSendCompletion(task, res, flags, completionHandler);
-                        } else if (completionHandler != null && task.egressId >= 0) {
-                            handleAsyncSendCompletion(task, res, flags, completionHandler);
-                        } else if (completionHandler != null) {
-                            boolean terminal = (flags & Opcodes.IORING_CQE_F_MORE) == 0;
-                            if (terminal) {
-                                task.completionHandler = null;
+                if (userData == -99L) {
+                    wakeupPending.set(0);
+                    submitEvfdRead();
+                } else if (userData != -88L) {
+                    int taskId = (int) userData;
+                    if (taskId >= 0 && taskId < tasks.length) {
+                        UringTask task = tasks[taskId];
+                        if (task.userData == userData) {
+                            task.result = res;
+                            task.flags = flags;
+                            CompletionHandler completionHandler =
+                                task.completionHandler;
+                            Thread vt = (Thread) TASK_THREAD_HANDLE.getAcquire(task);
+
+                            if (completionHandler != null && task.vectorSlot >= 0) {
+                                handleAsyncVectorSendCompletion(task, res, flags, completionHandler);
+                            } else if (completionHandler != null && task.egressId >= 0) {
+                                handleAsyncSendCompletion(task, res, flags, completionHandler);
+                            } else if (completionHandler != null) {
+                                boolean terminal =
+                                    (flags & Opcodes.IORING_CQE_F_MORE) == 0;
+                                if (terminal) {
+                                    task.completionHandler = null;
+                                    releaseTaskId(taskId);
+                                }
+                                completionHandler.onCompletion(
+                                    res, flags, terminal);
+                            } else if (vt != null
+                                    && (flags & Opcodes.IORING_CQE_F_MORE) == 0) {
+                                TASK_THREAD_HANDLE.setRelease(task, null);
+                                LockSupport.unpark(vt);
+                            } else if (vt == null
+                                    && (flags & Opcodes.IORING_CQE_F_MORE) == 0) {
                                 releaseTaskId(taskId);
                             }
-                            completionHandler.onCompletion(res, flags, terminal);
-                        } else if (vt != null && (flags & Opcodes.IORING_CQE_F_MORE) == 0) {
-                            TASK_THREAD_HANDLE.setRelease(task, null);
-                            LockSupport.unpark(vt);
-                        } else if (vt == null && (flags & Opcodes.IORING_CQE_F_MORE) == 0) {
-                            releaseTaskId(taskId);
                         }
                     }
                 }
             }
-
-            head++;
-            count++;
+        } finally {
+            if (count > 0) {
+                INT_HANDLE.setRelease(kheadSegment, 0L, head);
+            }
         }
-
-        if (count > 0) {
-            INT_HANDLE.setRelease(kheadSegment, 0L, head);
-        }
+        return count;
     }
 
     private boolean sqePending = false;
 
     void submitPendingOperations() {
-        if (!sqePending) {
+        if (!sqePending && !ring.hasPendingSubmissions()) {
             return;
         }
-        int result = ring.submit();
-        sqePending = false;
+        int result;
+        try {
+            result = ring.submit();
+        } finally {
+            sqePending = ring.hasPendingSubmissions();
+        }
+        schedulerSubmits++;
         if (result < 0) {
             throw new IllegalStateException(
                 "Submitting pending io_uring operations failed: " + result);
         }
+    }
+
+    private void submitForSqeSpace() {
+        int result;
+        try {
+            result = ring.submit();
+        } finally {
+            sqePending = ring.hasPendingSubmissions();
+        }
+        schedulerSubmits++;
+        checkEnterResult(result, "making room in the io_uring submission queue");
+    }
+
+    private MemorySegment reserveSqe() {
+        MemorySegment sqe = ring.getSqe();
+        if (!sqe.equals(MemorySegment.NULL)) {
+            return sqe;
+        }
+        submitForSqeSpace();
+        sqe = ring.getSqe();
+        if (sqe.equals(MemorySegment.NULL)) {
+            throw new IllegalStateException(
+                "io_uring submission queue remained full after submit");
+        }
+        return sqe;
     }
 
     private void handleAsyncSendCompletion(UringTask task, int res, int flags, CompletionHandler completionHandler) {
@@ -756,7 +1019,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         try {
             MemorySegment sqeRaw = ring.getSqe();
             if (sqeRaw.equals(MemorySegment.NULL)) {
-                int unused = ring.submit();
+                submitForSqeSpace();
                 sqeRaw = ring.getSqe();
                 if (sqeRaw.equals(MemorySegment.NULL)) {
                     return false;
@@ -809,7 +1072,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         try {
             MemorySegment sqeRaw = ring.getSqe();
             if (sqeRaw.equals(MemorySegment.NULL)) {
-                int unused = ring.submit();
+                submitForSqeSpace();
                 sqeRaw = ring.getSqe();
                 if (sqeRaw.equals(MemorySegment.NULL)) {
                     task.completionHandler = null;
@@ -982,7 +1245,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         try {
             MemorySegment sqeRaw = ring.getSqe();
             if (sqeRaw.equals(MemorySegment.NULL)) {
-                int unused = ring.submit();
+                submitForSqeSpace();
                 sqeRaw = ring.getSqe();
                 if (sqeRaw.equals(MemorySegment.NULL)) {
                     throw new RuntimeException("SQE queue completely full!");
@@ -1015,13 +1278,132 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         return result;
     }
 
+    /**
+     * Asynchronously installs a raw descriptor into a kernel-selected fixed
+     * slot. The calling virtual thread parks until the FILES_UPDATE CQE, so
+     * registration never pins the fused carrier in io_uring_register.
+     */
     public int registerFixedFd(int clientFd) {
         if (!useFixedFiles) {
             throw new IllegalStateException(
                 "Fixed-file registration was not initialized");
         }
+
+        int taskId = acquireTaskId();
+        if (taskId < 0) {
+            throw new IllegalStateException("io_uring task pool exhausted");
+        }
+        UringTask task = tasks[taskId];
+        prepareTask(task);
+        TASK_THREAD_HANDLE.setRelease(task, Thread.currentThread());
+        task.result = -11;
+        task.flags = 0;
+
+        long valueOffset = (long) taskId * 4;
+        fileUpdateValues.set(ValueLayout.JAVA_INT, valueOffset, clientFd);
+        try {
+            MemorySegment sqe = reserveSqe();
+            prepareFilesUpdateSqe(
+                sqe,
+                fileUpdateValues.address() + valueOffset,
+                Opcodes.IORING_FILE_INDEX_ALLOC,
+                task.userData
+            );
+            sqePending = true;
+        } catch (Throwable failure) {
+            TASK_THREAD_HANDLE.setRelease(task, null);
+            releaseTaskId(taskId);
+            throw new IllegalStateException(
+                "Submitting asynchronous fixed-file allocation failed",
+                failure);
+        }
+
+        awaitCompletion(task);
+        int result = task.result;
+        int slot = result == 1
+            ? fileUpdateValues.get(ValueLayout.JAVA_INT, valueOffset)
+            : -1;
+        releaseTaskId(taskId);
+
+        if (result == -23) { // ENFILE: the registered table is full.
+            fixedFileCapacityMisses++;
+            return -1;
+        }
+        if (result != 1 || slot < 0 || slot >= MAX_FIXED_FILES) {
+            throw new IllegalStateException(
+                "IORING_OP_FILES_UPDATE allocation failed: result="
+                    + result + ", slot=" + slot);
+        }
+        registeredFds.set(
+            ValueLayout.JAVA_INT, (long) slot * 4, clientFd);
+        fixedFileAcquired();
+        return slot;
+    }
+
+    int registerFixedFdAsyncExplicit(int clientFd) {
+        if (!useFixedFiles) {
+            throw new IllegalStateException(
+                "Fixed-file registration was not initialized");
+        }
         int slot = freeFixedSlots.poll();
-        if (slot < 0) return -1;
+        if (slot < 0) {
+            fixedFileCapacityMisses++;
+            return -1;
+        }
+        int taskId = acquireTaskId();
+        if (taskId < 0) {
+            freeFixedSlots.offer(slot);
+            throw new IllegalStateException("io_uring task pool exhausted");
+        }
+        UringTask task = tasks[taskId];
+        prepareTask(task);
+        TASK_THREAD_HANDLE.setRelease(task, Thread.currentThread());
+        task.result = -11;
+        task.flags = 0;
+        long valueOffset = (long) taskId * 4;
+        fileUpdateValues.set(ValueLayout.JAVA_INT, valueOffset, clientFd);
+        try {
+            MemorySegment sqe = reserveSqe();
+            prepareFilesUpdateSqe(
+                sqe,
+                fileUpdateValues.address() + valueOffset,
+                slot,
+                task.userData
+            );
+            sqePending = true;
+        } catch (Throwable failure) {
+            TASK_THREAD_HANDLE.setRelease(task, null);
+            releaseTaskId(taskId);
+            freeFixedSlots.offer(slot);
+            throw new IllegalStateException(
+                "Submitting asynchronous fixed-file update failed", failure);
+        }
+        awaitCompletion(task);
+        int result = task.result;
+        releaseTaskId(taskId);
+        if (result != 1) {
+            freeFixedSlots.offer(slot);
+            throw new IllegalStateException(
+                "IORING_OP_FILES_UPDATE failed for slot " + slot
+                    + " with error " + result);
+        }
+        registeredFds.set(
+            ValueLayout.JAVA_INT, (long) slot * 4, clientFd);
+        fixedFileAcquired();
+        return slot;
+    }
+
+    /** Benchmark-only baseline retaining the old synchronous update path. */
+    int registerFixedFdLegacy(int clientFd) {
+        if (!useFixedFiles) {
+            throw new IllegalStateException(
+                "Fixed-file registration was not initialized");
+        }
+        int slot = freeFixedSlots.poll();
+        if (slot < 0) {
+            fixedFileCapacityMisses++;
+            return -1;
+        }
         registeredFds.set(ValueLayout.JAVA_INT, (long) slot * 4, clientFd);
         MemorySegment slice = registeredFds.asSlice((long) slot * 4, 4);
         int result;
@@ -1031,7 +1413,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             throw new IllegalStateException(
                 "Updating fixed-file slot " + slot + " failed", t);
         }
-        if (result < 0) {
+        if (result != 1) {
             registeredFds.set(
                 ValueLayout.JAVA_INT, (long) slot * 4, -1);
             freeFixedSlots.offer(slot);
@@ -1039,20 +1421,234 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                 "IORING_REGISTER_FILES_UPDATE failed for slot " + slot
                     + " with error " + result);
         }
+        fixedFileAcquired();
         return slot;
     }
 
     public void unregisterFixedFd(int slot, int clientFd) {
-        if (slot >= 0 && useFixedFiles) {
-            try {
-                registeredFds.set(ValueLayout.JAVA_INT, (long) slot * 4, -1);
-                int ret = ring.updateFiles(slot, emptyFdSegment, 1);
-            } catch (Throwable t) {
-            } finally {
+        int fixedResult = 0;
+        try {
+            if (slot >= 0 && useFixedFiles) {
+                fixedResult = closeDirect(slot);
+            }
+        } finally {
+            if (clientFd >= 0) {
+                closeFd(clientFd);
+            }
+        }
+        if (!directCloseSucceeded(fixedResult)) {
+            throw new IllegalStateException(
+                "Direct close of fixed-file slot " + slot
+                    + " failed with error " + fixedResult);
+        }
+    }
+
+    void unregisterFixedFdLegacy(int slot, int clientFd) {
+        boolean released = false;
+        try {
+            if (slot >= 0 && useFixedFiles) {
+                try {
+                    registeredFds.set(
+                        ValueLayout.JAVA_INT, (long) slot * 4, -1);
+                    int ret = ring.updateFiles(slot, emptyFdSegment, 1);
+                    if (ret == 1) {
+                        fixedFileReleased(slot);
+                        released = true;
+                    } else {
+                        throw new IllegalStateException(
+                            "Legacy fixed-file release failed for slot "
+                                + slot + " with error " + ret);
+                    }
+                } finally {
+                    if (released) {
+                        freeFixedSlots.offer(slot);
+                    }
+                }
+            }
+        } finally {
+            if (clientFd >= 0) {
+                closeFd(clientFd);
+            }
+        }
+    }
+
+    void unregisterFixedFdAsyncExplicit(int slot, int clientFd) {
+        boolean released = false;
+        try {
+            unregisterFixedFd(slot, clientFd);
+            released = true;
+        } finally {
+            if (slot >= 0 && released) {
                 freeFixedSlots.offer(slot);
             }
         }
-        closeFd(clientFd);
+    }
+
+    int closeDirect(int slot) {
+        if (slot < 0 || slot >= MAX_FIXED_FILES) {
+            throw new IllegalArgumentException(
+                "Invalid fixed-file slot: " + slot);
+        }
+        int taskId = acquireTaskId();
+        if (taskId < 0) {
+            throw new IllegalStateException("io_uring task pool exhausted");
+        }
+        UringTask task = tasks[taskId];
+        prepareTask(task);
+        TASK_THREAD_HANDLE.setRelease(task, Thread.currentThread());
+        task.result = -11;
+        task.flags = 0;
+        try {
+            MemorySegment sqe = reserveSqe();
+            prepareDirectCloseSqe(sqe, slot, task.userData);
+            sqePending = true;
+        } catch (Throwable failure) {
+            TASK_THREAD_HANDLE.setRelease(task, null);
+            releaseTaskId(taskId);
+            return -5;
+        }
+        awaitCompletion(task);
+        int result = task.result;
+        releaseTaskId(taskId);
+        if (directCloseSucceeded(result)) {
+            fixedFileReleased(slot);
+        }
+        return result;
+    }
+
+    boolean closeDirectAsync(
+            int slot, CompletionHandler completionHandler) {
+        if (slot < 0 || slot >= MAX_FIXED_FILES) {
+            return false;
+        }
+        int taskId = acquireTaskId();
+        if (taskId < 0) {
+            return false;
+        }
+        UringTask task = tasks[taskId];
+        prepareTask(task);
+        TASK_THREAD_HANDLE.setRelease(task, null);
+        task.result = -11;
+        task.flags = 0;
+        task.completionHandler = (result, flags, terminal) -> {
+            if (terminal && directCloseSucceeded(result)) {
+                fixedFileReleased(slot);
+            }
+            completionHandler.onCompletion(result, flags, terminal);
+        };
+        try {
+            MemorySegment sqe = reserveSqe();
+            prepareDirectCloseSqe(sqe, slot, task.userData);
+            sqePending = true;
+            return true;
+        } catch (Throwable failure) {
+            task.completionHandler = null;
+            releaseTaskId(taskId);
+            return false;
+        }
+    }
+
+    int shutdownFixed(int slot, int how) {
+        if (slot < 0 || slot >= MAX_FIXED_FILES) {
+            return -9;
+        }
+        return submitOp(
+            Opcodes.IORING_OP_SHUTDOWN,
+            Opcodes.IOSQE_FIXED_FILE,
+            slot,
+            0L,
+            how,
+            0L,
+            0,
+            (short) 0
+        );
+    }
+
+    void fixedFileAccepted(int slot) {
+        if (slot < 0 || slot >= MAX_FIXED_FILES) {
+            throw new IllegalArgumentException(
+                "Invalid direct-accept fixed slot: " + slot);
+        }
+        fixedFileAcquired();
+    }
+
+    void whenFixedFileAvailable(Runnable waiter) {
+        fixedFileCapacityMisses++;
+        if (activeFixedFiles < MAX_FIXED_FILES) {
+            waiter.run();
+        } else {
+            fixedFileWaiters.addLast(waiter);
+        }
+    }
+
+    private void fixedFileAcquired() {
+        int active = ++activeFixedFiles;
+        if (active > peakActiveFixedFiles) {
+            peakActiveFixedFiles = active;
+        }
+    }
+
+    static boolean directCloseSucceeded(int result) {
+        return result == 0;
+    }
+
+    private void fixedFileReleased(int slot) {
+        registeredFds.set(
+            ValueLayout.JAVA_INT, (long) slot * 4, -1);
+        if (activeFixedFiles > 0) {
+            activeFixedFiles--;
+        }
+        Runnable waiter = fixedFileWaiters.pollFirst();
+        if (waiter != null) {
+            waiter.run();
+        }
+    }
+
+    static void prepareFilesUpdateSqe(
+            MemorySegment sqe, long valuesAddress,
+            int offset, long userData) {
+        requireSqe(sqe);
+        sqe.fill((byte) 0);
+        sqe.set(ValueLayout.JAVA_BYTE, 0, Opcodes.IORING_OP_FILES_UPDATE);
+        sqe.set(ValueLayout.JAVA_INT, 4, -1);
+        sqe.set(ValueLayout.JAVA_LONG, 8, (long) offset);
+        sqe.set(ValueLayout.JAVA_LONG, 16, valuesAddress);
+        sqe.set(ValueLayout.JAVA_INT, 24, 1);
+        sqe.set(ValueLayout.JAVA_LONG, 32, userData);
+    }
+
+    static void prepareDirectAcceptSqe(
+            MemorySegment sqe, int listenerFd, long userData) {
+        requireSqe(sqe);
+        sqe.fill((byte) 0);
+        sqe.set(ValueLayout.JAVA_BYTE, 0, Opcodes.IORING_OP_ACCEPT);
+        sqe.set(
+            ValueLayout.JAVA_SHORT, 2, Opcodes.IORING_ACCEPT_MULTISHOT);
+        sqe.set(ValueLayout.JAVA_INT, 4, listenerFd);
+        sqe.set(ValueLayout.JAVA_LONG, 32, userData);
+        sqe.set(
+            ValueLayout.JAVA_INT, 44, Opcodes.IORING_FILE_INDEX_ALLOC);
+    }
+
+    static void prepareDirectCloseSqe(
+            MemorySegment sqe, int slot, long userData) {
+        requireSqe(sqe);
+        if (slot < 0 || slot == Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(
+                "Invalid fixed-file slot: " + slot);
+        }
+        sqe.fill((byte) 0);
+        sqe.set(ValueLayout.JAVA_BYTE, 0, Opcodes.IORING_OP_CLOSE);
+        sqe.set(ValueLayout.JAVA_INT, 4, 0);
+        sqe.set(ValueLayout.JAVA_LONG, 32, userData);
+        sqe.set(ValueLayout.JAVA_INT, 44, slot + 1);
+    }
+
+    private static void requireSqe(MemorySegment sqe) {
+        if (sqe.byteSize() < 64) {
+            throw new IllegalArgumentException(
+                "An io_uring SQE requires 64 bytes");
+        }
     }
 
     public RecvResult recvSelectedBuffer(int fd, int len, short bgid, int fixedSlot) {
@@ -1073,7 +1669,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         try {
             MemorySegment sqeRaw = ring.getSqe();
             if (sqeRaw.equals(MemorySegment.NULL)) {
-                int unused = ring.submit();
+                submitForSqeSpace();
                 sqeRaw = ring.getSqe();
                 if (sqeRaw.equals(MemorySegment.NULL)) {
                     throw new RuntimeException("SQE queue completely full!");
@@ -1135,7 +1731,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         try {
             MemorySegment sqeRaw = ring.getSqe();
             if (sqeRaw.equals(MemorySegment.NULL)) {
-                int unused = ring.submit();
+                submitForSqeSpace();
                 sqeRaw = ring.getSqe();
                 if (sqeRaw.equals(MemorySegment.NULL)) {
                     task.completionHandler = null;
@@ -1191,7 +1787,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         try {
             MemorySegment sqeRaw = ring.getSqe();
             if (sqeRaw.equals(MemorySegment.NULL)) {
-                int unused = ring.submit();
+                submitForSqeSpace();
                 sqeRaw = ring.getSqe();
                 if (sqeRaw.equals(MemorySegment.NULL)) {
                     task.completionHandler = null;
@@ -1324,6 +1920,16 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         if (bufferId < 0 || bufferId >= numBuffers) {
             throw new IllegalArgumentException("Invalid bufferId: " + bufferId);
         }
+        appendReturnedBuffer(bufferId);
+        SHORT_HANDLE.setRelease(bufRingSegment, 14L, pbufTail);
+
+        Runnable waiter = inboundBufferWaiters.pollFirst();
+        if (waiter != null) {
+            waiter.run();
+        }
+    }
+
+    private void appendReturnedBuffer(int bufferId) {
         long bufAddr = ringBuffers.address() + (long) bufferId * BUFFER_SIZE;
         int tail = pbufTail & 0xFFFF;
         int index = tail & pbufMask;
@@ -1335,12 +1941,6 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         bufRingSegment.set(ValueLayout.JAVA_SHORT, offset + 14, (short) 0);
 
         pbufTail = (short) (tail + 1);
-        SHORT_HANDLE.setRelease(bufRingSegment, 14L, pbufTail);
-
-        Runnable waiter = inboundBufferWaiters.pollFirst();
-        if (waiter != null) {
-            waiter.run();
-        }
     }
 
     void returnKtlsBuffer(int bufferId) {
@@ -1348,6 +1948,17 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             throw new IllegalArgumentException(
                 "Invalid kTLS bufferId: " + bufferId);
         }
+        appendReturnedKtlsBuffer(bufferId);
+        SHORT_HANDLE.setRelease(
+            ktlsBufRingSegment, 14L, ktlsPbufTail);
+
+        Runnable waiter = ktlsBufferWaiters.pollFirst();
+        if (waiter != null) {
+            waiter.run();
+        }
+    }
+
+    private void appendReturnedKtlsBuffer(int bufferId) {
         long bufferAddress = ktlsRingBuffers.address()
             + (long) bufferId * KTLS_BUFFER_SIZE;
         int tail = ktlsPbufTail & 0xffff;
@@ -1364,12 +1975,61 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             ValueLayout.JAVA_SHORT, offset + 14, (short) 0);
 
         ktlsPbufTail = (short) (tail + 1);
-        SHORT_HANDLE.setRelease(
-            ktlsBufRingSegment, 14L, ktlsPbufTail);
+    }
 
-        Runnable waiter = ktlsBufferWaiters.pollFirst();
-        if (waiter != null) {
-            waiter.run();
+    void releaseInboundChunk(InboundChunk chunk) {
+        if (LOCAL_READY_QUEUE_ENABLED && inCarrierDomain()) {
+            int bufferId = chunk.bufferId();
+            if (chunk.bufferGroup() == KTLS_BUF_GROUP) {
+                if (returnedKtlsBufferCount == returnedKtlsBufferIds.length) {
+                    flushReturnedBuffers();
+                }
+                returnedKtlsBufferIds[returnedKtlsBufferCount++] = bufferId;
+            } else {
+                if (returnedInboundBufferCount
+                        == returnedInboundBufferIds.length) {
+                    flushReturnedBuffers();
+                }
+                returnedInboundBufferIds[returnedInboundBufferCount++] =
+                    bufferId;
+            }
+            return;
+        }
+        execute(chunk);
+    }
+
+    private void flushReturnedBuffers() {
+        int inboundCount = returnedInboundBufferCount;
+        if (inboundCount != 0) {
+            returnedInboundBufferCount = 0;
+            for (int i = 0; i < inboundCount; i++) {
+                appendReturnedBuffer(returnedInboundBufferIds[i]);
+            }
+            SHORT_HANDLE.setRelease(bufRingSegment, 14L, pbufTail);
+            for (int i = 0; i < inboundCount; i++) {
+                Runnable waiter = inboundBufferWaiters.pollFirst();
+                if (waiter == null) {
+                    break;
+                }
+                waiter.run();
+            }
+        }
+
+        int ktlsCount = returnedKtlsBufferCount;
+        if (ktlsCount != 0) {
+            returnedKtlsBufferCount = 0;
+            for (int i = 0; i < ktlsCount; i++) {
+                appendReturnedKtlsBuffer(returnedKtlsBufferIds[i]);
+            }
+            SHORT_HANDLE.setRelease(
+                ktlsBufRingSegment, 14L, ktlsPbufTail);
+            for (int i = 0; i < ktlsCount; i++) {
+                Runnable waiter = ktlsBufferWaiters.pollFirst();
+                if (waiter == null) {
+                    break;
+                }
+                waiter.run();
+            }
         }
     }
 
@@ -1386,6 +2046,17 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     }
 
     public long acceptMultishot(int serverFd, CompletionHandler completionHandler) {
+        return acceptMultishot(serverFd, false, completionHandler);
+    }
+
+    public long acceptMultishotDirect(
+            int serverFd, CompletionHandler completionHandler) {
+        return acceptMultishot(serverFd, true, completionHandler);
+    }
+
+    private long acceptMultishot(
+            int serverFd, boolean direct,
+            CompletionHandler completionHandler) {
         int taskId = acquireTaskId();
         if (taskId < 0) {
             return -1;
@@ -1399,23 +2070,18 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         task.fd = serverFd;
 
         try {
-            MemorySegment sqeRaw = ring.getSqe();
-            if (sqeRaw.equals(MemorySegment.NULL)) {
-                int unused = ring.submit();
-                sqeRaw = ring.getSqe();
-                if (sqeRaw.equals(MemorySegment.NULL)) {
-                    task.completionHandler = null;
-                    releaseTaskId(taskId);
-                    return -1;
-                }
+            MemorySegment sqe = reserveSqe();
+            if (direct) {
+                prepareDirectAcceptSqe(sqe, serverFd, task.userData);
+            } else {
+                sqe.fill((byte) 0);
+                sqe.set(ValueLayout.JAVA_BYTE, 0, Opcodes.IORING_OP_ACCEPT);
+                sqe.set(
+                    ValueLayout.JAVA_SHORT, 2,
+                    Opcodes.IORING_ACCEPT_MULTISHOT);
+                sqe.set(ValueLayout.JAVA_INT, 4, serverFd);
+                sqe.set(ValueLayout.JAVA_LONG, 32, task.userData);
             }
-
-            MemorySegment sqe = sqeRaw;
-            sqe.fill((byte) 0);
-            sqe.set(ValueLayout.JAVA_BYTE, 0, Opcodes.IORING_OP_ACCEPT);
-            sqe.set(ValueLayout.JAVA_SHORT, 2, Opcodes.IORING_ACCEPT_MULTISHOT);
-            sqe.set(ValueLayout.JAVA_INT, 4, serverFd);
-            sqe.set(ValueLayout.JAVA_LONG, 32, task.userData);
             sqePending = true;
             return task.userData;
         } catch (Throwable t) {
@@ -1508,6 +2174,10 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         return virtualThreadFactory;
     }
 
+    boolean inCarrierDomain() {
+        return carrierDomain.containsCurrentThread();
+    }
+
     ExchangeExecutor exchangeExecutor() {
         return exchangeExecutor;
     }
@@ -1540,11 +2210,55 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         return requested;
     }
 
+    private static int schedulerBudget(String property, int defaultValue) {
+        if (!BOUNDED_TURNS_ENABLED) {
+            return Integer.MAX_VALUE;
+        }
+        int configured = Integer.getInteger(property, defaultValue);
+        if (configured <= 0) {
+            throw new IllegalArgumentException(
+                property + " must be positive");
+        }
+        return configured;
+    }
+
+    private static long schedulerQuantumNanos() {
+        long micros = Long.getLong(
+            "cardigan.scheduler.protocolQuantumMicros", 50L);
+        if (micros <= 0 || micros > Long.MAX_VALUE / 1_000L) {
+            throw new IllegalArgumentException(
+                "cardigan.scheduler.protocolQuantumMicros must be positive");
+        }
+        return micros * 1_000L;
+    }
+
     record TaskPoolStats(
         int capacity,
         int active,
         int peak,
         long exhaustions
+    ) {}
+
+    record SchedulerStats(
+        long turns,
+        long cqes,
+        long completionTasks,
+        long protocolTasks,
+        long handlerContinuations,
+        long egressTasks,
+        long externalTasks,
+        long taskWorkEnters,
+        long submits,
+        long waits,
+        long cqOverflows
+    ) {}
+
+    record FixedFileStats(
+        int capacity,
+        int active,
+        int peak,
+        long capacityMisses,
+        int admissionWaiters
     ) {}
 
     TaskPoolStats taskPoolStats() {
@@ -1553,6 +2267,32 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             activeTasks,
             peakActiveTasks,
             taskPoolExhaustions
+        );
+    }
+
+    SchedulerStats schedulerStats() {
+        return new SchedulerStats(
+            schedulerTurns,
+            schedulerCqes,
+            schedulerCompletionTasks,
+            schedulerProtocolTasks,
+            schedulerHandlerTasks,
+            schedulerEgressTasks,
+            schedulerExternalTasks,
+            schedulerTaskWorkEnters,
+            schedulerSubmits,
+            schedulerWaits,
+            ring == null ? 0 : ring.cqOverflowCount()
+        );
+    }
+
+    FixedFileStats fixedFileStats() {
+        return new FixedFileStats(
+            MAX_FIXED_FILES,
+            activeFixedFiles,
+            peakActiveFixedFiles,
+            fixedFileCapacityMisses,
+            fixedFileWaiters.size()
         );
     }
 
@@ -1589,48 +2329,145 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     }
 
     private void triggerWakeup() {
-        try {
-            long unused = (long) Libc.write.invokeExact(evfd, wakeupBuf, 8L);
-        } catch (Throwable t) {
-            // The submitted task remains queued if the best-effort wakeup fails.
+        while (!writeWakeupEvent()) {
+            int failures = wakeupWriteFailures.incrementAndGet();
+            // Do not leave the coalescing latch asserted unless an event was
+            // actually delivered. Pair the clear with a fresh readiness
+            // check so the task whose wakeup failed cannot be abandoned.
+            wakeupPending.set(0);
+            VarHandle.fullFence();
+
+            if (!isSleeping || readyTasks.isEmpty()) {
+                return;
+            }
+            if (!wakeupPending.compareAndSet(0, 1)) {
+                // Another producer owns the retry.
+                return;
+            }
+            if (failures >= 2) {
+                wakeupPending.set(0);
+                throw failWakeupChannel();
+            }
+        }
+        wakeupWriteFailures.set(0);
+    }
+
+    private RejectedExecutionException failWakeupChannel() {
+        IllegalStateException failure = new IllegalStateException(
+            "eventfd wakeup channel failed for CPU " + cpuId);
+        wakeupFailure = failure;
+        System.err.println(failure.getMessage());
+        // A permanent eventfd failure leaves no normal way to interrupt the
+        // blocking enter. Mark the loop failed first, then make a best-effort
+        // attempt to break the carrier out of the syscall.
+        loopThread.interrupt();
+        return new RejectedExecutionException(
+            "Event loop wakeup channel failed", failure);
+    }
+
+    private boolean writeWakeupEvent() {
+        while (true) {
+            try {
+                long written = (long) Libc.write.invokeExact(
+                    evfd, wakeupBuf, 8L);
+                if (written == 8L) {
+                    return true;
+                }
+                if (written < 0 && Libc.errno() == EINTR) {
+                    continue;
+                }
+                return false;
+            } catch (Throwable failure) {
+                return false;
+            }
         }
     }
 
     @Override
     public void execute(Runnable command) {
-        if (LOCAL_READY_QUEUE_ENABLED && Thread.currentThread() == loopThread
-            && dispatchingCompletions) {
-            localReadyTasks.addLast(command);
+        if (LOCAL_READY_QUEUE_ENABLED && inCarrierDomain()) {
+            if (command instanceof HandlerContinuation) {
+                handlerReadyTasks.addLast(command);
+            } else if (command instanceof EgressTask) {
+                egressReadyTasks.addLast(command);
+            } else if (dispatchingCompletions) {
+                completionReadyTasks.addLast(command);
+            } else {
+                protocolReadyTasks.addLast(command);
+            }
             return;
         }
 
+        enqueueExternal(command);
+    }
+
+    void executeHandler(HandlerContinuation command) {
+        if (LOCAL_READY_QUEUE_ENABLED && inCarrierDomain()) {
+            handlerReadyTasks.addLast(command);
+            return;
+        }
+        enqueueExternal(command);
+    }
+
+    void executeEgress(EgressTask command) {
+        if (LOCAL_READY_QUEUE_ENABLED && inCarrierDomain()) {
+            egressReadyTasks.addLast(command);
+            return;
+        }
+        enqueueExternal(command);
+    }
+
+    private void enqueueExternal(Runnable command) {
+        Throwable failure = wakeupFailure;
+        if (closed || failure != null) {
+            throw new RejectedExecutionException(
+                "Event loop is not accepting work", failure);
+        }
         if (!readyTasks.offer(command)) {
             throw new RejectedExecutionException("Event loop ready queue full");
         }
 
         VarHandle.fullFence();
 
-        if (isSleeping && Thread.currentThread() != loopThread) {
+        if (isSleeping && !inCarrierDomain()
+            && wakeupPending.compareAndSet(0, 1)) {
             triggerWakeup();
         }
     }
 
     @Override
-    public void close() {
-        if (closed) return;
-        exchangeExecutor.close();
-        closed = true;
-
-        try {
-            long unused = (long) Libc.write.invokeExact(evfd, wakeupBuf, 8L);
-        } catch (Throwable t) {
-            // Continue teardown if the wakeup descriptor is unavailable.
+    public synchronized void close() {
+        if (resourcesClosed) return;
+        if (!closed) {
+            exchangeExecutor.close();
+            boolean workersStopped =
+                exchangeExecutor.awaitTermination(2_000);
+            if (!workersStopped) {
+                throw new IllegalStateException(
+                    "Exchange workers for CPU " + cpuId
+                        + " did not terminate; retaining their live carrier, "
+                        + "io_uring, and native memory");
+            }
+            closed = true;
+            writeWakeupEvent();
         }
 
         try {
             loopThread.join(2000);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+
+        if (loopThread.isAlive()) {
+            StackTraceElement[] carrierStack = loopThread.getStackTrace();
+            String carrierLocation = carrierStack.length == 0
+                ? "unknown"
+                : carrierStack[0].toString();
+            throw new IllegalStateException(
+                "Event-loop carrier for CPU " + cpuId
+                    + " did not terminate; retaining its live io_uring "
+                    + "and native memory (state=" + loopThread.getState()
+                    + ", at=" + carrierLocation + ")");
         }
 
         if (TASK_POOL_STATS_ENABLED) {
@@ -1641,6 +2478,33 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                     + ", peak=" + stats.peak()
                     + ", active-at-close=" + stats.active()
                     + ", exhaustions=" + stats.exhaustions());
+        }
+        if (SCHEDULER_STATS_ENABLED) {
+            SchedulerStats stats = schedulerStats();
+            System.out.println(
+                "Uring scheduler CPU " + cpuId
+                    + ": turns=" + stats.turns()
+                    + ", cqes=" + stats.cqes()
+                    + ", completion-tasks=" + stats.completionTasks()
+                    + ", protocol-tasks=" + stats.protocolTasks()
+                    + ", handler-continuations="
+                    + stats.handlerContinuations()
+                    + ", egress-tasks=" + stats.egressTasks()
+                    + ", external-tasks=" + stats.externalTasks()
+                    + ", task-work-enters=" + stats.taskWorkEnters()
+                    + ", submits=" + stats.submits()
+                    + ", waits=" + stats.waits()
+                    + ", cq-overflows=" + stats.cqOverflows());
+        }
+        if (FIXED_FILE_STATS_ENABLED) {
+            FixedFileStats stats = fixedFileStats();
+            System.out.println(
+                "Fixed-file table CPU " + cpuId
+                    + ": capacity=" + stats.capacity()
+                    + ", peak=" + stats.peak()
+                    + ", active-at-close=" + stats.active()
+                    + ", capacity-misses=" + stats.capacityMisses()
+                    + ", admission-waiters=" + stats.admissionWaiters());
         }
 
         try {
@@ -1675,6 +2539,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         }
 
         arena.close();
+        resourcesClosed = true;
         System.out.println("Closed UringEventLoop for CPU " + cpuId);
     }
 

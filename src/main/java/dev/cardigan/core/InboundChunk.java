@@ -65,6 +65,10 @@ class InboundChunk implements AutoCloseable, Runnable {
         return bufferId;
     }
 
+    short bufferGroup() {
+        return UringEventLoop.BUF_GROUP;
+    }
+
     MemorySegment segment() {
         return segment;
     }
@@ -108,7 +112,7 @@ class InboundChunk implements AutoCloseable, Runnable {
         int remaining = current - 1;
         if (remaining == 0) {
             if (owner != null) {
-                owner.execute(this);
+                owner.releaseInboundChunk(this);
             } else {
                 testReleaser.accept(bufferId);
             }

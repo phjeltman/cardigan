@@ -8,6 +8,7 @@ import java.lang.foreign.*;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import dev.cardigan.http.HttpRequest;
 import dev.cardigan.pico.PicoHTTPParser;
@@ -50,6 +51,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
     private final boolean http1Only;
     private final boolean directKtlsReceiveConfigured;
     private final TlsContext tlsContext;
+    private final FixedFilesMode fixedFilesMode;
+    private final boolean directAccept;
     private final List<UringEventLoop> eventLoops = new ArrayList<>();
     private final List<Integer> serverFds = new ArrayList<>();
     private final List<AcceptHandler> acceptHandlers = new ArrayList<>();
@@ -72,9 +75,36 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
     private static final int SHUT_RD = 0;
     private static final int SHUT_RDWR = 2;
 
+    private enum FixedFilesMode {
+        AUTO,
+        LEGACY,
+        ASYNC_EXPLICIT,
+        ASYNC_ALLOC,
+        DIRECT;
+
+        private static FixedFilesMode configured() {
+            String value = System.getProperty(
+                "cardigan.fixed.files.mode", "auto");
+            return switch (value.trim().toLowerCase(Locale.ROOT)) {
+                case "auto" -> AUTO;
+                case "legacy" -> LEGACY;
+                case "async-explicit" -> ASYNC_EXPLICIT;
+                case "async-alloc" -> ASYNC_ALLOC;
+                case "direct" -> DIRECT;
+                default -> throw new IllegalArgumentException(
+                    "cardigan.fixed.files.mode must be one of "
+                        + "auto, legacy, async-explicit, async-alloc, direct");
+            };
+        }
+    }
+
     public static final long MAX_REQUEST_SIZE = Long.getLong("cardigan.max.request.size", 10 * 1024 * 1024L);
     public static final int MAX_HEADER_SIZE = Integer.getInteger("cardigan.max.header.size", 8192);
     public static final int MAX_HTTP1_IN_FLIGHT = Integer.getInteger("cardigan.http1.max.inflight", 128);
+    private static final int PROTOCOL_CHECKPOINT_INTERVAL = Math.max(
+        1,
+        Integer.getInteger(
+            "cardigan.scheduler.protocolCheckpointInterval", 16));
 
     private static final long HTTP1_FRAMING_CHUNKED = 1L << 60;
     private static final long HTTP1_EXPECT_CONTINUE = 1L << 61;
@@ -213,6 +243,14 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         this.http1Only = protocolMode == ProtocolMode.HTTP1_ONLY;
         this.directKtlsReceiveConfigured =
             tlsConfig != null && tlsConfig.directKtlsReceive();
+        this.fixedFilesMode = FixedFilesMode.configured();
+        if (fixedFilesMode == FixedFilesMode.DIRECT && tlsConfig != null) {
+            throw new IllegalArgumentException(
+                "Direct fixed-file accept cannot be used with OpenSSL TLS; "
+                    + "use auto or async-alloc");
+        }
+        this.directAccept = fixedFilesMode == FixedFilesMode.DIRECT
+            || (fixedFilesMode == FixedFilesMode.AUTO && tlsConfig == null);
         this.tlsContext = tlsConfig == null
             ? null
             : new TlsContext(tlsConfig, http2Only, http1Only);
@@ -337,7 +375,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 + Arrays.toString(eventLoopCpus) + ", transport="
                 + (tlsContext == null
                     ? "plaintext"
-                    : "TLS/OpenSSL") + "...");
+                    : "TLS/OpenSSL")
+                + ", fixed-files=" + effectiveFixedFilesMode() + "...");
 
         try {
             for (int i = 0; i < cores; i++) {
@@ -384,6 +423,18 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             throw new IllegalStateException(
                 "Cardigan startup failed", failure);
         }
+    }
+
+    private String effectiveFixedFilesMode() {
+        if (directAccept) {
+            return "direct";
+        }
+        return switch (fixedFilesMode) {
+            case AUTO, ASYNC_ALLOC -> "async-alloc";
+            case ASYNC_EXPLICIT -> "async-explicit";
+            case LEGACY -> "legacy";
+            case DIRECT -> "direct";
+        };
     }
 
     private static void awaitStartup(CountDownLatch listenersReady) {
@@ -539,7 +590,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 throw systemCallFailure("listen");
             }
 
-            handler = new AcceptHandler(loop, serverFd);
+            handler = new AcceptHandler(loop, serverFd, directAccept);
             if (!handler.arm()) {
                 throw new IllegalStateException(
                     "Unable to arm required multishot accept on CPU "
@@ -576,12 +627,15 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
     private final class AcceptHandler implements UringEventLoop.CompletionHandler {
         private final UringEventLoop loop;
         private final int serverFd;
+        private final boolean direct;
         private final CountDownLatch stopped = new CountDownLatch(1);
         private volatile long acceptToken = -1;
 
-        private AcceptHandler(UringEventLoop loop, int serverFd) {
+        private AcceptHandler(
+                UringEventLoop loop, int serverFd, boolean direct) {
             this.loop = loop;
             this.serverFd = serverFd;
+            this.direct = direct;
         }
 
         @Override
@@ -590,10 +644,17 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 if (!terminal) {
                     multishotAcceptObserved = true;
                 }
-                if (running) {
-                    startConnection(loop, result);
+                ConnectionSocket socket;
+                if (direct) {
+                    loop.fixedFileAccepted(result);
+                    socket = ConnectionSocket.direct(result);
                 } else {
-                    closeSocket(result);
+                    socket = ConnectionSocket.raw(result);
+                }
+                if (running) {
+                    startConnection(loop, socket);
+                } else {
+                    closeAcceptedSocket(socket);
                 }
             }
 
@@ -606,7 +667,9 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 return;
             }
 
-            if (result == -22) {
+            if (direct && result == -23) {
+                loop.whenFixedFileAvailable(this::resumeAfterCapacity);
+            } else if (result == -22) {
                 System.err.println(
                     "Required io_uring multishot accept was rejected; "
                         + "Cardigan requires Linux 6.1 or newer");
@@ -619,9 +682,41 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         }
 
         private boolean arm() {
-            long token = loop.acceptMultishot(serverFd, this);
+            long token = direct
+                ? loop.acceptMultishotDirect(serverFd, this)
+                : loop.acceptMultishot(serverFd, this);
             acceptToken = token;
             return token >= 0;
+        }
+
+        private void resumeAfterCapacity() {
+            if (!running) {
+                stopped.countDown();
+            } else if (!arm()) {
+                System.err.println(
+                    "Unable to rearm direct multishot accept after "
+                        + "fixed-file capacity became available");
+                stopped.countDown();
+            }
+        }
+
+        private void closeAcceptedSocket(ConnectionSocket socket) {
+            if (!socket.direct()) {
+                closeSocket(socket.rawFd());
+                return;
+            }
+            if (!loop.closeDirectAsync(
+                    socket.fixedSlot(), (result, flags, terminal) -> {
+                    })) {
+                try {
+                    loop.startVirtualThread(
+                        () -> loop.closeDirect(socket.fixedSlot()));
+                } catch (Throwable failure) {
+                    System.err.println(
+                        "Unable to close direct accepted slot "
+                            + socket.fixedSlot());
+                }
+            }
         }
 
         private void beginStop() {
@@ -658,8 +753,9 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         }
     }
 
-    private void startConnection(UringEventLoop loop, int clientFd) {
-        ConnectionControl control = new ConnectionControl(loop, clientFd);
+    private void startConnection(
+            UringEventLoop loop, ConnectionSocket socket) {
+        ConnectionControl control = new ConnectionControl(loop, socket);
         activeConnectionCount.incrementAndGet();
         activeConnections.add(control);
         try {
@@ -668,11 +764,34 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             control.owner = owner;
         } catch (Throwable failure) {
             connectionClosed(control);
-            closeSocket(clientFd);
+            if (socket.direct()) {
+                if (!loop.closeDirectAsync(
+                        socket.fixedSlot(), (result, flags, terminal) -> {
+                        })) {
+                    loop.startVirtualThread(
+                        () -> loop.closeDirect(socket.fixedSlot()));
+                }
+            } else {
+                closeSocket(socket.rawFd());
+            }
             throw failure;
         }
         if (lifecycle != LIFECYCLE_RUNNING) {
             control.requestDrain();
+        }
+    }
+
+    private record ConnectionSocket(
+        int rawFd,
+        int fixedSlot,
+        boolean direct
+    ) {
+        private static ConnectionSocket raw(int fd) {
+            return new ConnectionSocket(fd, -1, false);
+        }
+
+        private static ConnectionSocket direct(int slot) {
+            return new ConnectionSocket(-1, slot, true);
         }
     }
 
@@ -688,8 +807,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
 
     private void handleConnection(ConnectionControl control) {
         UringEventLoop loop = control.loop;
-        int clientFd = control.clientFd;
-        int fixedSlot = -1;
+        int clientFd = control.socket.rawFd();
+        int fixedSlot = control.socket.fixedSlot();
         TlsConnection tls = null;
         ConnectionWriter writer = null;
         InboundReceiver receiver = null;
@@ -698,12 +817,22 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         MemorySegment currentBuf = null;
         int readOffset = 0;
         try {
-            fixedSlot = loop.registerFixedFd(clientFd);
-            if (fixedSlot < 0) {
-                // The fixed-file table is the connection-admission boundary;
-                // never silently switch an admitted connection to raw FDs.
-                return;
+            if (!control.socket.direct()) {
+                fixedSlot = switch (fixedFilesMode) {
+                    case LEGACY -> loop.registerFixedFdLegacy(clientFd);
+                    case ASYNC_EXPLICIT ->
+                        loop.registerFixedFdAsyncExplicit(clientFd);
+                    case AUTO, ASYNC_ALLOC -> loop.registerFixedFd(clientFd);
+                    case DIRECT -> throw new IllegalStateException(
+                        "Direct accept produced a raw descriptor");
+                };
+                if (fixedSlot < 0) {
+                    // The fixed-file table is the connection-admission
+                    // boundary; never silently switch to raw-descriptor I/O.
+                    return;
+                }
             }
+            control.fixedSlot = fixedSlot;
             if (tlsContext != null) {
                 tls = tlsContext.accept(loop, clientFd, fixedSlot);
                 if (tls == null) {
@@ -801,28 +930,31 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 t.printStackTrace();
             }
         } finally {
-            if (currentChunk != null) {
-                try {
-                    currentChunk.close();
-                } catch (Throwable t) {
-                    // Connection teardown releases the receiver resources below.
+            try {
+                if (currentChunk != null) {
+                    try {
+                        currentChunk.close();
+                    } catch (Throwable t) {
+                        // Connection teardown releases the receiver resources below.
+                    }
+                    currentChunk = null;
                 }
-                currentChunk = null;
+                if (inbound != null) {
+                    inbound.close();
+                }
+                if (receiver != null) {
+                    receiver.close();
+                }
+                if (writer != null) {
+                    writer.awaitDrained();
+                }
+                if (tls != null) {
+                    tls.close();
+                }
+                control.closeSocketRegistration(fixedSlot);
+            } finally {
+                connectionClosed(control);
             }
-            if (inbound != null) {
-                inbound.close();
-            }
-            if (receiver != null) {
-                receiver.close();
-            }
-            if (writer != null) {
-                writer.awaitDrained();
-            }
-            if (tls != null) {
-                tls.close();
-            }
-            control.closeSocketRegistration(fixedSlot);
-            connectionClosed(control);
         }
     }
 
@@ -836,10 +968,15 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         MemorySegment currentBuf = initialChunk.segment();
         int readOffset = initialReadOffset;
         int requestOffset = 0;
+        int requestsUntilCheckpoint = PROTOCOL_CHECKPOINT_INTERVAL;
         HttpRequest request = new HttpRequest();
         Http1ExchangeSequencer exchangeSequencer = null;
         try {
             while (keepAlive) {
+                if (--requestsUntilCheckpoint == 0) {
+                    requestsUntilCheckpoint = PROTOCOL_CHECKPOINT_INTERVAL;
+                    loop.protocolCheckpoint();
+                }
                 if (control.draining) {
                     break;
                 }
@@ -2259,7 +2396,6 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
     @Override
     public synchronized void close() {
         if (lifecycle == LIFECYCLE_CLOSED) return;
-        if (lifecycle == LIFECYCLE_DRAINING) return;
         lifecycle = LIFECYCLE_DRAINING;
         running = false;
 
@@ -2289,7 +2425,14 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             for (ConnectionControl connection : activeConnections) {
                 connection.forceClose();
             }
-            awaitConnections(forcedShutdownMillis);
+            drained = awaitConnections(forcedShutdownMillis);
+        }
+        if (!drained) {
+            throw new IllegalStateException(
+                "Forced shutdown did not quiesce "
+                    + activeConnectionCount.get()
+                    + " connection(s); retaining their live event loops "
+                    + "and native resources");
         }
 
         if (Http2ResourceStats.ENABLED) {
@@ -2298,12 +2441,22 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     + Http2ResourceStats.snapshot().summary());
         }
 
+        IllegalStateException loopCloseFailure = null;
         for (UringEventLoop loop : eventLoops) {
             try {
                 loop.close();
             } catch (Exception e) {
                 System.err.println("Error closing event loop: " + e.getMessage());
+                if (loopCloseFailure == null) {
+                    loopCloseFailure = new IllegalStateException(
+                        "One or more event loops could not stop safely", e);
+                } else {
+                    loopCloseFailure.addSuppressed(e);
+                }
             }
+        }
+        if (loopCloseFailure != null) {
+            throw loopCloseFailure;
         }
         if (tlsContext != null && TlsStats.ENABLED) {
             System.out.println(
@@ -2391,7 +2544,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         private static final int HTTP2 = 2;
 
         private final UringEventLoop loop;
-        private final int clientFd;
+        private final ConnectionSocket socket;
         private final AtomicBoolean inputShutdown = new AtomicBoolean();
         private final AtomicBoolean forceStarted = new AtomicBoolean();
         private final ReentrantLock socketLifecycleLock =
@@ -2400,15 +2553,18 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         private volatile int protocol;
         private volatile boolean draining;
         private volatile boolean done;
+        private volatile int fixedSlot;
         private volatile TlsConnection tls;
         // Holds either the response sequencer or isolated-streaming state;
         // sharing one slot avoids per-connection storage for both.
         private volatile Object http1;
         private volatile Http2Connection http2;
 
-        private ConnectionControl(UringEventLoop loop, int clientFd) {
+        private ConnectionControl(
+                UringEventLoop loop, ConnectionSocket socket) {
             this.loop = loop;
-            this.clientFd = clientFd;
+            this.socket = socket;
+            this.fixedSlot = socket.fixedSlot();
         }
 
         private void requestDrain() {
@@ -2429,19 +2585,29 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         }
 
         private void requestInputShutdown() {
-            try {
-                loop.startVirtualThread(this::shutdownInput);
-            } catch (Throwable ignored) {
-                shutdownInput();
-            }
+            startLoopVirtualThread(this::shutdownInput);
         }
 
         private void requestHttp2Drain(Http2Connection connection) {
+            startLoopVirtualThread(
+                () -> connection.beginDrain(this::shutdownInput));
+        }
+
+        private void startLoopVirtualThread(Runnable task) {
             try {
-                loop.startVirtualThread(
-                    () -> connection.beginDrain(this::shutdownInput));
+                loop.startVirtualThread(task);
             } catch (Throwable ignored) {
-                shutdownInput();
+                try {
+                    loop.execute(() -> {
+                        try {
+                            loop.startVirtualThread(task);
+                        } catch (Throwable retryFailure) {
+                            // The owner loop is no longer able to accept work.
+                        }
+                    });
+                } catch (Throwable retryFailure) {
+                    // The owner loop is no longer able to accept work.
+                }
             }
         }
 
@@ -2459,7 +2625,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     if (connection != null) {
                         connection.close();
                     }
-                    shutdownSocket(clientFd, SHUT_RD);
+                    shutdownSocket(SHUT_RD);
                 } finally {
                     socketLifecycleLock.unlock();
                 }
@@ -2490,14 +2656,38 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 } catch (Throwable ignored) {
                 }
             }
+            if (socket.direct()) {
+                startLoopVirtualThread(this::shutdownDirectAndWakeOwner);
+                return;
+            }
             socketLifecycleLock.lock();
             try {
                 if (!done) {
-                    shutdownSocket(clientFd, SHUT_RDWR);
+                    CardiganServer.shutdownSocket(
+                        socket.rawFd(), SHUT_RDWR);
                 }
             } finally {
                 socketLifecycleLock.unlock();
             }
+            wakeOwner();
+        }
+
+        private void shutdownDirectAndWakeOwner() {
+            try {
+                socketLifecycleLock.lock();
+                try {
+                    if (!done) {
+                        shutdownSocket(SHUT_RDWR);
+                    }
+                } finally {
+                    socketLifecycleLock.unlock();
+                }
+            } finally {
+                wakeOwner();
+            }
+        }
+
+        private void wakeOwner() {
             Thread connectionOwner = owner;
             if (connectionOwner != null) {
                 LockSupport.unpark(connectionOwner);
@@ -2511,12 +2701,43 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     return;
                 }
                 try {
-                    loop.unregisterFixedFd(fixedSlot, clientFd);
+                    if (socket.direct()) {
+                        int result = loop.closeDirect(fixedSlot);
+                        if (result != 0) {
+                            throw new IllegalStateException(
+                                "Closing direct socket slot " + fixedSlot
+                                    + " failed with error " + result);
+                        }
+                    } else {
+                        switch (fixedFilesMode) {
+                            case LEGACY -> loop.unregisterFixedFdLegacy(
+                                fixedSlot, socket.rawFd());
+                            case ASYNC_EXPLICIT ->
+                                loop.unregisterFixedFdAsyncExplicit(
+                                    fixedSlot, socket.rawFd());
+                            case AUTO, ASYNC_ALLOC -> loop.unregisterFixedFd(
+                                fixedSlot, socket.rawFd());
+                            case DIRECT -> throw new IllegalStateException(
+                                "Direct mode retained a raw socket");
+                        }
+                    }
+                    this.fixedSlot = -1;
                 } finally {
                     done = true;
                 }
             } finally {
                 socketLifecycleLock.unlock();
+            }
+        }
+
+        private void shutdownSocket(int how) {
+            if (socket.direct()) {
+                int slot = fixedSlot;
+                if (slot >= 0) {
+                    loop.shutdownFixed(slot, how);
+                }
+            } else {
+                CardiganServer.shutdownSocket(socket.rawFd(), how);
             }
         }
     }

@@ -42,6 +42,10 @@ final class Http2Connection {
             "cardigan.http2.max.streaming.bodies.per.connection", 16));
     private static final int RECEIVE_WINDOW_UPDATE_THRESHOLD =
         (INITIAL_WINDOW_SIZE + 1) >>> 1;
+    private static final int PROTOCOL_CHECKPOINT_INTERVAL = Math.max(
+        1,
+        Integer.getInteger(
+            "cardigan.scheduler.protocolCheckpointInterval", 16));
     private static final VarHandle IN_FLIGHT;
     private static final VarHandle FREE_TASK_COUNT;
     private static final VarHandle TASK_ACTIVE;
@@ -151,6 +155,7 @@ final class Http2Connection {
                 return;
             }
 
+            int framesUntilCheckpoint = PROTOCOL_CHECKPOINT_INTERVAL;
             while (open) {
                 MemorySegment header;
                 long headerOffset;
@@ -182,6 +187,11 @@ final class Http2Connection {
                         || (flags & Http2Frames.FLAG_ACK) != 0)) {
                     connectionError(Http2Frames.PROTOCOL_ERROR);
                     break;
+                }
+
+                if (--framesUntilCheckpoint == 0) {
+                    framesUntilCheckpoint = PROTOCOL_CHECKPOINT_INTERVAL;
+                    writer.eventLoop().protocolCheckpoint();
                 }
 
                 if (payloadLength == 0) {

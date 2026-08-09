@@ -18,6 +18,11 @@ final class KtlsInboundChunk extends InboundChunk {
     }
 
     @Override
+    short bufferGroup() {
+        return UringEventLoop.KTLS_BUF_GROUP;
+    }
+
+    @Override
     public void run() {
         ktlsOwner.returnKtlsBuffer(ktlsBufferId);
     }

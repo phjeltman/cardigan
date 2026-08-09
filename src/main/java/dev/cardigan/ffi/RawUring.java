@@ -34,6 +34,10 @@ public final class RawUring implements AutoCloseable {
 
     private static final int IORING_ENTER_GETEVENTS = 1;
     private static final int IORING_FEAT_SINGLE_MMAP = 1;
+    private static final int IORING_SQ_CQ_OVERFLOW = 1 << 1;
+    private static final int IORING_SQ_TASKRUN = 1 << 2;
+    private static final int IORING_SETUP_SUBMIT_ALL = 1 << 7;
+    private static final int IORING_SETUP_TASKRUN_FLAG = 1 << 9;
     private static final int IORING_SETUP_SINGLE_ISSUER = 1 << 12;
     private static final int IORING_SETUP_DEFER_TASKRUN = 1 << 13;
     private static final int IORING_REGISTER_FILES = 2;
@@ -133,11 +137,13 @@ public final class RawUring implements AutoCloseable {
 
     private final MemorySegment sqHead;
     private final MemorySegment sqTail;
+    private final MemorySegment sqFlags;
     private final MemorySegment sqArray;
     private final int sqMask;
     private final int sqEntries;
     private final MemorySegment cqHead;
     private final MemorySegment cqTail;
+    private final MemorySegment cqOverflow;
     private final MemorySegment cqes;
     private final int cqMask;
     private final MemorySegment fileUpdate;
@@ -215,8 +221,11 @@ public final class RawUring implements AutoCloseable {
             long sqTailOffset = u32(params, SQ_OFFSETS + 4);
             long sqMaskOffset = u32(params, SQ_OFFSETS + 8);
             long sqEntriesOffset = u32(params, SQ_OFFSETS + 12);
+            long sqFlagsOffset = u32(params, SQ_OFFSETS + 16);
             this.sqHead = slice(initializedSqRing, sqHeadOffset, 4, "SQ head");
             this.sqTail = slice(initializedSqRing, sqTailOffset, 4, "SQ tail");
+            this.sqFlags = slice(
+                initializedSqRing, sqFlagsOffset, 4, "SQ flags");
             this.sqMask = slice(initializedSqRing, sqMaskOffset, 4, "SQ mask")
                 .get(ValueLayout.JAVA_INT, 0);
             this.sqEntries = slice(
@@ -234,6 +243,7 @@ public final class RawUring implements AutoCloseable {
             long cqHeadOffset = u32(params, CQ_OFFSETS);
             long cqTailOffset = u32(params, CQ_OFFSETS + 4);
             long cqMaskOffset = u32(params, CQ_OFFSETS + 8);
+            long cqOverflowOffset = u32(params, CQ_OFFSETS + 16);
             int kernelCqMask = slice(
                 initializedCqRing, cqMaskOffset, 4, "CQ mask")
                 .get(ValueLayout.JAVA_INT, 0);
@@ -241,6 +251,8 @@ public final class RawUring implements AutoCloseable {
                 initializedCqRing, cqHeadOffset, 4, "CQ head");
             this.cqTail = slice(
                 initializedCqRing, cqTailOffset, 4, "CQ tail");
+            this.cqOverflow = slice(
+                initializedCqRing, cqOverflowOffset, 4, "CQ overflow");
             this.cqMask = kernelCqMask;
             this.cqes = slice(
                 initializedCqRing, cqesOffset,
@@ -287,6 +299,35 @@ public final class RawUring implements AutoCloseable {
         return cqMask;
     }
 
+    /** Returns SQEs published to the shared ring but not yet consumed. */
+    public int pendingSubmissionCount() {
+        int head = (int) INT_HANDLE.getAcquire(sqHead, 0L);
+        int tail = (int) INT_HANDLE.getAcquire(sqTail, 0L);
+        return pendingSubmissionCount(tail, head);
+    }
+
+    public boolean hasPendingSubmissions() {
+        return pendingSubmissionCount() != 0;
+    }
+
+    /** Returns whether deferred completion task work needs a kernel entry. */
+    public boolean taskWorkPending() {
+        int flags = (int) INT_HANDLE.getAcquire(sqFlags, 0L);
+        return taskWorkPending(flags);
+    }
+
+    /** Returns whether CQEs are waiting in the kernel overflow list. */
+    public boolean overflowPending() {
+        int flags = (int) INT_HANDLE.getAcquire(sqFlags, 0L);
+        return overflowPending(flags);
+    }
+
+    /** Returns the unsigned cumulative CQ overflow counter. */
+    public long cqOverflowCount() {
+        int count = (int) INT_HANDLE.getAcquire(cqOverflow, 0L);
+        return cqOverflowCount(count);
+    }
+
     public MemorySegment getSqe() {
         int head = (int) INT_HANDLE.getAcquire(sqHead, 0L);
         int next = sqeTail + 1;
@@ -308,6 +349,15 @@ public final class RawUring implements AutoCloseable {
                 "minimumCompletions must be non-negative");
         }
         return enter(minimumCompletions);
+    }
+
+    /**
+     * Enters the kernel with {@code IORING_ENTER_GETEVENTS}, even when no SQEs
+     * are pending. This runs deferred task work and flushes CQ overflow state
+     * without waiting for a minimum number of completions.
+     */
+    public int enterGetEvents() {
+        return enter(0, true);
     }
 
     public int registerFiles(MemorySegment files, int count) {
@@ -332,18 +382,21 @@ public final class RawUring implements AutoCloseable {
     }
 
     private int enter(int minimumCompletions) {
-        int submitted = flushSq();
-        if (submitted == 0 && minimumCompletions == 0) {
+        return enter(minimumCompletions, false);
+    }
+
+    private int enter(int minimumCompletions, boolean forceGetEvents) {
+        int toSubmit = flushSq();
+        if (skipEnter(toSubmit, minimumCompletions, forceGetEvents)) {
             return 0;
         }
-        int enterFlags =
-            (deferTaskRun || minimumCompletions != 0)
-                ? IORING_ENTER_GETEVENTS : 0;
+        int enterFlags = enterFlags(
+            deferTaskRun, minimumCompletions, forceGetEvents);
         try {
             long result = (long) SYSCALL_ENTER.invokeExact(
                 SYS_IO_URING_ENTER,
                 fd,
-                submitted,
+                toSubmit,
                 minimumCompletions,
                 enterFlags,
                 MemorySegment.NULL,
@@ -354,17 +407,51 @@ public final class RawUring implements AutoCloseable {
         }
     }
 
+    static boolean taskWorkPending(int sqFlags) {
+        return (sqFlags & IORING_SQ_TASKRUN) != 0;
+    }
+
+    static boolean overflowPending(int sqFlags) {
+        return (sqFlags & IORING_SQ_CQ_OVERFLOW) != 0;
+    }
+
+    static long cqOverflowCount(int rawCount) {
+        return Integer.toUnsignedLong(rawCount);
+    }
+
+    static int pendingSubmissionCount(int tail, int head) {
+        return tail - head;
+    }
+
+    static boolean skipEnter(
+            int submitted, int minimumCompletions, boolean forceGetEvents) {
+        return submitted == 0 && minimumCompletions == 0 && !forceGetEvents;
+    }
+
+    static int enterFlags(
+            boolean deferTaskRun, int minimumCompletions,
+            boolean forceGetEvents) {
+        return deferTaskRun || minimumCompletions != 0 || forceGetEvents
+            ? IORING_ENTER_GETEVENTS
+            : 0;
+    }
+
     private int flushSq() {
-        int submitted = sqeTail - sqeHead;
-        if (submitted == 0) {
-            return 0;
+        int unflushed = sqeTail - sqeHead;
+        if (unflushed != 0) {
+            int tail = (int) INT_HANDLE.getAcquire(sqTail, 0L);
+            // The submission array is initialized as an identity map. Since
+            // this single-producer ring allocates SQEs in tail order it never
+            // changes.
+            sqeHead = sqeTail;
+            INT_HANDLE.setRelease(sqTail, 0L, tail + unflushed);
         }
-        int tail = (int) INT_HANDLE.getAcquire(sqTail, 0L);
-        // The submission array is initialized as an identity map. Since this
-        // single-producer ring allocates SQEs in tail order it never changes.
-        sqeHead = sqeTail;
-        INT_HANDLE.setRelease(sqTail, 0L, tail + submitted);
-        return submitted;
+
+        // Use the shared SQ state, not merely the number flushed above. If a
+        // prior io_uring_enter consumed fewer SQEs than requested (including
+        // an interrupted enter), khead remains behind ktail and the next
+        // enter retries every unconsumed entry.
+        return pendingSubmissionCount();
     }
 
     @Override
@@ -439,12 +526,16 @@ public final class RawUring implements AutoCloseable {
 
     static IllegalStateException setupFailure(int flags, int errno) {
         int required = IORING_SETUP_SINGLE_ISSUER
-            | IORING_SETUP_DEFER_TASKRUN;
+            | IORING_SETUP_SUBMIT_ALL
+            | IORING_SETUP_DEFER_TASKRUN
+            | IORING_SETUP_TASKRUN_FLAG;
         if (errno == 22 && (flags & required) == required) {
             return new UnsupportedKernelException(
                 "Cardigan requires Linux 6.1 or newer with "
-                    + "IORING_SETUP_SINGLE_ISSUER and "
-                    + "IORING_SETUP_DEFER_TASKRUN. Upgrade the kernel "
+                    + "IORING_SETUP_SINGLE_ISSUER, "
+                    + "IORING_SETUP_SUBMIT_ALL, and "
+                    + "IORING_SETUP_DEFER_TASKRUN with "
+                    + "IORING_SETUP_TASKRUN_FLAG. Upgrade the kernel "
                     + "instead of running Cardigan with a degraded "
                     + "io_uring execution model.");
         }

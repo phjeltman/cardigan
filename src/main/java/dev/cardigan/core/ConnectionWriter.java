@@ -16,7 +16,8 @@ import java.util.concurrent.locks.LockSupport;
  * Acquire/release state publishes drain progress to a parked virtual thread;
  * it does not protect the queue itself.
  */
-final class ConnectionWriter implements UringEventLoop.CompletionHandler, Runnable {
+final class ConnectionWriter implements UringEventLoop.CompletionHandler,
+        UringEventLoop.EgressTask {
     private static final int INITIAL_QUEUE_CAPACITY = 16;
     private static final int INITIAL_DRAIN_WAITER_CAPACITY = 4;
     private static final int MAX_VECTOR_BYTES =
@@ -111,7 +112,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler, Runnab
         addQueued(bufferId, address, length, reference);
         if (!sendInFlight && !startScheduled) {
             startScheduled = true;
-            loop.execute(this);
+            loop.executeEgress(this);
         }
         return true;
     }
@@ -195,7 +196,10 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler, Runnab
         }
 
         if (queueSize != 0) {
-            startNextSend();
+            if (!startScheduled) {
+                startScheduled = true;
+                loop.executeEgress(this);
+            }
             return;
         }
 

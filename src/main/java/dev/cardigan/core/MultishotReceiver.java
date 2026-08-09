@@ -12,6 +12,7 @@ import java.util.concurrent.locks.LockSupport;
 final class MultishotReceiver implements UringEventLoop.CompletionHandler, InboundReceiver {
     private static final VarHandle QUEUE_SIZE;
     private static final VarHandle RECEIVE_WAITER;
+    private static final VarHandle HANDOFF_CHUNK;
 
     static {
         try {
@@ -19,6 +20,8 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
             QUEUE_SIZE = lookup.findVarHandle(MultishotReceiver.class, "queueSize", int.class);
             RECEIVE_WAITER =
                 lookup.findVarHandle(MultishotReceiver.class, "receiveWaiter", Thread.class);
+            HANDOFF_CHUNK = lookup.findVarHandle(
+                MultishotReceiver.class, "handoffChunk", InboundChunk.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -58,6 +61,7 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
     private boolean failed;
     private boolean closed;
     private Thread receiveWaiter;
+    private InboundChunk handoffChunk;
     private volatile Thread closeWaiter;
 
     MultishotReceiver(UringEventLoop loop, int clientFd, int fixedSlot, Observer observer) {
@@ -88,7 +92,10 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
     public InboundChunk receive() {
         Thread current = Thread.currentThread();
         while (!closed) {
-            InboundChunk chunk = poll();
+            InboundChunk chunk = takeHandoff();
+            if (chunk == null) {
+                chunk = poll();
+            }
             if (chunk != null) {
                 maybeArm();
                 return chunk;
@@ -99,7 +106,8 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
 
             maybeArm();
             setReceiveWaiter(current);
-            if (queueSize() != 0 || eof || failed || closed) {
+            if (handoffChunk() != null || queueSize() != 0
+                    || eof || failed || closed) {
                 setReceiveWaiter(null);
                 continue;
             }
@@ -124,7 +132,7 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
                 failed = true;
             } else {
                 InboundChunk chunk = new InboundChunk(loop, bufferId, result);
-                if (closed || !offer(chunk)) {
+                if (closed || (!tryHandoff(chunk) && !offer(chunk))) {
                     chunk.close();
                     if (!closed) {
                         failed = true;
@@ -183,6 +191,10 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
         closed = true;
 
         InboundChunk chunk;
+        chunk = takeHandoff();
+        if (chunk != null) {
+            chunk.close();
+        }
         while ((chunk = poll()) != null) {
             chunk.close();
         }
@@ -227,6 +239,25 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
         return chunk;
     }
 
+    private boolean tryHandoff(InboundChunk chunk) {
+        Thread waiter = receiveWaiter();
+        if (waiter == null
+            || !RECEIVE_WAITER.compareAndSet(this, waiter, null)) {
+            return false;
+        }
+        HANDOFF_CHUNK.setRelease(this, chunk);
+        LockSupport.unpark(waiter);
+        return true;
+    }
+
+    private InboundChunk takeHandoff() {
+        return (InboundChunk) HANDOFF_CHUNK.getAndSetAcquire(this, null);
+    }
+
+    private InboundChunk handoffChunk() {
+        return (InboundChunk) HANDOFF_CHUNK.getAcquire(this);
+    }
+
     private void pause() {
         if (!active || cancelPending) {
             return;
@@ -267,9 +298,9 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
 
     private void signalReceiveWaiter() {
         Thread waiter = receiveWaiter();
-        if (waiter != null) {
+        if (waiter != null
+            && RECEIVE_WAITER.compareAndSet(this, waiter, null)) {
             LockSupport.unpark(waiter);
-            setReceiveWaiter(null);
         }
     }
 

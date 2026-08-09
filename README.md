@@ -12,11 +12,12 @@ correctness, resource bounds, and performance.
 ## Requirements
 
 - 64-bit Linux; x86-64 is the regularly exercised target.
-- Linux 6.1 or newer. Cardigan requires `IORING_SETUP_SINGLE_ISSUER` and
-  `IORING_SETUP_DEFER_TASKRUN`, registered files, provided-buffer rings,
+- Linux 6.1 or newer. Cardigan requires `IORING_SETUP_SINGLE_ISSUER`,
+  `IORING_SETUP_SUBMIT_ALL`, `IORING_SETUP_DEFER_TASKRUN`, and
+  `IORING_SETUP_TASKRUN_FLAG`, registered files, provided-buffer rings,
   multishot accept/receive, pinned event loops, and its TCP listener options.
-  It will not start with a degraded transport. Direct kTLS remains an
-  optional capability.
+  It does not select a degraded fallback when a required operation is
+  rejected. Direct kTLS remains an optional capability.
 - JDK 26 with the incubating Vector API.
 - Maven 3.9 or newer.
 - OpenSSL 3 at runtime when TLS is enabled.

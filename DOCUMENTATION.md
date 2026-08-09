@@ -16,10 +16,24 @@ resources, and runs application exchanges on virtual threads. Physical cores
 are selected before SMT siblings. Exact placement can be supplied with
 `eventLoopCpus("0,2,4,6")` or `cardigan.eventloop.cpus`.
 
-The server requires `IORING_SETUP_SINGLE_ISSUER`,
-`IORING_SETUP_DEFER_TASKRUN`, registered files, provided-buffer rings, and
-multishot accept and receive. Startup fails rather than selecting a slower
-transport when these requirements are unavailable.
+The server requires `IORING_SETUP_SINGLE_ISSUER`, `IORING_SETUP_SUBMIT_ALL`,
+`IORING_SETUP_DEFER_TASKRUN`, `IORING_SETUP_TASKRUN_FLAG`, registered files,
+provided-buffer rings, and multishot accept and receive. Cardigan does not
+select a slower fallback when one of these required operations is rejected.
+
+The ring owner is also the sole carrier for that loop's ordinary virtual
+threads. Mounted virtual threads, protocol continuations, completion-unblocked
+continuations, handler workers, and egress connections are separate local
+scheduler lanes on that carrier. Turns are bounded so a yielded continuation
+cannot keep deferred kernel task work or visible CQEs from progressing.
+`IORING_SQ_TASKRUN` and CQ-overflow state are treated as readiness sources and
+cause a zero-submit `GETEVENTS` entry when necessary.
+
+Plaintext listeners accept sockets directly into the registered-file table.
+TLS retains a process descriptor for OpenSSL, but installs it with an
+asynchronous `IORING_OP_FILES_UPDATE`; the connection virtual thread parks for
+the CQE rather than pinning the carrier in `io_uring_register`. Direct sockets
+also use ring-native shutdown and close operations.
 
 Applications launch with:
 
@@ -99,6 +113,21 @@ they are not dynamically reloadable. Defaults remain experimental.
 | `cardigan.http2.max.header.list.size` | 16 KiB | Decoded header-list limit |
 | `cardigan.http2.max.streaming.bodies.per.connection` | 16 | Streaming request bodies per connection |
 | `cardigan.http2.max.streaming.buffer.bytes` | 256 MiB | Process-wide streaming-buffer budget |
+| `cardigan.fixed.files.mode` | `auto` | `auto`, `legacy`, `async-explicit`, `async-alloc`, or `direct`; auto uses direct plaintext accept and async allocation for TLS |
+| `cardigan.fixed.files.capacity` | 8192 | Registered socket slots per event loop |
+| `cardigan.max.tasks` | 2 x fixed-file capacity + SQ entries | io_uring task slots per event loop |
+| `cardigan.scheduler.boundedTurns` | `true` | Bound each reactor lane instead of exhaustive drains |
+| `cardigan.scheduler.cqesPerTurn` | 256 | CQEs reaped per scheduler turn |
+| `cardigan.scheduler.completionsPerTurn` | 256 | CQ-unblocked continuations per scheduler turn |
+| `cardigan.scheduler.protocolTasksPerTurn` | 128 | Protocol continuations per turn |
+| `cardigan.scheduler.handlerContinuationsPerTurn` | 32 | Exchange-worker continuations per turn; each worker retains its own request batch |
+| `cardigan.scheduler.egressTasksPerTurn` | 256 | Egress-ready connections per scheduler turn |
+| `cardigan.scheduler.externalTasksPerTurn` | 64 | Externally submitted tasks admitted per scheduler turn |
+| `cardigan.scheduler.protocolQuantumMicros` | 50 | Cooperative H1/H2 pump quantum when competing work exists |
+| `cardigan.scheduler.protocolCheckpointInterval` | 16 | Requests/frames between pump fairness checks |
+| `cardigan.exchange.max.batch` | 64 | Exchanges run by a hot worker before it cooperatively yields |
+| `cardigan.scheduler.stats` | `false` | Report lane, submit, wait, task-work, and CQ-overflow counters |
+| `cardigan.fixed.files.stats` | `false` | Report fixed-file occupancy and admission counters |
 | `cardigan.isolated.carriers` | available processors | Isolated carrier count |
 | `cardigan.isolated.cpus` | empty | Optional isolated-carrier CPU list |
 | `cardigan.isolated.max.tasks` | 4096 | Process-wide isolated-task limit |
@@ -115,6 +144,14 @@ they are not dynamically reloadable. Defaults remain experimental.
 | `cardigan.openssl.libraryDir` | empty | Optional system OpenSSL library directory |
 | `cardigan.tls.stats` | `false` | Report TLS counters at shutdown |
 | `cardigan.http2.resource.stats` | `false` | Report HTTP/2 resource high-water marks |
+
+The handler budget counts continuation mounts, not individual exchanges. A
+normal exchange worker retains Cardigan's 64-exchange batch, and a yielded
+worker may consume another handler slot in the same turn. The default therefore
+permits at most 32 mounts (roughly 2,048 trivial exchanges under continuous
+backlog) before the egress phase. Smaller handler budgets are useful
+latency/resource-pressure profiles, but should be benchmarked against the
+target workload: they deliberately give up some of Cardigan's batching.
 
 Lower-level tuning properties are intentionally undocumented; they are
 experimental diagnostics, use at your peril.
@@ -138,6 +175,19 @@ are never part of the framework artifact:
 mvn -f dev/pom.xml test
 ./dev/benchmarks/benchmark.sh --help
 ```
+
+The benchmark launcher exposes the scheduler budgets and all fixed-file
+lifecycle modes directly. For an end-to-end comparison, compare the
+unbounded-budget/legacy control with the fused bounded/direct design using
+`--scheduler-bounded=false --fixed-files=legacy` and
+`--scheduler-bounded=true --fixed-files=direct --scheduler-stats`.
+That is intentionally a composite comparison. Attribute effects with a 2x2
+matrix that varies one switch at a time; use a connection-churn workload to
+measure accept/register/close rather than a persistent connection cohort.
+Use `--fixed-files-capacity` to exercise admission pressure. When sweeping that
+capacity for throughput rather than overload behavior, use `--uring-max-tasks`
+to hold the task-pool size constant; otherwise its runtime default scales with
+the fixed-file table.
 
 The adversarial JUnit suites and HTTP/2 flow-control probe cover bounded
 resources, cancellation, connection survival, and recovery after hostile work.

@@ -95,6 +95,36 @@ final class ExchangeExecutor implements AutoCloseable {
         }
     }
 
+    boolean awaitTermination(long timeoutMillis) {
+        long timeoutNanos = timeoutMillis >= Long.MAX_VALUE / 1_000_000L
+            ? Long.MAX_VALUE
+            : Math.max(0L, timeoutMillis) * 1_000_000L;
+        long deadline = System.nanoTime() + timeoutNanos;
+        boolean interrupted = false;
+        synchronized (lifecycleLock) {
+            while (workerCount != 0) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    if (interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return false;
+                }
+                try {
+                    long millis = remaining / 1_000_000L;
+                    int nanos = (int) (remaining % 1_000_000L);
+                    lifecycleLock.wait(millis, nanos);
+                } catch (InterruptedException ignored) {
+                    interrupted = true;
+                }
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+        return true;
+    }
+
     /**
      * Ensures queued work has a runnable consumer. This is called both when a
      * task is submitted and after the event loop regains its carrier from a
@@ -164,6 +194,7 @@ final class ExchangeExecutor implements AutoCloseable {
             worker.continuation = null;
             workers[worker.slot] = null;
             workerCount--;
+            lifecycleLock.notifyAll();
             if (!closed) {
                 freeWorkerSlots.addLast(worker.slot);
             }
@@ -178,7 +209,8 @@ final class ExchangeExecutor implements AutoCloseable {
         private boolean available;
         private Thread thread;
         private volatile Runnable continuation;
-        private final Runnable scheduledContinuation = this::runContinuation;
+        private final UringEventLoop.HandlerContinuation scheduledContinuation =
+            this::runContinuation;
 
         private WorkerRunner(int slot) {
             this.slot = slot;
@@ -189,7 +221,7 @@ final class ExchangeExecutor implements AutoCloseable {
             continuation = command;
             scheduledContinuations.incrementAndGet();
             try {
-                loop.execute(scheduledContinuation);
+                loop.executeHandler(scheduledContinuation);
             } catch (Throwable t) {
                 scheduledContinuations.decrementAndGet();
                 throw t;
