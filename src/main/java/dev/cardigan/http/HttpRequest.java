@@ -14,6 +14,7 @@ public class HttpRequest {
     private static final long BYTE_HIGH_BITS = 0x8080_8080_8080_8080L;
     private MemorySegment segment;
     private long address;
+    private long messageOffset;
     private final Request picoRequest = new Request(64);
     private final long[] segPacked = new long[16];
 
@@ -27,8 +28,13 @@ public class HttpRequest {
     private int keepAliveState = -1;
 
     public void init(MemorySegment segment) {
+        init(segment, 0);
+    }
+
+    public void init(MemorySegment segment, long messageOffset) {
         this.segment = segment;
         this.address = segment != null ? segment.address() : 0;
+        this.messageOffset = messageOffset;
         this.picoRequest.reset();
         this.bodyOffset = 0;
         this.bodyLength = 0;
@@ -315,6 +321,7 @@ public class HttpRequest {
     public void copyMetadataFrom(HttpRequest source, MemorySegment copiedSegment) {
         this.segment = copiedSegment;
         this.address = copiedSegment.address();
+        this.messageOffset = 0;
         this.bodyOffset = source.bodyOffset;
         this.bodyLength = source.bodyLength;
         this.bodyStream = source.bodyStream;
@@ -332,15 +339,15 @@ public class HttpRequest {
     }
 
     HttpRequest detachedCopy() {
-        long requestLength = bodyOffset + bodyLength;
-        requestLength = Math.max(
-            requestLength,
+        long requestEnd = bodyOffset + bodyLength;
+        requestEnd = Math.max(
+            requestEnd,
             picoRequest.methodOffset >= 0
                 ? picoRequest.methodOffset + picoRequest.methodLen
                 : 0
         );
-        requestLength = Math.max(
-            requestLength,
+        requestEnd = Math.max(
+            requestEnd,
             picoRequest.pathOffset >= 0
                 ? picoRequest.pathOffset
                     + (picoRequest.targetLen != 0
@@ -348,21 +355,24 @@ public class HttpRequest {
                 : 0
         );
         for (int i = 0; i < picoRequest.numHeaders; i++) {
-            requestLength = Math.max(
-                requestLength,
+            requestEnd = Math.max(
+                requestEnd,
                 picoRequest.headers[i].nameOffset + picoRequest.headers[i].nameLen
             );
-            requestLength = Math.max(
-                requestLength,
+            requestEnd = Math.max(
+                requestEnd,
                 picoRequest.headers[i].valueOffset + picoRequest.headers[i].valueLen
             );
         }
+        long requestLength = requestEnd - messageOffset;
         MemorySegment detachedSegment = Arena.ofAuto().allocate(requestLength);
-        MemorySegment.copy(segment, 0, detachedSegment, 0, requestLength);
+        MemorySegment.copy(
+            segment, messageOffset, detachedSegment, 0, requestLength);
 
         HttpRequest detached = new HttpRequest();
         detached.segment = detachedSegment;
         detached.address = detachedSegment.address();
+        detached.messageOffset = messageOffset;
         detached.bodyOffset = bodyOffset;
         detached.bodyLength = bodyLength;
         detached.bodyStream = bodyStream;
@@ -377,7 +387,31 @@ public class HttpRequest {
         }
         detached.keepAliveState = keepAliveState;
         copyRequestMetadata(picoRequest, detached.picoRequest);
+        detached.rebase(-messageOffset);
         return detached;
+    }
+
+    private void rebase(long delta) {
+        messageOffset += delta;
+        bodyOffset += delta;
+        if (picoRequest.methodOffset >= 0) {
+            picoRequest.methodOffset += delta;
+        }
+        if (picoRequest.pathOffset >= 0) {
+            picoRequest.pathOffset += delta;
+        }
+        if (picoRequest.queryOffset >= 0) {
+            picoRequest.queryOffset += delta;
+        }
+        for (int i = 0; i < picoRequest.numHeaders; i++) {
+            picoRequest.headers[i].nameOffset += delta;
+            picoRequest.headers[i].valueOffset += delta;
+        }
+        for (int i = 0; i < resolvedSegmentCount; i++) {
+            long packed = segPacked[i];
+            long offset = (packed >>> 32) + delta;
+            segPacked[i] = (offset << 32) | (packed & 0xffff_ffffL);
+        }
     }
 
     private static void copyRequestMetadata(Request source, Request target) {

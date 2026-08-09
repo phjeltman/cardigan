@@ -3,7 +3,7 @@
   "language": "Java",
   "type": "engine",
   "engine": "io_uring",
-  "description": "Cardigan's direct gRPC wire engine over prior-knowledge cleartext HTTP/2.",
+  "description": "Cardigan gRPC over cleartext HTTP/2 prior knowledge.",
   "repo": "https://github.com/phjeltman/cardigan",
   "enabled": true,
   "tests": [

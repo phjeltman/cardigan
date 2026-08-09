@@ -3,7 +3,7 @@
   "language": "Java",
   "type": "engine",
   "engine": "io_uring",
-  "description": "Cardigan's prior-knowledge cleartext HTTP/2 listener.",
+  "description": "Cardigan HTTP/2 over cleartext prior knowledge.",
   "repo": "https://github.com/phjeltman/cardigan",
   "enabled": true,
   "tests": [

@@ -3,7 +3,7 @@
   "language": "Java",
   "type": "engine",
   "engine": "io_uring",
-  "description": "Cardigan's HTTP/2 engine over its OpenSSL/Panama TLS 1.3 and kTLS-capable transport.",
+  "description": "Cardigan HTTP/2 over TLS.",
   "repo": "https://github.com/phjeltman/cardigan",
   "enabled": true,
   "tests": [

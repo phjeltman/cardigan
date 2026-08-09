@@ -13,11 +13,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
 
-/**
- * The two RPCs exercised by HttpArena, implemented directly at the gRPC wire
- * boundary. Cardigan is ranked as an engine, so this deliberately avoids
- * grpc-java and writes protobuf messages into the HTTP/2 egress buffers.
- */
+/** Implements the two gRPC methods exercised by HttpArena. */
 public final class HttpArenaGrpcController {
     private static final String CONTENT_TYPE = "application/grpc";
     private static final int MAX_STREAM_REPLIES = 1_000_000;

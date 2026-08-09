@@ -3,7 +3,7 @@
   "language": "Java",
   "type": "engine",
   "engine": "io_uring",
-  "description": "Cardigan's OpenSSL/Panama TLS 1.3 transport serving live JSON over HTTP/1.1.",
+  "description": "Cardigan HTTP/1.1 over TLS.",
   "repo": "https://github.com/phjeltman/cardigan",
   "enabled": true,
   "tests": [

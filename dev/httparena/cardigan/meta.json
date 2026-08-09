@@ -3,7 +3,7 @@
   "language": "Java",
   "type": "engine",
   "engine": "io_uring",
-  "description": "Java HTTP engine designed around io_uring, Panama FFI, virtual threads, and thread-per-core event loops.",
+  "description": "Java HTTP engine built on io_uring, Panama FFI, virtual threads, and thread-per-core event loops.",
   "repo": "https://github.com/phjeltman/cardigan",
   "enabled": true,
   "tests": [

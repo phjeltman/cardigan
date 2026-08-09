@@ -9,6 +9,7 @@ import dev.cardigan.simdjson.ondemand.Value;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -17,9 +18,12 @@ import java.util.List;
 
 /** Immutable startup representation of HttpArena's mounted JSON dataset. */
 final class HttpArenaDataset {
-    private static final byte[] PREFIX = "{\"items\":[".getBytes();
-    private static final byte[] TOTAL = ",\"total\":".getBytes();
-    private static final byte[] COUNT = "],\"count\":".getBytes();
+    private static final byte[] PREFIX =
+        "{\"items\":[".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] TOTAL =
+        ",\"total\":".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] COUNT =
+        "],\"count\":".getBytes(StandardCharsets.US_ASCII);
 
     private final byte[][] itemPrefixes;
     private final long[] baseTotals;

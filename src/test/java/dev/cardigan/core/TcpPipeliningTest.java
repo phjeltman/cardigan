@@ -6,6 +6,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
@@ -74,5 +75,47 @@ public class TcpPipeliningTest {
             assertTrue(resp2.contains("HTTP/1.1 200 OK"), "Expected 200 OK for Request 2");
             assertTrue(resp2.contains("PipelinedUser"), "Expected body for Request 2");
         }
+    }
+
+    @Test
+    public void parsesPipelineLargerThanOneProvidedBuffer() throws Exception {
+        int requestCount = 300;
+        StringBuilder pipeline = new StringBuilder(
+            requestCount * 80);
+        for (int id = 0; id < requestCount; id++) {
+            pipeline.append("GET /users/").append(id)
+                .append(" HTTP/1.1\r\nHost: localhost\r\nConnection: ")
+                .append(id + 1 == requestCount ? "close" : "keep-alive")
+                .append("\r\n\r\n");
+        }
+
+        try (Socket socket = new Socket("127.0.0.1", PORT)) {
+            socket.setSoTimeout(5000);
+            socket.getOutputStream().write(
+                pipeline.toString().getBytes(StandardCharsets.US_ASCII));
+            socket.getOutputStream().flush();
+
+            ByteArrayOutputStream responses = new ByteArrayOutputStream();
+            socket.getInputStream().transferTo(responses);
+            String responseText = responses.toString(
+                StandardCharsets.US_ASCII);
+
+            assertEquals(
+                requestCount,
+                countOccurrences(responseText, "HTTP/1.1 200 OK"));
+            assertTrue(responseText.contains("User details for ID: 0"));
+            assertTrue(responseText.contains(
+                "User details for ID: " + (requestCount - 1)));
+        }
+    }
+
+    private static int countOccurrences(String text, String target) {
+        int count = 0;
+        int offset = 0;
+        while ((offset = text.indexOf(target, offset)) >= 0) {
+            count++;
+            offset += target.length();
+        }
+        return count;
     }
 }

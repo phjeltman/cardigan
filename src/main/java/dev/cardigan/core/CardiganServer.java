@@ -835,6 +835,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         InboundChunk currentChunk = initialChunk;
         MemorySegment currentBuf = initialChunk.segment();
         int readOffset = initialReadOffset;
+        int requestOffset = 0;
         HttpRequest request = new HttpRequest();
         Http1ExchangeSequencer exchangeSequencer = null;
         try {
@@ -855,26 +856,44 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     }
                     currentBuf = currentChunk.segment();
                     readOffset = currentChunk.length();
+                    requestOffset = 0;
                 }
 
-                request.init(currentBuf);
+                request.init(currentBuf, requestOffset);
                 long lastLen = 0;
                 long parseRes = PicoHTTPParser.parseRequest(
-                    currentBuf, 0, Math.min(readOffset, MAX_HEADER_SIZE),
+                    currentBuf, requestOffset,
+                    Math.min(readOffset, requestOffset + MAX_HEADER_SIZE),
                     request.picoRequest(), lastLen);
 
                 while (parseRes == PicoHTTPParser.ERROR_PARTIAL
-                    && readOffset < MAX_HEADER_SIZE) {
+                    && readOffset - requestOffset < MAX_HEADER_SIZE) {
+                    if (readOffset == currentBuf.byteSize()
+                        && requestOffset != 0) {
+                        int partialLength = readOffset - requestOffset;
+                        MemorySegment.copy(
+                            currentBuf, requestOffset,
+                            currentBuf, 0, partialLength);
+                        readOffset = partialLength;
+                        requestOffset = 0;
+                        currentChunk.length(readOffset);
+                        request.init(currentBuf);
+                    }
                     int previousOffset = readOffset;
-                    readOffset = inbound.appendOnce(
-                        currentChunk, readOffset, MAX_HEADER_SIZE);
-                    if (readOffset <= previousOffset) {
+                    int appended = inbound.appendOnce(
+                        currentChunk, readOffset,
+                        Math.min(
+                            (int) currentBuf.byteSize(),
+                            requestOffset + MAX_HEADER_SIZE));
+                    if (appended <= previousOffset) {
                         break;
                     }
-                    lastLen = previousOffset;
+                    readOffset = appended;
+                    lastLen = previousOffset - requestOffset;
                     parseRes = PicoHTTPParser.parseRequest(
-                        currentBuf, 0,
-                        Math.min(readOffset, MAX_HEADER_SIZE),
+                        currentBuf, requestOffset,
+                        Math.min(
+                            readOffset, requestOffset + MAX_HEADER_SIZE),
                         request.picoRequest(), lastLen);
                 }
 
@@ -897,7 +916,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
 
                 request.splitQuery();
 
-                int headerEndPos = (int) parseRes;
+                int headerLength = (int) parseRes;
+                int headerEndPos = requestOffset + headerLength;
                 long framing = parseHttp1Framing(request);
                 if (framing == HTTP1_FRAMING_INVALID) {
                     if (exchangeSequencer != null) {
@@ -927,14 +947,26 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     (framing & HTTP1_EXPECT_UNSUPPORTED) != 0
                         || (expectContinue && request.version() != 1);
                 long contentLength = framing & HTTP1_FRAMING_LENGTH_MASK;
-                if (contentLength > MAX_REQUEST_SIZE - headerEndPos) {
+                if (contentLength > MAX_REQUEST_SIZE - headerLength) {
                     if (exchangeSequencer != null) {
                         exchangeSequencer.awaitAll();
                     }
                     sendResponse(writer, Response.payloadTooLarge(), false);
                     break;
                 }
-                long totalRequestSize = (long) headerEndPos + contentLength;
+                long requestSize = (long) headerLength + contentLength;
+                long totalRequestSize = (long) requestOffset + requestSize;
+
+                if (totalRequestSize > readOffset && requestOffset != 0) {
+                    int partialLength = readOffset - requestOffset;
+                    MemorySegment.copy(
+                        currentBuf, requestOffset,
+                        currentBuf, 0, partialLength);
+                    readOffset = partialLength;
+                    requestOffset = 0;
+                    currentChunk.length(readOffset);
+                    continue;
+                }
                 int streamingBodyMode = router.streamingBodyMode(request);
                 boolean streamingRoute =
                     streamingBodyMode != Router.BODY_BUFFERED;
@@ -982,7 +1014,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                             inbound,
                             currentChunk,
                             headerEndPos,
-                            MAX_REQUEST_SIZE - headerEndPos,
+                            MAX_REQUEST_SIZE - headerLength,
                             MAX_HEADER_SIZE
                         )
                         : new Http1RequestBody(
@@ -1029,6 +1061,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     currentBuf = currentChunk == null
                         ? null
                         : currentChunk.segment();
+                    requestOffset = 0;
                     boolean sent = sendResponse(
                         writer,
                         response,
@@ -1046,7 +1079,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 Arena jumboArena = null;
                 MemorySegment jumboBuf = null;
 
-                if (totalRequestSize > UringEventLoop.BUFFER_SIZE) {
+                if (requestSize > UringEventLoop.BUFFER_SIZE) {
                     jumboArena = Arena.ofShared();
                     jumboBuf = jumboArena.allocate(totalRequestSize);
                     MemorySegment.copy(
@@ -1138,17 +1171,15 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 if (jumboArena != null) {
                     jumboArena.close();
                     readOffset = 0;
+                    requestOffset = 0;
                 } else if (leftover == 0) {
                     currentChunk.close();
                     currentChunk = null;
                     currentBuf = null;
                     readOffset = 0;
+                    requestOffset = 0;
                 } else {
-                    MemorySegment.copy(
-                        currentBuf, totalRequestSize,
-                        currentBuf, 0, leftover);
-                    readOffset = leftover;
-                    currentChunk.length(leftover);
+                    requestOffset = (int) totalRequestSize;
                 }
 
                 if (!sentOk) {

@@ -23,6 +23,6 @@
         <module>..</module>
         <module>example-server</module>
         <module>benchmarks</module>
-        <module>httparena</module>
+        <module>httparena/cardigan</module>
     </modules>
 </project>

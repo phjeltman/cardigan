@@ -2,6 +2,7 @@
 
 package dev.cardigan.http;
 
+import dev.cardigan.pico.PicoHTTPParser;
 import org.junit.jupiter.api.Test;
 
 import java.lang.foreign.Arena;
@@ -63,5 +64,47 @@ class HttpRequestDetachTest {
         assertEquals("value", detached.getHeader("x-test").toString());
         assertEquals("body", detached.body().toString());
         assertTrue(detached.isKeepAlive());
+    }
+
+    @Test
+    void detachesHttp1RequestParsedAfterAConsumedPipelinePrefix() {
+        byte[] prefix = (
+            "GET /users/1 HTTP/1.1\r\n"
+                + "Host: localhost\r\n\r\n"
+        ).getBytes(StandardCharsets.US_ASCII);
+        byte[] request = (
+            "POST /users?source=pipeline HTTP/1.1\r\n"
+                + "Host: localhost\r\n"
+                + "Content-Length: 4\r\n\r\n"
+                + "body"
+        ).getBytes(StandardCharsets.US_ASCII);
+        byte[] bytes = new byte[prefix.length + request.length];
+        System.arraycopy(prefix, 0, bytes, 0, prefix.length);
+        System.arraycopy(request, 0, bytes, prefix.length, request.length);
+
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment segment = arena.allocate(bytes.length);
+            MemorySegment.copy(
+                bytes, 0, segment,
+                java.lang.foreign.ValueLayout.JAVA_BYTE, 0, bytes.length);
+
+            HttpRequest source = new HttpRequest();
+            source.init(segment, prefix.length);
+            long headerLength = PicoHTTPParser.parseRequest(
+                segment, prefix.length, bytes.length,
+                source.picoRequest(), 0);
+            assertTrue(headerLength > 0);
+            source.splitQuery();
+            source.setBody(prefix.length + headerLength, 4);
+
+            HttpRequest detached = source.detachedCopy();
+            segment.fill((byte) 0);
+
+            assertEquals("POST", detached.method().toString());
+            assertEquals("/users", detached.path().toString());
+            assertEquals("source=pipeline", detached.query().toString());
+            assertEquals("localhost", detached.getHeader("Host").toString());
+            assertEquals("body", detached.body().toString());
+        }
     }
 }

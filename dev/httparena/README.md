@@ -30,12 +30,14 @@ therefore does not spend benchmark CPUs or memory on unrelated protocols.
 The launcher consumes HttpArena's standard read-only mounts:
 `/data/dataset.json`, `/data/static`, and `/certs/server.{crt,key}`. Static
 assets are copied once at startup into process-lifetime native `StaticBody`
-storage. JSON responses are generated per request from immutable dataset item
-fragments; only the source data is preloaded. The gRPC variants implement the
-canonical `benchmark.BenchmarkService` wire contract directly: requests are
-decoded from their protobuf envelope and replies are streamed into Cardigan's
-HTTP/2 egress buffers without introducing grpc-java or generated-message
-allocation machinery. This is permitted for HttpArena's Engine category.
+storage. Supplied `.br` sidecars are also preloaded and selected through
+`Accept-Encoding`; identity responses remain available for other clients.
+JSON responses are generated per request from immutable dataset item fragments;
+only the source data is preloaded. The gRPC variants implement the canonical
+`benchmark.BenchmarkService` wire contract directly: requests are decoded from
+their protobuf envelope and replies are streamed into Cardigan's HTTP/2 egress
+buffers without introducing grpc-java or generated-message allocation
+machinery. This is permitted for HttpArena's Engine category.
 
 Each variant's `build.sh` produces the image name expected by HttpArena. The
 canonical Docker build downloads Cardigan from Maven Central and builds only
@@ -62,8 +64,3 @@ seccomp profile blocks. HttpArena starts framework containers with
 `--security-opt seccomp=unconfined` and an unlimited memlock ulimit. When
 running an image directly, supply those options yourself; full `--privileged`
 access is not required.
-
-Static content is currently served uncompressed. That is conformant—the arena
-accepts an origin representation when `Accept-Encoding` is present—but adding
-response headers and precompressed `.br`/`.gz` selection is an obvious future
-score optimization.
