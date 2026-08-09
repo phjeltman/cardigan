@@ -108,6 +108,14 @@ microbenchmark and profiling modes. Benchmark results are meaningful only when
 the server and client CPU placement, protocol concurrency and payload are kept
 comparable.
 
+Independent results from HttpArena's 64-core reference host are available in
+the [overall Engine composite](https://www.http-arena.com/#scope=all&type=engine),
+[HTTP/1 Engine results](https://www.http-arena.com/#type=engine), and
+[HTTP/2 Engine results](https://www.http-arena.com/#scope=h2&type=engine).
+HttpArena scores unimplemented profiles as zero, so its composite rankings
+measure profile coverage as well as performance; use the individual profile
+tables for like-for-like comparisons.
+
 Microbenchmark and probe sources live outside the runtime artifact under
 `dev/benchmarks/src/main/java`. They are compiled by the benchmark script, or explicitly with:
 
