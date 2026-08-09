@@ -19,19 +19,17 @@ import java.util.concurrent.locks.LockSupport;
  * The event loop has one carrier, so worker continuations consume the queue
  * serially. The event loop checks progress whenever a continuation returns
  * and starts another worker only when queued work remains while every current
- * worker is actually waiting or blocked. Budgeted scheduler mode yields after
- * a bounded batch; epoch mode instead shares the handler phase's absolute
- * queue-tail cutoff across every worker.
+ * worker is actually waiting or blocked. The scheduler seals the absolute
+ * queue-tail delta produced by each mounted completion/protocol continuation,
+ * then lets a hot worker cross those causal ranges without an extra
+ * virtual-thread mount.
  */
 final class ExchangeExecutor implements AutoCloseable {
     private static final int DEFAULT_QUEUE_CAPACITY = 65_536;
-    private static final int DEFAULT_MAX_BATCH = 64;
     private static final int DEFAULT_MAX_IDLE_WORKERS = 64;
 
     private final UringEventLoop loop;
     private final TaskQueue tasks;
-    private final boolean epochScheduler;
-    private final int maxBatch;
     private final int maxIdleWorkers;
     private final ArrayDeque<WorkerRunner> availableWorkers = new ArrayDeque<>();
     private final ArrayDeque<Integer> freeWorkerSlots = new ArrayDeque<>();
@@ -43,6 +41,11 @@ final class ExchangeExecutor implements AutoCloseable {
     private volatile int workerCount;
     private final AtomicInteger scheduledContinuations = new AtomicInteger();
     private long handlerEpochCutoff;
+    private long lastSealedHandlerTail;
+    private long[] handlerRangeCutoffs = new long[64];
+    private int handlerRangeHead;
+    private int handlerRangeTail;
+    private boolean handlerRangeActive;
     private volatile boolean closed;
 
     ExchangeExecutor(UringEventLoop loop) {
@@ -52,11 +55,6 @@ final class ExchangeExecutor implements AutoCloseable {
             DEFAULT_QUEUE_CAPACITY
         );
         this.tasks = new TaskQueue(Math.max(2, requestedCapacity));
-        this.epochScheduler = loop.usesEpochScheduler();
-        this.maxBatch = Math.max(
-            1,
-            Integer.getInteger("cardigan.exchange.max.batch", DEFAULT_MAX_BATCH)
-        );
         this.maxIdleWorkers = Math.max(
             1,
             Integer.getInteger(
@@ -70,7 +68,8 @@ final class ExchangeExecutor implements AutoCloseable {
         if (closed || !tasks.offer(task)) {
             return false;
         }
-        ensureProgress();
+        // Work is not runnable until its producing continuation seals an
+        // absolute tail range. beginHandlerEpoch() is its activation point.
         return true;
     }
 
@@ -78,12 +77,49 @@ final class ExchangeExecutor implements AutoCloseable {
         return workerCount;
     }
 
-    /** Freezes the handler work admitted to the phase about to run. */
+    long handlerTailSnapshot() {
+        return tasks.tailSnapshot();
+    }
+
+    /**
+     * Seals only work appended by one mounted completion/protocol producer.
+     * Empty deltas deliberately create no range.
+     */
+    boolean sealHandlerRange(long producerTail) {
+        if (closed) {
+            return false;
+        }
+        long tail = tasks.tailSnapshot();
+        if (producerTail != lastSealedHandlerTail) {
+            throw new IllegalStateException(
+                "Handler producer tail does not match the sealed frontier");
+        }
+        if (tail <= producerTail) {
+            return false;
+        }
+        appendHandlerRange(tail);
+        return true;
+    }
+
+    /** Seals handler-originated appends left beyond the prior epoch frontier. */
+    boolean sealDeferredHandlerRange() {
+        if (closed) {
+            return false;
+        }
+        long tail = tasks.tailSnapshot();
+        if (tail <= lastSealedHandlerTail) {
+            return false;
+        }
+        appendHandlerRange(tail);
+        return true;
+    }
+
+    /** Activates the oldest causal handler range for the phase about to run. */
     void beginHandlerEpoch() {
-        if (!epochScheduler || closed) {
+        if (closed) {
             return;
         }
-        handlerEpochCutoff = tasks.tailSnapshot();
+        activateNextHandlerRange();
         ensureProgress();
     }
 
@@ -93,8 +129,75 @@ final class ExchangeExecutor implements AutoCloseable {
      * epoch-deferred request in the queue.
      */
     boolean hasDeferredEpochWork() {
-        return epochScheduler && !closed
-            && tasks.hasDeferredWork(handlerEpochCutoff);
+        if (closed) {
+            return false;
+        }
+        return tasks.tailSnapshot() > lastSealedHandlerTail
+            || handlerRangeHead != handlerRangeTail
+            || (handlerRangeActive
+                && tasks.hasWorkBefore(handlerEpochCutoff));
+    }
+
+    int pendingHandlerRanges() {
+        return (handlerRangeActive ? 1 : 0)
+            + handlerRangeTail - handlerRangeHead;
+    }
+
+    private void appendHandlerRange(long cutoff) {
+        if (cutoff <= lastSealedHandlerTail) {
+            return;
+        }
+        if (handlerRangeTail == handlerRangeCutoffs.length) {
+            int pending = handlerRangeTail - handlerRangeHead;
+            if (handlerRangeHead != 0) {
+                System.arraycopy(
+                    handlerRangeCutoffs, handlerRangeHead,
+                    handlerRangeCutoffs, 0, pending);
+                handlerRangeHead = 0;
+                handlerRangeTail = pending;
+            } else {
+                handlerRangeCutoffs = Arrays.copyOf(
+                    handlerRangeCutoffs, handlerRangeCutoffs.length << 1);
+            }
+        }
+        handlerRangeCutoffs[handlerRangeTail++] = cutoff;
+        lastSealedHandlerTail = cutoff;
+    }
+
+    private boolean activateNextHandlerRange() {
+        if (handlerRangeActive) {
+            return true;
+        }
+        if (handlerRangeHead == handlerRangeTail) {
+            if (handlerRangeHead != 0) {
+                handlerRangeHead = 0;
+                handlerRangeTail = 0;
+            }
+            return false;
+        }
+        handlerEpochCutoff = handlerRangeCutoffs[handlerRangeHead++];
+        handlerRangeActive = true;
+        return true;
+    }
+
+    /**
+     * Moves across every range whose tasks have been claimed. Completion of a
+     * parked task is intentionally not awaited: its resumed continuation owns
+     * any later output, while ordered H1/H2 response state remains authoritative.
+     */
+    private boolean advanceClaimedHandlerRanges() {
+        if (closed) {
+            return false;
+        }
+        boolean advanced = false;
+        while (handlerRangeActive
+                && !tasks.hasWorkBefore(handlerEpochCutoff)) {
+            handlerRangeActive = false;
+            loop.handlerRangeBoundary();
+            advanced = true;
+            activateNextHandlerRange();
+        }
+        return advanced;
     }
 
     @Override
@@ -154,7 +257,11 @@ final class ExchangeExecutor implements AutoCloseable {
      * continuation, which is the point where a parked handler can be observed.
      */
     void ensureProgress() {
-        if (closed || scheduledContinuations.get() != 0
+        if (closed) {
+            return;
+        }
+        advanceClaimedHandlerRanges();
+        if (scheduledContinuations.get() != 0
                 || !hasRunnableWork()) {
             return;
         }
@@ -170,9 +277,8 @@ final class ExchangeExecutor implements AutoCloseable {
     }
 
     private boolean hasRunnableWork() {
-        return epochScheduler
-            ? tasks.hasWorkBefore(handlerEpochCutoff)
-            : !tasks.isEmpty();
+        return handlerRangeActive
+            && tasks.hasWorkBefore(handlerEpochCutoff);
     }
 
     private void startWorker() {
@@ -263,6 +369,7 @@ final class ExchangeExecutor implements AutoCloseable {
             try {
                 continuation.run();
             } finally {
+                advanceClaimedHandlerRanges();
                 ensureProgress();
             }
         }
@@ -270,16 +377,12 @@ final class ExchangeExecutor implements AutoCloseable {
         @Override
         public void run() {
             try {
-                int completedInBatch = 0;
                 while (!closed) {
-                    Runnable task = epochScheduler
-                        ? tasks.pollBefore(handlerEpochCutoff)
-                        : tasks.poll();
+                    Runnable task = tasks.pollBefore(handlerEpochCutoff);
                     if (task == null) {
                         if (!awaitWork()) {
                             return;
                         }
-                        completedInBatch = 0;
                         continue;
                     }
 
@@ -289,13 +392,7 @@ final class ExchangeExecutor implements AutoCloseable {
                         t.printStackTrace();
                     }
 
-                    if (!epochScheduler) {
-                        completedInBatch++;
-                        if (completedInBatch == maxBatch && !tasks.isEmpty()) {
-                            completedInBatch = 0;
-                            Thread.yield();
-                        }
-                    }
+                    advanceClaimedHandlerRanges();
                 }
             } finally {
                 retireWorker(this);
@@ -365,19 +462,6 @@ final class ExchangeExecutor implements AutoCloseable {
             return true;
         }
 
-        private Runnable poll() {
-            long currentHead = (long) HEAD.getAcquire(this);
-            if (currentHead == (long) TAIL.getAcquire(this)) {
-                return null;
-            }
-
-            int index = (int) currentHead & mask;
-            Runnable task = (Runnable) ARRAY.getAcquire(elements, index);
-            ARRAY.setRelease(elements, index, null);
-            HEAD.setRelease(this, currentHead + 1);
-            return task;
-        }
-
         Runnable pollBefore(long cutoff) {
             long currentHead = (long) HEAD.getAcquire(this);
             if (currentHead >= cutoff
@@ -400,14 +484,5 @@ final class ExchangeExecutor implements AutoCloseable {
             return (long) HEAD.getAcquire(this) < cutoff;
         }
 
-        boolean hasDeferredWork(long cutoff) {
-            long currentHead = (long) HEAD.getAcquire(this);
-            return currentHead == cutoff
-                && currentHead != (long) TAIL.getAcquire(this);
-        }
-
-        private boolean isEmpty() {
-            return (long) HEAD.getAcquire(this) == (long) TAIL.getAcquire(this);
-        }
     }
 }

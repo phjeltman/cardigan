@@ -15,7 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @Tag("integration")
-final class BoundedSchedulerIntegrationTest {
+final class SchedulerProgressIntegrationTest {
     @Test
     void yieldingContinuationCannotKeepPendingIoAwayFromTheRing() throws Exception {
         try (UringEventLoop loop = new UringEventLoop(0, 64)) {

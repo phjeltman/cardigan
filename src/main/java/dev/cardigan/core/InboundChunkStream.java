@@ -25,10 +25,15 @@ final class InboundChunkStream implements AutoCloseable {
 
     InboundChunk nextChunk() {
         if (pending == null) {
-            if (loop != null) {
+            boolean trackEpoch = loop != null
+                && loop.inCarrierDomain();
+            long receiveEpoch = trackEpoch ? loop.schedulerEpoch() : 0L;
+            InboundChunk chunk = receiver.receive();
+            if (chunk != null && trackEpoch
+                    && loop.schedulerEpoch() == receiveEpoch) {
                 loop.inboundChunkBoundary();
             }
-            return receiver.receive();
+            return chunk;
         }
 
         InboundChunk chunk = pending;

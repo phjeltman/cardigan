@@ -101,10 +101,6 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
     public static final long MAX_REQUEST_SIZE = Long.getLong("cardigan.max.request.size", 10 * 1024 * 1024L);
     public static final int MAX_HEADER_SIZE = Integer.getInteger("cardigan.max.header.size", 8192);
     public static final int MAX_HTTP1_IN_FLIGHT = Integer.getInteger("cardigan.http1.max.inflight", 128);
-    private static final int PROTOCOL_CHECKPOINT_INTERVAL = Math.max(
-        1,
-        Integer.getInteger(
-            "cardigan.scheduler.protocolCheckpointInterval", 16));
 
     private static final long HTTP1_FRAMING_CHUNKED = 1L << 60;
     private static final long HTTP1_EXPECT_CONTINUE = 1L << 61;
@@ -968,15 +964,10 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         MemorySegment currentBuf = initialChunk.segment();
         int readOffset = initialReadOffset;
         int requestOffset = 0;
-        int requestsUntilCheckpoint = PROTOCOL_CHECKPOINT_INTERVAL;
         HttpRequest request = new HttpRequest();
         Http1ExchangeSequencer exchangeSequencer = null;
         try {
             while (keepAlive) {
-                if (--requestsUntilCheckpoint == 0) {
-                    requestsUntilCheckpoint = PROTOCOL_CHECKPOINT_INTERVAL;
-                    loop.protocolCheckpoint();
-                }
                 if (control.draining) {
                     break;
                 }

@@ -19,8 +19,7 @@ class ExchangeExecutorEpochTest {
     void offerFromRunningHandlerExecutesInLaterSchedulerEpoch()
             throws Exception {
         try (UringEventLoop loop = new UringEventLoop(
-                0, 64, 512, false,
-                UringEventLoop.SchedulerMode.EPOCH)) {
+                0, 64, 512, false)) {
             ExchangeExecutor executor = loop.exchangeExecutor();
             CompletableFuture<Long> firstEpoch = new CompletableFuture<>();
             CompletableFuture<Long> deferredEpoch = new CompletableFuture<>();
@@ -58,17 +57,14 @@ class ExchangeExecutorEpochTest {
         assertTrue(queue.offer(deferred));
 
         assertTrue(queue.hasWorkBefore(cutoff));
-        assertFalse(queue.hasDeferredWork(cutoff));
         assertSame(first, queue.pollBefore(cutoff));
         assertSame(second, queue.pollBefore(cutoff));
         assertNull(queue.pollBefore(cutoff));
         assertFalse(queue.hasWorkBefore(cutoff));
-        assertTrue(queue.hasDeferredWork(cutoff));
 
         long nextCutoff = queue.tailSnapshot();
         assertSame(deferred, queue.pollBefore(nextCutoff));
         assertNull(queue.pollBefore(nextCutoff));
-        assertFalse(queue.hasDeferredWork(nextCutoff));
     }
 
     @Test

@@ -5,6 +5,8 @@ package dev.cardigan.core;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -101,6 +103,96 @@ final class EpochSchedulerIntegrationTest {
     }
 
     @Test
+    void immediateInboundChunkRetainsTheEpochBoundary() throws Exception {
+        try (UringEventLoop loop = epochLoop();
+             Arena arena = Arena.ofShared()) {
+            MemorySegment buffer = arena.allocate(1);
+            AtomicLong receiveEpoch = new AtomicLong();
+            AtomicLong handlerEpoch = new AtomicLong();
+            AtomicLong returnedEpoch = new AtomicLong();
+            CountDownLatch completed = new CountDownLatch(1);
+            CountDownLatch handlerCompleted = new CountDownLatch(1);
+
+            InboundReceiver receiver = immediateReceiver(
+                buffer,
+                () -> {
+                    receiveEpoch.set(loop.schedulerEpoch());
+                    loop.executeHandler(() -> {
+                        handlerEpoch.set(loop.schedulerEpoch());
+                        handlerCompleted.countDown();
+                    });
+                }
+            );
+
+            Thread protocol = loop.startVirtualThread(() -> {
+                try (InboundChunkStream inbound =
+                         new InboundChunkStream(loop, receiver);
+                     InboundChunk ignored = inbound.nextChunk()) {
+                    returnedEpoch.set(loop.schedulerEpoch());
+                } finally {
+                    completed.countDown();
+                }
+            });
+
+            assertTrue(completed.await(2, TimeUnit.SECONDS));
+            assertTrue(handlerCompleted.await(2, TimeUnit.SECONDS));
+            protocol.join(2_000);
+            assertEquals(receiveEpoch.get(), handlerEpoch.get());
+            assertTrue(returnedEpoch.get() > receiveEpoch.get(),
+                "an immediately available chunk bypassed its epoch boundary");
+        }
+    }
+
+    @Test
+    void parkedInboundReceiveAlreadySatisfiesTheEpochBoundary()
+            throws Exception {
+        try (UringEventLoop loop = epochLoop();
+             Arena arena = Arena.ofShared()) {
+            MemorySegment buffer = arena.allocate(1);
+            AtomicInteger nopResult = new AtomicInteger(Integer.MIN_VALUE);
+            AtomicLong resumedEpoch = new AtomicLong();
+            AtomicLong handlerEpoch = new AtomicLong();
+            AtomicLong returnedEpoch = new AtomicLong();
+            CountDownLatch completed = new CountDownLatch(1);
+            CountDownLatch handlerCompleted = new CountDownLatch(1);
+
+            InboundReceiver receiver = immediateReceiver(
+                buffer,
+                () -> {
+                    nopResult.set(loop.nop());
+                    // A completion continuation is a phase before protocol.
+                    // Continue from protocol so a second boundary would have
+                    // to defer this continuation to another epoch.
+                    Thread.yield();
+                    resumedEpoch.set(loop.schedulerEpoch());
+                    loop.executeHandler(() -> {
+                        handlerEpoch.set(loop.schedulerEpoch());
+                        handlerCompleted.countDown();
+                    });
+                }
+            );
+
+            Thread protocol = loop.startVirtualThread(() -> {
+                try (InboundChunkStream inbound =
+                         new InboundChunkStream(loop, receiver);
+                     InboundChunk ignored = inbound.nextChunk()) {
+                    returnedEpoch.set(loop.schedulerEpoch());
+                } finally {
+                    completed.countDown();
+                }
+            });
+
+            assertTrue(completed.await(2, TimeUnit.SECONDS));
+            assertTrue(handlerCompleted.await(2, TimeUnit.SECONDS));
+            protocol.join(2_000);
+            assertEquals(0, nopResult.get());
+            assertEquals(resumedEpoch.get(), returnedEpoch.get(),
+                "a parked receive paid a second epoch boundary");
+            assertEquals(resumedEpoch.get(), handlerEpoch.get());
+        }
+    }
+
+    @Test
     void quiescentSubmissionCompletesInALaterCqEpoch() throws Exception {
         try (UringEventLoop loop = epochLoop()) {
             AtomicLong submissionEpoch = new AtomicLong();
@@ -123,9 +215,26 @@ final class EpochSchedulerIntegrationTest {
     }
 
     private static UringEventLoop epochLoop() {
-        UringEventLoop loop = new UringEventLoop(
-            0, 64, 512, false, UringEventLoop.SchedulerMode.EPOCH);
-        assertTrue(loop.usesEpochScheduler());
-        return loop;
+        return new UringEventLoop(0, 64, 512, false);
+    }
+
+    private static InboundReceiver immediateReceiver(
+            MemorySegment buffer, Runnable beforeReturn) {
+        return new InboundReceiver() {
+            @Override
+            public void start() {
+            }
+
+            @Override
+            public InboundChunk receive() {
+                beforeReturn.run();
+                return new InboundChunk(buffer, 0, 1, ignored -> {
+                });
+            }
+
+            @Override
+            public void close() {
+            }
+        };
     }
 }
