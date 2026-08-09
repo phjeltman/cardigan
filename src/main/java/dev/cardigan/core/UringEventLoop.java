@@ -18,7 +18,15 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.ArrayDeque;
 
 public class UringEventLoop implements AutoCloseable, java.util.concurrent.Executor {
+    enum SchedulerMode {
+        BUDGETED,
+        EPOCH
+    }
+
     private static final int EINTR = 4;
+    private static final SchedulerMode CONFIGURED_SCHEDULER_MODE =
+        schedulerMode(System.getProperty(
+            "cardigan.scheduler.mode", "budgeted"));
     private static final boolean TASK_POOL_STATS_ENABLED =
         Boolean.getBoolean("cardigan.uring.task.stats");
     private static final boolean LOCAL_READY_QUEUE_ENABLED =
@@ -44,7 +52,9 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private static final int EXTERNAL_TURN_BUDGET = schedulerBudget(
         "cardigan.scheduler.externalTasksPerTurn", 64);
     private static final long PROTOCOL_QUANTUM_NANOS =
-        schedulerQuantumNanos();
+        CONFIGURED_SCHEDULER_MODE == SchedulerMode.BUDGETED
+            ? schedulerQuantumNanos()
+            : 0L;
     private static final VarHandle INT_HANDLE = ValueLayout.JAVA_INT.varHandle();
     private static final VarHandle SHORT_HANDLE = ValueLayout.JAVA_SHORT.varHandle();
     private static final VarHandle TASK_THREAD_HANDLE;
@@ -94,6 +104,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
     private final Thread loopThread;
     private final CarrierDomain carrierDomain;
+    private final SchedulerMode schedulerMode;
 
     /** Continuations made runnable by the current CQE batch. */
     private final ArrayDeque<Runnable> completionReadyTasks =
@@ -209,6 +220,29 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                 sequences, index);
             return sequence != h + 1;
         }
+
+        /**
+         * Captures the contiguous published prefix visible to the sole
+         * consumer. Positions claimed after the tail snapshot, and positions
+         * hidden behind a claimed-but-unpublished slot, belong to a later
+         * scheduler epoch.
+         */
+        int publishedSnapshotSize() {
+            long position = head;
+            long snapshotTail = tail.get();
+            int count = 0;
+            while (position != snapshotTail && count < buffer.length) {
+                int index = (int) (position & mask);
+                long sequence = (long) SEQUENCE_HANDLE.getAcquire(
+                    sequences, index);
+                if (sequence != position + 1) {
+                    break;
+                }
+                position++;
+                count++;
+            }
+            return count;
+        }
     }
     
     private final int numBuffers;
@@ -285,6 +319,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private long schedulerTaskWorkEnters;
     private long schedulerSubmits;
     private long schedulerWaits;
+    private volatile long schedulerEpoch;
     private long protocolDeadlineNanos = Long.MAX_VALUE;
 
     public UringEventLoop(int cpuId, int entries) {
@@ -298,7 +333,17 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     public UringEventLoop(
             int cpuId, int entries, int numBuffers,
             boolean ktlsReceiveBuffers) {
+        this(
+            cpuId, entries, numBuffers, ktlsReceiveBuffers,
+            CONFIGURED_SCHEDULER_MODE);
+    }
+
+    UringEventLoop(
+            int cpuId, int entries, int numBuffers,
+            boolean ktlsReceiveBuffers, SchedulerMode schedulerMode) {
         this.cpuId = cpuId;
+        this.schedulerMode = java.util.Objects.requireNonNull(
+            schedulerMode, "schedulerMode");
         int bufCap = 1;
         while (bufCap < numBuffers) {
             bufCap <<= 1;
@@ -488,6 +533,47 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
         while (!closed && wakeupFailure == null) {
             try {
+                if (usesEpochScheduler()) {
+                    runSchedulerEpoch();
+                    if (hasEpochSourceExcludingPendingSq()) {
+                        submitEpochBoundary();
+                        continue;
+                    }
+
+                    // An epoch with no runnable/kernel source can combine its
+                    // pending SQ publication with the blocking wait. Publish
+                    // sleeping first so an external producer cannot arrive
+                    // between the source check and io_uring_enter unnoticed.
+                    isSleeping = true;
+                    VarHandle.fullFence();
+
+                    if (hasEpochSourceExcludingPendingSq()) {
+                        isSleeping = false;
+                        submitEpochBoundary();
+                        continue;
+                    }
+
+                    try {
+                        boolean submitted = sqePending
+                            || ring.hasPendingSubmissions();
+                        int ret;
+                        try {
+                            ret = ring.submitAndWait(1);
+                        } finally {
+                            sqePending = ring.hasPendingSubmissions();
+                        }
+                        schedulerWaits++;
+                        if (submitted) {
+                            schedulerSubmits++;
+                        }
+                        checkEnterResult(
+                            ret, "waiting for the next scheduler epoch");
+                    } finally {
+                        isSleeping = false;
+                    }
+                    continue;
+                }
+
                 runSchedulerTurn();
                 if (hasSchedulerWork()) {
                     if (sqePending || ring.hasPendingSubmissions()) {
@@ -530,6 +616,92 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                 System.err.println("Error in event loop for CPU " + cpuId + ": " + t.getMessage());
             }
         }
+    }
+
+    /**
+     * Runs one topological scheduler epoch. Kernel work is materialized before
+     * the CQ snapshot, then each downstream lane consumes exactly the work
+     * present at its phase boundary. Same-lane appends therefore wait for the
+     * next epoch while work produced for a later lane remains fused on this
+     * carrier and can run in the current epoch.
+     */
+    private void runSchedulerEpoch() {
+        schedulerTurns++;
+        schedulerEpoch++;
+
+        // With DEFER_TASKRUN, task work and CQ overflow are not necessarily
+        // visible through cq.tail. Materialize both before capturing the
+        // kernel-source snapshot for this epoch.
+        if (ring.taskWorkPending() || ring.overflowPending()) {
+            boolean submitted = sqePending
+                || ring.hasPendingSubmissions();
+            int result;
+            try {
+                result = ring.enterGetEvents();
+            } finally {
+                sqePending = ring.hasPendingSubmissions();
+            }
+            schedulerTaskWorkEnters++;
+            if (submitted) {
+                schedulerSubmits++;
+            }
+            checkEnterResult(
+                result, "materializing io_uring work for scheduler epoch");
+        }
+
+        int cqHead = (int) INT_HANDLE.getAcquire(kheadSegment, 0L);
+        int cqTail = (int) INT_HANDLE.getAcquire(ktailSegment, 0L);
+        int reaped = reapCompletionEpochSnapshot(cqHead, cqTail);
+        schedulerCqes += reaped;
+
+        int externalSnapshotSize = readyTasks.publishedSnapshotSize();
+        schedulerExternalTasks += drainExternalTasks(externalSnapshotSize);
+        schedulerCompletionTasks += drainReadyTaskSnapshot(
+            completionReadyTasks, false);
+        schedulerProtocolTasks += drainReadyTaskSnapshot(
+            protocolReadyTasks, false);
+
+        exchangeExecutor.beginHandlerEpoch();
+        schedulerHandlerTasks += drainReadyTaskSnapshot(
+            handlerReadyTasks, false);
+        flushReturnedBuffers();
+        schedulerEgressTasks += drainReadyTaskSnapshot(
+            egressReadyTasks, false);
+    }
+
+    private int drainReadyTaskSnapshot(
+            ArrayDeque<Runnable> tasks, boolean protocolQuantum) {
+        int snapshotSize = tasks.size();
+        int count = 0;
+        while (count < snapshotSize) {
+            Runnable task = tasks.pollFirst();
+            if (task == null) {
+                break;
+            }
+            runReadyTask(task, protocolQuantum);
+            count++;
+        }
+        return count;
+    }
+
+    private void submitEpochBoundary() {
+        if (sqePending || ring.hasPendingSubmissions()) {
+            submitPendingOperations();
+        }
+    }
+
+    private boolean hasEpochSourceExcludingPendingSq() {
+        return !completionReadyTasks.isEmpty()
+            || !protocolReadyTasks.isEmpty()
+            || !handlerReadyTasks.isEmpty()
+            || !egressReadyTasks.isEmpty()
+            || !readyTasks.isEmpty()
+            || returnedInboundBufferCount != 0
+            || returnedKtlsBufferCount != 0
+            || hasCompletions()
+            || ring.taskWorkPending()
+            || ring.overflowPending()
+            || exchangeExecutor.hasDeferredEpochWork();
     }
 
     /**
@@ -637,7 +809,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
      * time quantum when another lane or kernel work needs the carrier.
      */
     void protocolCheckpoint() {
-        if (!BOUNDED_TURNS_ENABLED || !inCarrierDomain()) {
+        if (usesEpochScheduler() || !BOUNDED_TURNS_ENABLED
+                || !inCarrierDomain()) {
             return;
         }
         boolean kernelUrgent = hasCompletions()
@@ -652,6 +825,23 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             || ring.hasPendingSubmissions();
         if ((kernelUrgent || competingWork)
             && System.nanoTime() - protocolDeadlineNanos >= 0) {
+            Thread.yield();
+        }
+    }
+
+    /**
+     * Natural epoch safe-point used before an owner-domain consumer moves to
+     * another receiver-owned chunk. Unlike the legacy budgeted checkpoint,
+     * this boundary has no time or request-count policy: it yields only when
+     * another scheduler, kernel, submission, buffer-return, or
+     * deferred-exchange source already needs the fused carrier.
+     */
+    void inboundChunkBoundary() {
+        if (!usesEpochScheduler() || !inCarrierDomain()) {
+            return;
+        }
+        if (hasEpochSourceExcludingPendingSq()
+                || sqePending || ring.hasPendingSubmissions()) {
             Thread.yield();
         }
     }
@@ -806,44 +996,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                 head++;
                 count++;
 
-                if (userData == -99L) {
-                    wakeupPending.set(0);
-                    submitEvfdRead();
-                } else if (userData != -88L) {
-                    int taskId = (int) userData;
-                    if (taskId >= 0 && taskId < tasks.length) {
-                        UringTask task = tasks[taskId];
-                        if (task.userData == userData) {
-                            task.result = res;
-                            task.flags = flags;
-                            CompletionHandler completionHandler =
-                                task.completionHandler;
-                            Thread vt = (Thread) TASK_THREAD_HANDLE.getAcquire(task);
-
-                            if (completionHandler != null && task.vectorSlot >= 0) {
-                                handleAsyncVectorSendCompletion(task, res, flags, completionHandler);
-                            } else if (completionHandler != null && task.egressId >= 0) {
-                                handleAsyncSendCompletion(task, res, flags, completionHandler);
-                            } else if (completionHandler != null) {
-                                boolean terminal =
-                                    (flags & Opcodes.IORING_CQE_F_MORE) == 0;
-                                if (terminal) {
-                                    task.completionHandler = null;
-                                    releaseTaskId(taskId);
-                                }
-                                completionHandler.onCompletion(
-                                    res, flags, terminal);
-                            } else if (vt != null
-                                    && (flags & Opcodes.IORING_CQE_F_MORE) == 0) {
-                                TASK_THREAD_HANDLE.setRelease(task, null);
-                                LockSupport.unpark(vt);
-                            } else if (vt == null
-                                    && (flags & Opcodes.IORING_CQE_F_MORE) == 0) {
-                                releaseTaskId(taskId);
-                            }
-                        }
-                    }
-                }
+                dispatchCompletion(userData, res, flags);
             }
         } finally {
             if (count > 0) {
@@ -851,6 +1004,86 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             }
         }
         return count;
+    }
+
+    /**
+     * Consumes exactly the CQ interval captured at epoch entry. Publish each
+     * consumed head before invoking Java code so an unbounded snapshot cannot
+     * keep a full CQ artificially occupied while a callback submits more I/O.
+     */
+    private int reapCompletionEpochSnapshot(int head, int snapshotTail) {
+        if (head == snapshotTail) {
+            return 0;
+        }
+        dispatchingCompletions = true;
+        int count = 0;
+        try {
+            while (head != snapshotTail) {
+                int index = head & kmask;
+                long cqeOffset = index * 16L;
+                long userData = cqesSegment.get(
+                    ValueLayout.JAVA_LONG, cqeOffset);
+                int res = cqesSegment.get(
+                    ValueLayout.JAVA_INT, cqeOffset + 8);
+                int flags = cqesSegment.get(
+                    ValueLayout.JAVA_INT, cqeOffset + 12);
+
+                head++;
+                count++;
+                INT_HANDLE.setRelease(kheadSegment, 0L, head);
+                dispatchCompletion(userData, res, flags);
+            }
+        } finally {
+            dispatchingCompletions = false;
+        }
+        return count;
+    }
+
+    private void dispatchCompletion(long userData, int res, int flags) {
+        if (userData == -99L) {
+            wakeupPending.set(0);
+            submitEvfdRead();
+            return;
+        }
+        if (userData == -88L) {
+            return;
+        }
+
+        int taskId = (int) userData;
+        if (taskId < 0 || taskId >= tasks.length) {
+            return;
+        }
+        UringTask task = tasks[taskId];
+        if (task.userData != userData) {
+            return;
+        }
+
+        task.result = res;
+        task.flags = flags;
+        CompletionHandler completionHandler = task.completionHandler;
+        Thread vt = (Thread) TASK_THREAD_HANDLE.getAcquire(task);
+
+        if (completionHandler != null && task.vectorSlot >= 0) {
+            handleAsyncVectorSendCompletion(
+                task, res, flags, completionHandler);
+        } else if (completionHandler != null && task.egressId >= 0) {
+            handleAsyncSendCompletion(task, res, flags, completionHandler);
+        } else if (completionHandler != null) {
+            boolean terminal =
+                (flags & Opcodes.IORING_CQE_F_MORE) == 0;
+            if (terminal) {
+                task.completionHandler = null;
+                releaseTaskId(taskId);
+            }
+            completionHandler.onCompletion(res, flags, terminal);
+        } else if (vt != null
+                && (flags & Opcodes.IORING_CQE_F_MORE) == 0) {
+            TASK_THREAD_HANDLE.setRelease(task, null);
+            LockSupport.unpark(vt);
+        } else if (vt == null
+                && (flags & Opcodes.IORING_CQE_F_MORE) == 0) {
+            releaseTaskId(taskId);
+        }
     }
 
     private boolean sqePending = false;
@@ -1978,7 +2211,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     }
 
     void releaseInboundChunk(InboundChunk chunk) {
-        if (LOCAL_READY_QUEUE_ENABLED && inCarrierDomain()) {
+        if (localReadyQueueEnabled() && inCarrierDomain()) {
             int bufferId = chunk.bufferId();
             if (chunk.bufferGroup() == KTLS_BUF_GROUP) {
                 if (returnedKtlsBufferCount == returnedKtlsBufferIds.length) {
@@ -2178,6 +2411,20 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         return carrierDomain.containsCurrentThread();
     }
 
+    private boolean localReadyQueueEnabled() {
+        // Epoch ordering is defined by the owner-local lanes. A legacy
+        // diagnostic switch must not collapse them into the external inbox.
+        return usesEpochScheduler() || LOCAL_READY_QUEUE_ENABLED;
+    }
+
+    boolean usesEpochScheduler() {
+        return schedulerMode == SchedulerMode.EPOCH;
+    }
+
+    long schedulerEpoch() {
+        return schedulerEpoch;
+    }
+
     ExchangeExecutor exchangeExecutor() {
         return exchangeExecutor;
     }
@@ -2210,7 +2457,23 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         return requested;
     }
 
+    static SchedulerMode schedulerMode(String configured) {
+        String normalized = java.util.Objects.requireNonNull(
+            configured, "configured").trim().toLowerCase(
+                java.util.Locale.ROOT);
+        return switch (normalized) {
+            case "budgeted" -> SchedulerMode.BUDGETED;
+            case "epoch" -> SchedulerMode.EPOCH;
+            default -> throw new IllegalArgumentException(
+                "cardigan.scheduler.mode must be budgeted or epoch: "
+                    + configured);
+        };
+    }
+
     private static int schedulerBudget(String property, int defaultValue) {
+        if (CONFIGURED_SCHEDULER_MODE == SchedulerMode.EPOCH) {
+            return defaultValue;
+        }
         if (!BOUNDED_TURNS_ENABLED) {
             return Integer.MAX_VALUE;
         }
@@ -2385,7 +2648,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
     @Override
     public void execute(Runnable command) {
-        if (LOCAL_READY_QUEUE_ENABLED && inCarrierDomain()) {
+        if (localReadyQueueEnabled() && inCarrierDomain()) {
             if (command instanceof HandlerContinuation) {
                 handlerReadyTasks.addLast(command);
             } else if (command instanceof EgressTask) {
@@ -2402,7 +2665,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     }
 
     void executeHandler(HandlerContinuation command) {
-        if (LOCAL_READY_QUEUE_ENABLED && inCarrierDomain()) {
+        if (localReadyQueueEnabled() && inCarrierDomain()) {
             handlerReadyTasks.addLast(command);
             return;
         }
@@ -2410,7 +2673,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     }
 
     void executeEgress(EgressTask command) {
-        if (LOCAL_READY_QUEUE_ENABLED && inCarrierDomain()) {
+        if (localReadyQueueEnabled() && inCarrierDomain()) {
             egressReadyTasks.addLast(command);
             return;
         }

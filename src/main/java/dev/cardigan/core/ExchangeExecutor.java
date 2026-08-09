@@ -19,8 +19,9 @@ import java.util.concurrent.locks.LockSupport;
  * The event loop has one carrier, so worker continuations consume the queue
  * serially. The event loop checks progress whenever a continuation returns
  * and starts another worker only when queued work remains while every current
- * worker is actually waiting or blocked. Workers yield after a bounded batch
- * so the carrier can return to io_uring and connection continuations.
+ * worker is actually waiting or blocked. Budgeted scheduler mode yields after
+ * a bounded batch; epoch mode instead shares the handler phase's absolute
+ * queue-tail cutoff across every worker.
  */
 final class ExchangeExecutor implements AutoCloseable {
     private static final int DEFAULT_QUEUE_CAPACITY = 65_536;
@@ -29,6 +30,7 @@ final class ExchangeExecutor implements AutoCloseable {
 
     private final UringEventLoop loop;
     private final TaskQueue tasks;
+    private final boolean epochScheduler;
     private final int maxBatch;
     private final int maxIdleWorkers;
     private final ArrayDeque<WorkerRunner> availableWorkers = new ArrayDeque<>();
@@ -40,6 +42,7 @@ final class ExchangeExecutor implements AutoCloseable {
     private int nextWorkerId;
     private volatile int workerCount;
     private final AtomicInteger scheduledContinuations = new AtomicInteger();
+    private long handlerEpochCutoff;
     private volatile boolean closed;
 
     ExchangeExecutor(UringEventLoop loop) {
@@ -49,6 +52,7 @@ final class ExchangeExecutor implements AutoCloseable {
             DEFAULT_QUEUE_CAPACITY
         );
         this.tasks = new TaskQueue(Math.max(2, requestedCapacity));
+        this.epochScheduler = loop.usesEpochScheduler();
         this.maxBatch = Math.max(
             1,
             Integer.getInteger("cardigan.exchange.max.batch", DEFAULT_MAX_BATCH)
@@ -72,6 +76,25 @@ final class ExchangeExecutor implements AutoCloseable {
 
     int workerCount() {
         return workerCount;
+    }
+
+    /** Freezes the handler work admitted to the phase about to run. */
+    void beginHandlerEpoch() {
+        if (!epochScheduler || closed) {
+            return;
+        }
+        handlerEpochCutoff = tasks.tailSnapshot();
+        ensureProgress();
+    }
+
+    /**
+     * Reports work intentionally left beyond the current phase's cutoff. The
+     * event loop uses this to start another turn instead of sleeping with an
+     * epoch-deferred request in the queue.
+     */
+    boolean hasDeferredEpochWork() {
+        return epochScheduler && !closed
+            && tasks.hasDeferredWork(handlerEpochCutoff);
     }
 
     @Override
@@ -131,7 +154,8 @@ final class ExchangeExecutor implements AutoCloseable {
      * continuation, which is the point where a parked handler can be observed.
      */
     void ensureProgress() {
-        if (closed || scheduledContinuations.get() != 0 || tasks.isEmpty()) {
+        if (closed || scheduledContinuations.get() != 0
+                || !hasRunnableWork()) {
             return;
         }
 
@@ -143,6 +167,12 @@ final class ExchangeExecutor implements AutoCloseable {
         }
 
         startWorker();
+    }
+
+    private boolean hasRunnableWork() {
+        return epochScheduler
+            ? tasks.hasWorkBefore(handlerEpochCutoff)
+            : !tasks.isEmpty();
     }
 
     private void startWorker() {
@@ -242,7 +272,9 @@ final class ExchangeExecutor implements AutoCloseable {
             try {
                 int completedInBatch = 0;
                 while (!closed) {
-                    Runnable task = tasks.poll();
+                    Runnable task = epochScheduler
+                        ? tasks.pollBefore(handlerEpochCutoff)
+                        : tasks.poll();
                     if (task == null) {
                         if (!awaitWork()) {
                             return;
@@ -257,10 +289,12 @@ final class ExchangeExecutor implements AutoCloseable {
                         t.printStackTrace();
                     }
 
-                    completedInBatch++;
-                    if (completedInBatch == maxBatch && !tasks.isEmpty()) {
-                        completedInBatch = 0;
-                        Thread.yield();
+                    if (!epochScheduler) {
+                        completedInBatch++;
+                        if (completedInBatch == maxBatch && !tasks.isEmpty()) {
+                            completedInBatch = 0;
+                            Thread.yield();
+                        }
                     }
                 }
             } finally {
@@ -289,7 +323,7 @@ final class ExchangeExecutor implements AutoCloseable {
      * acquire/release indices publish ownership without the CAS required by a
      * general MPSC queue.
      */
-    private static final class TaskQueue {
+    static final class TaskQueue {
         private static final VarHandle ARRAY =
             MethodHandles.arrayElementVarHandle(Object[].class);
         private static final VarHandle HEAD;
@@ -310,7 +344,7 @@ final class ExchangeExecutor implements AutoCloseable {
         private long head;
         private long tail;
 
-        private TaskQueue(int requestedCapacity) {
+        TaskQueue(int requestedCapacity) {
             int capacity = 1;
             while (capacity < requestedCapacity) {
                 capacity <<= 1;
@@ -319,7 +353,7 @@ final class ExchangeExecutor implements AutoCloseable {
             this.mask = capacity - 1;
         }
 
-        private boolean offer(Runnable task) {
+        boolean offer(Runnable task) {
             long currentTail = (long) TAIL.getAcquire(this);
             long currentHead = (long) HEAD.getAcquire(this);
             if (currentTail - currentHead >= elements.length) {
@@ -342,6 +376,34 @@ final class ExchangeExecutor implements AutoCloseable {
             ARRAY.setRelease(elements, index, null);
             HEAD.setRelease(this, currentHead + 1);
             return task;
+        }
+
+        Runnable pollBefore(long cutoff) {
+            long currentHead = (long) HEAD.getAcquire(this);
+            if (currentHead >= cutoff
+                    || currentHead == (long) TAIL.getAcquire(this)) {
+                return null;
+            }
+
+            int index = (int) currentHead & mask;
+            Runnable task = (Runnable) ARRAY.getAcquire(elements, index);
+            ARRAY.setRelease(elements, index, null);
+            HEAD.setRelease(this, currentHead + 1);
+            return task;
+        }
+
+        long tailSnapshot() {
+            return (long) TAIL.getAcquire(this);
+        }
+
+        boolean hasWorkBefore(long cutoff) {
+            return (long) HEAD.getAcquire(this) < cutoff;
+        }
+
+        boolean hasDeferredWork(long cutoff) {
+            long currentHead = (long) HEAD.getAcquire(this);
+            return currentHead == cutoff
+                && currentHead != (long) TAIL.getAcquire(this);
         }
 
         private boolean isEmpty() {

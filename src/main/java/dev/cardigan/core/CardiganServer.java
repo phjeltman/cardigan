@@ -856,7 +856,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             if (directKtlsReceive && TlsStats.ENABLED) {
                 TlsStats.directReceiveConnection();
             }
-            inbound = new InboundChunkStream(receiver);
+            inbound = new InboundChunkStream(loop, receiver);
             receiver.start();
             currentChunk = inbound.nextChunk();
             if (currentChunk == null) {

@@ -33,6 +33,7 @@ class MpscArrayQueueTest {
         assertTrue(queue.offer(2));
         assertTrue(queue.offer(3));
         assertFalse(queue.offer(4));
+        assertEquals(4, queue.publishedSnapshotSize());
 
         assertEquals(0, queue.poll());
         assertTrue(queue.offer(4));
@@ -56,6 +57,8 @@ class MpscArrayQueueTest {
         // publishing it. A later producer can publish its own position.
         assertTrue(tail.compareAndSet(0, 1));
         assertTrue(queue.offer("second"));
+        assertEquals(0, queue.publishedSnapshotSize(),
+            "a later publication must remain behind the unpublished head");
 
         AtomicReference<String> result = new AtomicReference<>("not-run");
         Thread consumer = Thread.ofPlatform().daemon(true).start(
@@ -67,6 +70,7 @@ class MpscArrayQueueTest {
         // to finish so the test does not leave a spinning thread behind.
         buffer[0] = "first";
         LONG_ARRAY_HANDLE.setRelease(sequences, 0, 1L);
+        assertEquals(2, queue.publishedSnapshotSize());
         if (!returnedWithoutPublication) {
             consumer.join(1_000);
         }
@@ -77,6 +81,22 @@ class MpscArrayQueueTest {
         assertEquals("first", queue.poll());
         assertEquals("second", queue.poll());
         assertTrue(queue.isEmpty());
+    }
+
+    @Test
+    void snapshotExcludesPositionsClaimedAfterItsTailBoundary() {
+        UringEventLoop.MpscArrayQueue<Integer> queue =
+            new UringEventLoop.MpscArrayQueue<>(4);
+
+        assertTrue(queue.offer(1));
+        int snapshotSize = queue.publishedSnapshotSize();
+        assertTrue(queue.offer(2));
+
+        for (int i = 0; i < snapshotSize; i++) {
+            assertEquals(1, queue.poll());
+        }
+        assertEquals(2, queue.poll(),
+            "work published after capture belongs to the next snapshot");
     }
 
     @Test

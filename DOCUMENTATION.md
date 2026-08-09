@@ -24,10 +24,26 @@ select a slower fallback when one of these required operations is rejected.
 The ring owner is also the sole carrier for that loop's ordinary virtual
 threads. Mounted virtual threads, protocol continuations, completion-unblocked
 continuations, handler workers, and egress connections are separate local
-scheduler lanes on that carrier. Turns are bounded so a yielded continuation
-cannot keep deferred kernel task work or visible CQEs from progressing.
-`IORING_SQ_TASKRUN` and CQ-overflow state are treated as readiness sources and
-cause a zero-submit `GETEVENTS` entry when necessary.
+scheduler lanes on that carrier. The default `budgeted` scheduler places
+configured count limits on those lanes and a cooperative time limit on a
+running protocol pump. Its manual limits are retained as diagnostics rather
+than production tuning recommendations.
+
+The alternative `epoch` scheduler is experimental. It materializes deferred
+kernel task work, then advances through snapshots of visible CQEs, the external
+inbox, completion-unblocked continuations, protocol continuations, handler
+continuations, returned buffers, and egress work. Work appended to its current
+or an earlier phase waits for the next epoch; work offered to a later phase may
+run in the current epoch. Handler workers share the exchange-queue tail captured
+at the start of their phase. Protocol input yields at an RX-chunk boundary only
+when another scheduler, kernel, submission, returned-buffer, or deferred-handler
+source is actually ready. Pending SQEs are normally submitted after the final
+phase, although SQ exhaustion or kernel-task-work materialization can require
+an earlier entry.
+
+Both modes keep ordinary handlers on the fused ring-owner/Loom carrier.
+`IORING_SQ_TASKRUN` and CQ-overflow state are readiness sources and cause a
+`GETEVENTS` entry when necessary, even when no SQE is pending.
 
 Plaintext listeners accept sockets directly into the registered-file table.
 TLS retains a process descriptor for OpenSSL, but installs it with an
@@ -116,16 +132,9 @@ they are not dynamically reloadable. Defaults remain experimental.
 | `cardigan.fixed.files.mode` | `auto` | `auto`, `legacy`, `async-explicit`, `async-alloc`, or `direct`; auto uses direct plaintext accept and async allocation for TLS |
 | `cardigan.fixed.files.capacity` | 8192 | Registered socket slots per event loop |
 | `cardigan.max.tasks` | 2 x fixed-file capacity + SQ entries | io_uring task slots per event loop |
-| `cardigan.scheduler.boundedTurns` | `true` | Bound each reactor lane instead of exhaustive drains |
-| `cardigan.scheduler.cqesPerTurn` | 256 | CQEs reaped per scheduler turn |
-| `cardigan.scheduler.completionsPerTurn` | 256 | CQ-unblocked continuations per scheduler turn |
-| `cardigan.scheduler.protocolTasksPerTurn` | 128 | Protocol continuations per turn |
-| `cardigan.scheduler.handlerContinuationsPerTurn` | 32 | Exchange-worker continuations per turn; each worker retains its own request batch |
-| `cardigan.scheduler.egressTasksPerTurn` | 256 | Egress-ready connections per scheduler turn |
-| `cardigan.scheduler.externalTasksPerTurn` | 64 | Externally submitted tasks admitted per scheduler turn |
-| `cardigan.scheduler.protocolQuantumMicros` | 50 | Cooperative H1/H2 pump quantum when competing work exists |
-| `cardigan.scheduler.protocolCheckpointInterval` | 16 | Requests/frames between pump fairness checks |
-| `cardigan.exchange.max.batch` | 64 | Exchanges run by a hot worker before it cooperatively yields |
+| `cardigan.exchange.queue.capacity` | 65536 | Queued ordinary exchanges per event loop |
+| `cardigan.exchange.max.idle.workers` | 64 | Retained idle exchange workers per event loop |
+| `cardigan.scheduler.mode` | `budgeted` | `budgeted` or experimental `epoch` |
 | `cardigan.scheduler.stats` | `false` | Report lane, submit, wait, task-work, and CQ-overflow counters |
 | `cardigan.fixed.files.stats` | `false` | Report fixed-file occupancy and admission counters |
 | `cardigan.isolated.carriers` | available processors | Isolated carrier count |
@@ -145,16 +154,40 @@ they are not dynamically reloadable. Defaults remain experimental.
 | `cardigan.tls.stats` | `false` | Report TLS counters at shutdown |
 | `cardigan.http2.resource.stats` | `false` | Report HTTP/2 resource high-water marks |
 
-The handler budget counts continuation mounts, not individual exchanges. A
-normal exchange worker retains Cardigan's 64-exchange batch, and a yielded
-worker may consume another handler slot in the same turn. The default therefore
-permits at most 32 mounts (roughly 2,048 trivial exchanges under continuous
-backlog) before the egress phase. Smaller handler budgets are useful
-latency/resource-pressure profiles, but should be benchmarked against the
-target workload: they deliberately give up some of Cardigan's batching.
+The fixed-file table, io_uring task pool, exchange queue, and retained-worker
+limit are resource capacities. They are distinct from the scheduling policy
+below and should be held constant when comparing scheduler modes.
 
-Lower-level tuning properties are intentionally undocumented; they are
-experimental diagnostics, use at your peril.
+### Legacy budgeted-scheduler diagnostics
+
+These properties preserve the original budgeted scheduler for experiments and
+regression diagnosis. They are not production sizing guidance. The `epoch`
+scheduler does not use them to govern epoch scheduling; the benchmark launcher
+rejects the explicit equivalents it exposes when `--scheduler-mode=epoch` is
+selected.
+
+| Property | Default | Budgeted-mode meaning |
+| --- | ---: | --- |
+| `cardigan.scheduler.boundedTurns` | `true` | Apply lane limits and cooperative protocol checkpoints; `false` removes numeric caps, while CQ/completion/protocol/egress still retain entry snapshots and the external/handler lanes retain their legacy append behavior |
+| `cardigan.scheduler.cqesPerTurn` | 256 | CQEs reaped per turn |
+| `cardigan.scheduler.completionsPerTurn` | 256 | CQ-unblocked continuations per turn |
+| `cardigan.scheduler.protocolTasksPerTurn` | 128 | Protocol continuations per turn |
+| `cardigan.scheduler.handlerContinuationsPerTurn` | 32 | Exchange-worker continuation mounts per turn |
+| `cardigan.scheduler.egressTasksPerTurn` | 256 | Egress-ready connections per turn |
+| `cardigan.scheduler.externalTasksPerTurn` | 64 | External-inbox tasks admitted per turn |
+| `cardigan.scheduler.protocolQuantumMicros` | 50 | Protocol-pump deadline when competing work exists |
+| `cardigan.scheduler.protocolCheckpointInterval` | 16 | Requests or frames between deadline checks |
+| `cardigan.exchange.max.batch` | 64 | Exchanges a hot worker runs before a cooperative yield |
+
+The handler budget counts continuation mounts, not exchanges. Under continuous
+backlog, the defaults allow 32 mounts and up to 64 exchanges per uninterrupted
+worker batch, so roughly 2,048 trivial exchanges can run before egress. Parking
+or yielding changes that arithmetic. This explains the diagnostic; it is not a
+recommended target. Epoch mode instead runs the work offered through the
+handler phase's captured queue-tail cutoff.
+
+Other lower-level tuning properties remain intentionally undocumented
+experimental diagnostics.
 
 ## Validation
 
@@ -176,18 +209,62 @@ mvn -f dev/pom.xml test
 ./dev/benchmarks/benchmark.sh --help
 ```
 
-The benchmark launcher exposes the scheduler budgets and all fixed-file
-lifecycle modes directly. For an end-to-end comparison, compare the
-unbounded-budget/legacy control with the fused bounded/direct design using
-`--scheduler-bounded=false --fixed-files=legacy` and
-`--scheduler-bounded=true --fixed-files=direct --scheduler-stats`.
-That is intentionally a composite comparison. Attribute effects with a 2x2
-matrix that varies one switch at a time; use a connection-churn workload to
-measure accept/register/close rather than a persistent connection cohort.
-Use `--fixed-files-capacity` to exercise admission pressure. When sweeping that
+The benchmark launcher exposes `budgeted` and `epoch` directly and prints the
+effective scheduler and fixed-file layout before each case, plus the io_uring
+task-pool capacity when it is pinned. The following is a controlled HTTP/2
+scheduler A/B. It holds the
+fixed-file layout, fixed-file capacity, and io_uring task-pool capacity
+constant, selects only endpoint 1, and reverses run order across four pairs:
+
+```bash
+common=(
+  --scheduler-stats
+  --fixed-file-stats
+  --fixed-files=direct
+  --fixed-files-capacity=8192
+  --uring-max-tasks=16896
+  --http2
+  --http2-streams=16
+  --cpus=1
+  --threads=4
+  --connections=200
+  --warmup=10s
+  --duration=30s
+  1
+)
+
+for pair in 1 2 3 4; do
+  if (( pair % 2 == 1 )); then
+    modes=(budgeted epoch)
+  else
+    modes=(epoch budgeted)
+  fi
+  for mode in "${modes[@]}"; do
+    ./dev/benchmarks/benchmark.sh \
+      --scheduler-mode="$mode" "${common[@]}"
+  done
+done
+```
+
+The pinned task count, 16,896, is `2 * 8192 + 512`: the runtime-derived default
+for this fixed-file capacity and the launcher's 512-entry rings. Run the pair
+from one immutable source revision and JDK on an otherwise quiet host with the
+same disjoint server/client CPU placement. The launcher pins server loops but
+not the client, so arrange client affinity externally. Treat it as an
+experiment, not a performance guarantee. The
+scheduler and fixed-file counters are cumulative over server startup, warm-up,
+measurement, and shutdown; use them to explain a run, not as measurement-window
+rates. Repeat the comparison with `--pipeline --pipeline-depth=16` in place of
+the two HTTP/2 flags to cover HTTP/1 pipelining; the launcher enables wrk's
+latency distribution for those runs.
+
+Do not combine an epoch run with the legacy budget flags. To study fixed-file
+lifecycle separately, vary one fixed-file mode at a time and use a
+connection-churn workload rather than a persistent cohort. Use
+`--fixed-files-capacity` to exercise admission pressure. When sweeping that
 capacity for throughput rather than overload behavior, use `--uring-max-tasks`
-to hold the task-pool size constant; otherwise its runtime default scales with
-the fixed-file table.
+to keep the task-pool size constant; otherwise its default scales with the
+fixed-file table.
 
 The adversarial JUnit suites and HTTP/2 flow-control probe cover bounded
 resources, cancellation, connection survival, and recovery after hostile work.

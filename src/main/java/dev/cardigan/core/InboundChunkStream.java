@@ -9,16 +9,25 @@ import java.lang.foreign.MemorySegment;
  * independently owned multishot receive buffers.
  */
 final class InboundChunkStream implements AutoCloseable {
+    private final UringEventLoop loop;
     private final InboundReceiver receiver;
     private InboundChunk pending;
     private int pendingOffset;
 
     InboundChunkStream(InboundReceiver receiver) {
+        this(null, receiver);
+    }
+
+    InboundChunkStream(UringEventLoop loop, InboundReceiver receiver) {
+        this.loop = loop;
         this.receiver = receiver;
     }
 
     InboundChunk nextChunk() {
         if (pending == null) {
+            if (loop != null) {
+                loop.inboundChunkBoundary();
+            }
             return receiver.receive();
         }
 

@@ -32,7 +32,9 @@ FIXED_FILE_STATS=false
 FIXED_FILES_MODE="auto"
 FIXED_FILES_CAPACITY=8192
 URING_MAX_TASKS=""
+SCHEDULER_MODE="budgeted"
 SCHEDULER_BOUNDED="true"
+SCHEDULER_LEGACY_OPTIONS_SET=false
 SCHEDULER_CQES=256
 SCHEDULER_COMPLETIONS=256
 SCHEDULER_PROTOCOL_TASKS=128
@@ -90,12 +92,14 @@ Options:
   --tls-private-key=PATH     PEM private key (default: generated test key)
   --tls-stats                Print opt-in TLS transport counters at shutdown
   --http2-resource-stats     Print opt-in HTTP/2 resource high-water marks
+  --scheduler-mode=MODE      budgeted (default) or experimental epoch
   --scheduler-stats          Print per-loop scheduler turn/lane counters
   --fixed-file-stats         Print fixed-file capacity and admission counters
   --fixed-files=MODE         auto, legacy, async-explicit, async-alloc, direct
   --fixed-files-capacity=N   Registered socket slots per event loop (default: 8192)
   --uring-max-tasks=N        Pin io_uring task slots per event loop
                              (default: derived from fixed-file capacity)
+  Legacy budgeted-mode diagnostics (rejected with --scheduler-mode=epoch):
   --scheduler-bounded=BOOL   Enable bounded reactor turns (default: true)
   --scheduler-cqes=N         CQEs reaped per turn (default: 256)
   --scheduler-completions=N  CQ-unblocked continuations per turn (default: 256)
@@ -145,6 +149,7 @@ Examples:
   ./dev/benchmarks/benchmark.sh --cpus=1 --isolated-carriers=1 --duration=10s 4
   ./dev/benchmarks/benchmark.sh --http2 --cpus=4 --duration=10s 1
   ./dev/benchmarks/benchmark.sh --http2 --http2-streams=16 --cpus=4 --duration=10s 1
+  ./dev/benchmarks/benchmark.sh --scheduler-mode=epoch --http2 --http2-streams=16 1
   ./dev/benchmarks/benchmark.sh --tls --http2 --cpus=2 --duration=10s 1
   ./dev/benchmarks/benchmark.sh --tls12 --tls-direct-rx --http2 --cpus=2 --duration=10s 1
   ./dev/benchmarks/benchmark.sh --http2-flow-control --cpus=2 --flow-cycles=10
@@ -208,6 +213,15 @@ while [ "$#" -gt 0 ]; do
             SCHEDULER_STATS=true
             shift
             ;;
+        --scheduler-mode=*)
+            SCHEDULER_MODE="${1#*=}"
+            shift
+            ;;
+        --scheduler-mode)
+            require_value "$@"
+            SCHEDULER_MODE="$2"
+            shift 2
+            ;;
         --fixed-file-stats)
             FIXED_FILE_STATS=true
             shift
@@ -241,74 +255,90 @@ while [ "$#" -gt 0 ]; do
             ;;
         --scheduler-bounded=*)
             SCHEDULER_BOUNDED="${1#*=}"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift
             ;;
         --scheduler-bounded)
             require_value "$@"
             SCHEDULER_BOUNDED="$2"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift 2
             ;;
         --scheduler-cqes=*)
             SCHEDULER_CQES="${1#*=}"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift
             ;;
         --scheduler-cqes)
             require_value "$@"
             SCHEDULER_CQES="$2"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift 2
             ;;
         --scheduler-completions=*)
             SCHEDULER_COMPLETIONS="${1#*=}"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift
             ;;
         --scheduler-completions)
             require_value "$@"
             SCHEDULER_COMPLETIONS="$2"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift 2
             ;;
         --scheduler-protocol=*)
             SCHEDULER_PROTOCOL_TASKS="${1#*=}"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift
             ;;
         --scheduler-protocol)
             require_value "$@"
             SCHEDULER_PROTOCOL_TASKS="$2"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift 2
             ;;
         --scheduler-handlers=*)
             SCHEDULER_HANDLER_CONTINUATIONS="${1#*=}"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift
             ;;
         --scheduler-handlers)
             require_value "$@"
             SCHEDULER_HANDLER_CONTINUATIONS="$2"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift 2
             ;;
         --scheduler-egress=*)
             SCHEDULER_EGRESS_TASKS="${1#*=}"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift
             ;;
         --scheduler-egress)
             require_value "$@"
             SCHEDULER_EGRESS_TASKS="$2"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift 2
             ;;
         --scheduler-external=*)
             SCHEDULER_EXTERNAL_TASKS="${1#*=}"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift
             ;;
         --scheduler-external)
             require_value "$@"
             SCHEDULER_EXTERNAL_TASKS="$2"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift 2
             ;;
         --scheduler-quantum-us=*)
             SCHEDULER_QUANTUM_MICROS="${1#*=}"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift
             ;;
         --scheduler-quantum-us)
             require_value "$@"
             SCHEDULER_QUANTUM_MICROS="$2"
+            SCHEDULER_LEGACY_OPTIONS_SET=true
             shift 2
             ;;
         --chunked-upload)
@@ -630,6 +660,14 @@ case "$FIXED_FILES_MODE" in
         ;;
 esac
 
+case "$SCHEDULER_MODE" in
+    budgeted|epoch) ;;
+    *)
+        echo "Invalid scheduler mode: $SCHEDULER_MODE" >&2
+        exit 2
+        ;;
+esac
+
 case "$SCHEDULER_BOUNDED" in
     true|false) ;;
     *)
@@ -637,6 +675,12 @@ case "$SCHEDULER_BOUNDED" in
         exit 2
         ;;
 esac
+
+if [ "$SCHEDULER_MODE" = epoch ] &&
+   [ "$SCHEDULER_LEGACY_OPTIONS_SET" = true ]; then
+    echo "Legacy scheduler budget options require --scheduler-mode=budgeted" >&2
+    exit 2
+fi
 
 if [ "$TLS" = true ] && [ "$FIXED_FILES_MODE" = direct ]; then
     echo "--fixed-files=direct cannot be used with TLS" >&2
@@ -1115,7 +1159,7 @@ run_wrk() {
     local duration="$1"
     local url="$2"
     local script_path="$3"
-    local args=(-t"$WRK_THREADS" -c"$CONNECTIONS" -d"$duration")
+    local args=(--latency -t"$WRK_THREADS" -c"$CONNECTIONS" -d"$duration")
     if [ -s "$script_path" ]; then
         args=(-s "$script_path" "${args[@]}")
     fi
@@ -1168,10 +1212,12 @@ print_runtime_configuration() {
     else
         echo "io_uring task pool: runtime-derived from fixed-file capacity and SQ entries"
     fi
-    if [ "$SCHEDULER_BOUNDED" = true ]; then
-        echo "Scheduler: bounded=true, CQEs=$SCHEDULER_CQES, completions=$SCHEDULER_COMPLETIONS, protocol=$SCHEDULER_PROTOCOL_TASKS, handlers=$SCHEDULER_HANDLER_CONTINUATIONS, egress=$SCHEDULER_EGRESS_TASKS, external=$SCHEDULER_EXTERNAL_TASKS, quantum=${SCHEDULER_QUANTUM_MICROS}us"
+    if [ "$SCHEDULER_MODE" = epoch ]; then
+        echo "Scheduler: mode=epoch (experimental phase snapshots), stats=$SCHEDULER_STATS"
+    elif [ "$SCHEDULER_BOUNDED" = true ]; then
+        echo "Scheduler: mode=budgeted, bounded=true, CQEs=$SCHEDULER_CQES, completions=$SCHEDULER_COMPLETIONS, protocol=$SCHEDULER_PROTOCOL_TASKS, handlers=$SCHEDULER_HANDLER_CONTINUATIONS, egress=$SCHEDULER_EGRESS_TASKS, external=$SCHEDULER_EXTERNAL_TASKS, quantum=${SCHEDULER_QUANTUM_MICROS}us, stats=$SCHEDULER_STATS"
     else
-        echo "Scheduler: bounded=false (lane budgets disabled), quantum=${SCHEDULER_QUANTUM_MICROS}us"
+        echo "Scheduler: mode=budgeted, bounded=false (lane budgets disabled), quantum=${SCHEDULER_QUANTUM_MICROS}us, stats=$SCHEDULER_STATS"
     fi
 }
 
@@ -1359,6 +1405,22 @@ CARDIGAN_FIXED_FILE_ARGS=(
     -Dcardigan.fixed.files.capacity="$FIXED_FILES_CAPACITY"
     -Dcardigan.fixed.files.stats="$FIXED_FILE_STATS"
 )
+CARDIGAN_SCHEDULER_ARGS=(
+    -Dcardigan.scheduler.mode="$SCHEDULER_MODE"
+    -Dcardigan.scheduler.stats="$SCHEDULER_STATS"
+)
+if [ "$SCHEDULER_MODE" = budgeted ]; then
+    CARDIGAN_SCHEDULER_ARGS+=(
+        -Dcardigan.scheduler.boundedTurns="$SCHEDULER_BOUNDED"
+        -Dcardigan.scheduler.cqesPerTurn="$SCHEDULER_CQES"
+        -Dcardigan.scheduler.completionsPerTurn="$SCHEDULER_COMPLETIONS"
+        -Dcardigan.scheduler.protocolTasksPerTurn="$SCHEDULER_PROTOCOL_TASKS"
+        -Dcardigan.scheduler.handlerContinuationsPerTurn="$SCHEDULER_HANDLER_CONTINUATIONS"
+        -Dcardigan.scheduler.egressTasksPerTurn="$SCHEDULER_EGRESS_TASKS"
+        -Dcardigan.scheduler.externalTasksPerTurn="$SCHEDULER_EXTERNAL_TASKS"
+        -Dcardigan.scheduler.protocolQuantumMicros="$SCHEDULER_QUANTUM_MICROS"
+    )
+fi
 if [ -n "$URING_MAX_TASKS" ]; then
     CARDIGAN_FIXED_FILE_ARGS+=(
         -Dcardigan.max.tasks="$URING_MAX_TASKS"
@@ -1389,20 +1451,12 @@ java "${JAVA_ARGS[@]}" \
         "${CARDIGAN_TLS_ARGS[@]}" \
         "${CARDIGAN_DIAGNOSTIC_ARGS[@]}" \
         "${CARDIGAN_FIXED_FILE_ARGS[@]}" \
+        "${CARDIGAN_SCHEDULER_ARGS[@]}" \
         -Dcardigan.benchmark.payloadSize="$PAYLOAD_SIZE" \
         -Dcardigan.benchmark.sleepMillis="$SLEEP_MILLIS" \
         -Dcardigan.benchmark.heavyIterations="$HEAVY_ITERATIONS" \
         -Dcardigan.http2.resource.stats="$HTTP2_RESOURCE_STATS" \
         -Dcardigan.http2.max.parked.senders.per.loop="$HTTP2_MAX_PARKED_SENDERS" \
-        -Dcardigan.scheduler.boundedTurns="$SCHEDULER_BOUNDED" \
-        -Dcardigan.scheduler.cqesPerTurn="$SCHEDULER_CQES" \
-        -Dcardigan.scheduler.completionsPerTurn="$SCHEDULER_COMPLETIONS" \
-        -Dcardigan.scheduler.protocolTasksPerTurn="$SCHEDULER_PROTOCOL_TASKS" \
-        -Dcardigan.scheduler.handlerContinuationsPerTurn="$SCHEDULER_HANDLER_CONTINUATIONS" \
-        -Dcardigan.scheduler.egressTasksPerTurn="$SCHEDULER_EGRESS_TASKS" \
-        -Dcardigan.scheduler.externalTasksPerTurn="$SCHEDULER_EXTERNAL_TASKS" \
-        -Dcardigan.scheduler.protocolQuantumMicros="$SCHEDULER_QUANTUM_MICROS" \
-        -Dcardigan.scheduler.stats="$SCHEDULER_STATS" \
         -Dcardigan.isolated.carriers="$ISOLATED_CARRIERS" \
         -Dcardigan.isolated.cpus="$ISOLATED_CPUS" \
         -Dcardigan.isolated.max.tasks="$ISOLATED_MAX_TASKS" \
