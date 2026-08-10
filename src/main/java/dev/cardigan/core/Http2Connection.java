@@ -137,79 +137,26 @@ final class Http2Connection {
     }
 
     void run() {
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment headerScratch = arena.allocate(Http2Frames.HEADER_SIZE);
-            MemorySegment payloadScratch = arena.allocate(Http2Frames.DEFAULT_MAX_FRAME_SIZE);
-            decodedHeaders = arena.allocate(MAX_HEADER_LIST_SIZE);
-            requestParser.bind(decodedHeaders);
-            continuationHeaders = arena.allocate(MAX_COMPRESSED_HEADER_BLOCK);
-
+        try (FrameBuffers buffers = new FrameBuffers()) {
             if (!sendSettings()) {
                 return;
             }
 
             while (open) {
-                if (!ensureCurrentChunk()) {
+                if (!drainAvailableFrames(buffers)) {
                     break;
                 }
-                MemorySegment header;
-                long headerOffset;
-                if (remaining() >= Http2Frames.HEADER_SIZE) {
-                    header = currentChunk.segment();
-                    headerOffset = currentOffset;
-                    currentOffset += Http2Frames.HEADER_SIZE;
-                } else {
-                    if (!readFully(headerScratch, 0, Http2Frames.HEADER_SIZE)) {
-                        break;
-                    }
-                    header = headerScratch;
-                    headerOffset = 0;
-                }
-
-                long headerWord = Http2Frames.readHeaderWord(header, headerOffset);
-                int payloadLength = Http2Frames.payloadLength(headerWord);
-                int type = Http2Frames.type(headerWord);
-                int flags = Http2Frames.flags(headerWord);
-                int streamId = Http2Frames.streamId(header, headerOffset, headerWord);
-
-                if (payloadLength > Http2Frames.DEFAULT_MAX_FRAME_SIZE) {
-                    connectionError(Http2Frames.FRAME_SIZE_ERROR);
+                InboundChunk next = inbound.nextChunk();
+                if (next == null) {
                     break;
                 }
-                if (!receivedInitialSettings
-                    && (type != Http2Frames.SETTINGS
-                        || streamId != 0
-                        || (flags & Http2Frames.FLAG_ACK) != 0)) {
-                    connectionError(Http2Frames.PROTOCOL_ERROR);
-                    break;
+                if (currentChunk != null) {
+                    next.close();
+                    throw new IllegalStateException(
+                        "Cannot replace unconsumed HTTP/2 input");
                 }
-
-                if (payloadLength == 0) {
-                    if (!processFrame(type, flags, streamId, MemorySegment.NULL, 0, 0)) {
-                        break;
-                    }
-                    releaseExhaustedChunk();
-                    continue;
-                }
-
-                if (remaining() >= payloadLength) {
-                    MemorySegment payload = currentChunk.segment();
-                    int payloadOffset = currentOffset;
-                    if (!processFrame(type, flags, streamId,
-                                      payload, payloadOffset, payloadLength)) {
-                        break;
-                    }
-                    currentOffset += payloadLength;
-                    releaseExhaustedChunk();
-                } else {
-                    if (!readFully(payloadScratch, 0, payloadLength)) {
-                        break;
-                    }
-                    if (!processFrame(type, flags, streamId,
-                                      payloadScratch, 0, payloadLength)) {
-                        break;
-                    }
-                }
+                currentChunk = next;
+                currentOffset = 0;
             }
             cancelAllStreams();
             awaitExchanges();
@@ -220,6 +167,179 @@ final class Http2Connection {
             disposePendingStreams();
             releaseCurrentChunk();
         }
+    }
+
+    /**
+     * Drains complete frames from the currently owned receive chunk. The
+     * ordinary frame-aligned path returns before acquiring another chunk so
+     * this large parser frame is not captured by the idle receive park.
+     * Fragmented headers and payloads retain the stackful {@link #readFully}
+     * fallback. Frame dispatch deliberately remains here so this method stays
+     * a stable HotSpot continuation boundary instead of being inlined back
+     * into the receive driver.
+     */
+    private boolean drainAvailableFrames(FrameBuffers buffers) {
+        while (open) {
+            releaseExhaustedChunk();
+            if (currentChunk == null) {
+                return true;
+            }
+
+            MemorySegment header;
+            long headerOffset;
+            if (remaining() >= Http2Frames.HEADER_SIZE) {
+                header = currentChunk.segment();
+                headerOffset = currentOffset;
+                currentOffset += Http2Frames.HEADER_SIZE;
+            } else {
+                if (!readFully(
+                        buffers.headerScratch, 0,
+                        Http2Frames.HEADER_SIZE)) {
+                    return false;
+                }
+                header = buffers.headerScratch;
+                headerOffset = 0;
+            }
+
+            long headerWord = Http2Frames.readHeaderWord(header, headerOffset);
+            int payloadLength = Http2Frames.payloadLength(headerWord);
+            int type = Http2Frames.type(headerWord);
+            int flags = Http2Frames.flags(headerWord);
+            int streamId = Http2Frames.streamId(
+                header, headerOffset, headerWord);
+
+            if (payloadLength > Http2Frames.DEFAULT_MAX_FRAME_SIZE) {
+                return connectionError(Http2Frames.FRAME_SIZE_ERROR);
+            }
+            if (!receivedInitialSettings
+                && (type != Http2Frames.SETTINGS
+                    || streamId != 0
+                    || (flags & Http2Frames.FLAG_ACK) != 0)) {
+                return connectionError(Http2Frames.PROTOCOL_ERROR);
+            }
+
+            MemorySegment payload;
+            int payloadOffset;
+            boolean advanceCurrentPayload = false;
+            if (payloadLength == 0) {
+                payload = MemorySegment.NULL;
+                payloadOffset = 0;
+            } else if (remaining() >= payloadLength) {
+                payload = currentChunk.segment();
+                payloadOffset = currentOffset;
+                advanceCurrentPayload = true;
+            } else {
+                if (!readFully(
+                        buffers.payloadScratch, 0, payloadLength)) {
+                    return false;
+                }
+                payload = buffers.payloadScratch;
+                payloadOffset = 0;
+            }
+
+            boolean processed;
+            if (continuationStreamId != 0
+                    && type != Http2Frames.CONTINUATION) {
+                processed = connectionError(Http2Frames.PROTOCOL_ERROR);
+            } else {
+                processed = switch (type) {
+                    case Http2Frames.SETTINGS -> processSettings(
+                        flags, streamId, payload, payloadOffset,
+                        payloadLength);
+                    case Http2Frames.PING -> processPing(
+                        flags, streamId, payload, payloadOffset,
+                        payloadLength);
+                    case Http2Frames.WINDOW_UPDATE -> {
+                        if (payloadLength != 4) {
+                            yield connectionError(
+                                Http2Frames.FRAME_SIZE_ERROR);
+                        }
+                        int increment = payload.get(
+                            INT_BE, payloadOffset)
+                            & Http2Frames.MAX_STREAM_ID;
+                        if (increment == 0) {
+                            if (streamId == 0) {
+                                yield connectionError(
+                                    Http2Frames.PROTOCOL_ERROR);
+                            }
+                            yield sendRstStream(
+                                streamId, Http2Frames.PROTOCOL_ERROR);
+                        }
+
+                        if (streamId == 0) {
+                            long updated =
+                                (long) connectionSendWindow + increment;
+                            if (updated > Integer.MAX_VALUE) {
+                                yield connectionError(
+                                    Http2Frames.FLOW_CONTROL_ERROR);
+                            }
+                            connectionSendWindow = (int) updated;
+                            signalAllSendWaiters();
+                            yield true;
+                        }
+
+                        Http2Task task = findActiveTask(streamId);
+                        if (task != null) {
+                            long updated =
+                                (long) task.sendWindow + increment;
+                            if (updated > Integer.MAX_VALUE) {
+                                yield sendRstStream(
+                                    streamId,
+                                    Http2Frames.FLOW_CONTROL_ERROR);
+                            }
+                            task.sendWindow = (int) updated;
+                            signalSendWaiter(task);
+                            yield true;
+                        }
+                        PendingStream pending =
+                            findPendingStream(streamId);
+                        if (pending != null) {
+                            long updated =
+                                (long) pending.sendWindow + increment;
+                            if (updated > Integer.MAX_VALUE) {
+                                removePendingStream(pending);
+                                yield sendRstStream(
+                                    streamId,
+                                    Http2Frames.FLOW_CONTROL_ERROR);
+                            }
+                            pending.sendWindow = (int) updated;
+                            yield true;
+                        }
+                        if (streamId > lastClientStreamId) {
+                            yield connectionError(
+                                Http2Frames.PROTOCOL_ERROR);
+                        }
+                        yield true;
+                    }
+                    case Http2Frames.GOAWAY ->
+                        processGoAway(streamId, payloadLength);
+                    case Http2Frames.RST_STREAM ->
+                        processRstStream(streamId, payloadLength);
+                    case Http2Frames.PRIORITY -> processPriority(
+                        streamId, payload, payloadOffset, payloadLength);
+                    case Http2Frames.PUSH_PROMISE ->
+                        connectionError(Http2Frames.PROTOCOL_ERROR);
+                    case Http2Frames.CONTINUATION -> processContinuation(
+                        flags, streamId, payload, payloadOffset,
+                        payloadLength);
+                    case Http2Frames.HEADERS -> processHeaders(
+                        flags, streamId, payload, payloadOffset,
+                        payloadLength);
+                    case Http2Frames.DATA -> processData(
+                        flags, streamId, payload, payloadOffset,
+                        payloadLength);
+                    default -> true;
+                };
+            }
+            if (!processed) {
+                return false;
+            }
+            if (advanceCurrentPayload) {
+                currentOffset += payloadLength;
+            }
+            releaseExhaustedChunk();
+        }
+        return false;
     }
 
     int peerMaxFrameSize() {
@@ -249,36 +369,6 @@ final class Http2Connection {
         cancelAllStreams();
         signalAllSendWaiters();
         scheduleDrainInputShutdown();
-    }
-
-    private boolean processFrame(int type, int flags, int streamId,
-                                 MemorySegment payload, int payloadOffset, int payloadLength) {
-        if (continuationStreamId != 0 && type != Http2Frames.CONTINUATION) {
-            return connectionError(Http2Frames.PROTOCOL_ERROR);
-        }
-        return switch (type) {
-            case Http2Frames.SETTINGS ->
-                processSettings(flags, streamId, payload, payloadOffset, payloadLength);
-            case Http2Frames.PING ->
-                processPing(flags, streamId, payload, payloadOffset, payloadLength);
-            case Http2Frames.WINDOW_UPDATE ->
-                processWindowUpdate(streamId, payload, payloadOffset, payloadLength);
-            case Http2Frames.GOAWAY ->
-                processGoAway(streamId, payloadLength);
-            case Http2Frames.RST_STREAM ->
-                processRstStream(streamId, payloadLength);
-            case Http2Frames.PRIORITY ->
-                processPriority(streamId, payload, payloadOffset, payloadLength);
-            case Http2Frames.PUSH_PROMISE ->
-                connectionError(Http2Frames.PROTOCOL_ERROR);
-            case Http2Frames.CONTINUATION ->
-                processContinuation(flags, streamId, payload, payloadOffset, payloadLength);
-            case Http2Frames.HEADERS ->
-                processHeaders(flags, streamId, payload, payloadOffset, payloadLength);
-            case Http2Frames.DATA ->
-                processData(flags, streamId, payload, payloadOffset, payloadLength);
-            default -> true;
-        };
     }
 
     private boolean processSettings(int flags, int streamId, MemorySegment payload,
@@ -361,55 +451,6 @@ final class Http2Connection {
             return true;
         }
         return sendPing(payload.get(LONG_BE, payloadOffset));
-    }
-
-    private boolean processWindowUpdate(int streamId, MemorySegment payload,
-                                        int payloadOffset, int payloadLength) {
-        if (payloadLength != 4) {
-            return connectionError(Http2Frames.FRAME_SIZE_ERROR);
-        }
-        int increment = payload.get(INT_BE, payloadOffset) & Http2Frames.MAX_STREAM_ID;
-        if (increment == 0) {
-            if (streamId == 0) {
-                return connectionError(Http2Frames.PROTOCOL_ERROR);
-            }
-            return sendRstStream(streamId, Http2Frames.PROTOCOL_ERROR);
-        }
-
-        if (streamId == 0) {
-            long updated = (long) connectionSendWindow + increment;
-            if (updated > Integer.MAX_VALUE) {
-                return connectionError(Http2Frames.FLOW_CONTROL_ERROR);
-            }
-            connectionSendWindow = (int) updated;
-            signalAllSendWaiters();
-            return true;
-        }
-
-        Http2Task task = findActiveTask(streamId);
-        if (task != null) {
-            long updated = (long) task.sendWindow + increment;
-            if (updated > Integer.MAX_VALUE) {
-                return sendRstStream(streamId, Http2Frames.FLOW_CONTROL_ERROR);
-            }
-            task.sendWindow = (int) updated;
-            signalSendWaiter(task);
-            return true;
-        }
-        PendingStream pending = findPendingStream(streamId);
-        if (pending != null) {
-            long updated = (long) pending.sendWindow + increment;
-            if (updated > Integer.MAX_VALUE) {
-                removePendingStream(pending);
-                return sendRstStream(streamId, Http2Frames.FLOW_CONTROL_ERROR);
-            }
-            pending.sendWindow = (int) updated;
-            return true;
-        }
-        if (streamId > lastClientStreamId) {
-            return connectionError(Http2Frames.PROTOCOL_ERROR);
-        }
-        return true;
     }
 
     private boolean processGoAway(int streamId, int payloadLength) {
@@ -1412,6 +1453,33 @@ final class Http2Connection {
             currentChunk.close();
             currentChunk = null;
             currentOffset = 0;
+        }
+    }
+
+    /** Scratch storage whose lifetime is the complete HTTP/2 connection. */
+    private final class FrameBuffers implements AutoCloseable {
+        private final Arena arena = Arena.ofConfined();
+        private final MemorySegment headerScratch;
+        private final MemorySegment payloadScratch;
+
+        private FrameBuffers() {
+            try {
+                headerScratch = arena.allocate(Http2Frames.HEADER_SIZE);
+                payloadScratch = arena.allocate(
+                    Http2Frames.DEFAULT_MAX_FRAME_SIZE);
+                decodedHeaders = arena.allocate(MAX_HEADER_LIST_SIZE);
+                requestParser.bind(decodedHeaders);
+                continuationHeaders = arena.allocate(
+                    MAX_COMPRESSED_HEADER_BLOCK);
+            } catch (RuntimeException | Error failure) {
+                arena.close();
+                throw failure;
+            }
+        }
+
+        @Override
+        public void close() {
+            arena.close();
         }
     }
 
