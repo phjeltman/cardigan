@@ -32,7 +32,6 @@ import dev.cardigan.tls.TlsHandshakeStats;
 import dev.cardigan.tls.TlsCapabilities;
 
 import java.nio.charset.StandardCharsets;
-import java.lang.invoke.VarHandle;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -109,18 +108,6 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         HTTP1_FRAMING_CHUNKED - 1;
     private static final long HTTP1_FRAMING_INVALID = -2;
     private static final long HTTP1_FRAMING_TOO_LARGE = -3;
-
-    private static final VarHandle STRING_VALUE_HANDLE;
-    static {
-        VarHandle handle = null;
-        try {
-            java.lang.invoke.MethodHandles.Lookup lookup = java.lang.invoke.MethodHandles.privateLookupIn(String.class, java.lang.invoke.MethodHandles.lookup());
-            handle = lookup.findVarHandle(String.class, "value", byte[].class);
-        } catch (Throwable t) {
-            handle = null;
-        }
-        STRING_VALUE_HANDLE = handle;
-    }
 
     private static MemorySegment createStaticSegment(String asciiStr) {
         byte[] bytes = asciiStr.getBytes(StandardCharsets.US_ASCII);
@@ -1714,15 +1701,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                             staticBody.segment(), bodyLen);
                     }
                 } else if (body instanceof String text) {
-                    byte[] utf8Bytes = null;
-                    if (STRING_VALUE_HANDLE != null) {
-                        try {
-                            byte[] bytes = (byte[]) STRING_VALUE_HANDLE.get(text);
-                            if (bytes != null && bytes.length == text.length()) {
-                                utf8Bytes = bytes;
-                            }
-                        } catch (Throwable ignored) {}
-                    }
+                    byte[] utf8Bytes = Http2ResponseWriter.asciiBytes(text);
                     if (utf8Bytes == null) {
                         utf8Bytes = text.getBytes(StandardCharsets.UTF_8);
                     }

@@ -15,12 +15,16 @@ class Http2ResponseWriterTest {
         assertAscii("");
         assertAscii("1234567");
         assertAscii("12345678");
+        assertAscii("123456789");
         assertAscii("User details for ID: 423 parsed directly off-heap!");
     }
 
     @Test
     void rejectsLatin1AndUtf16BodiesThatRequireUtf8Encoding() {
         assertNull(Http2ResponseWriter.asciiBytes("café"));
+        assertNull(Http2ResponseWriter.asciiBytes("\u00801234567"));
+        assertNull(Http2ResponseWriter.asciiBytes("1234567\u00ff"));
+        assertNull(Http2ResponseWriter.asciiBytes("12345678\u00a9"));
         assertNull(Http2ResponseWriter.asciiBytes("snowman \u2603"));
     }
 
