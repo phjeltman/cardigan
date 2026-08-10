@@ -24,11 +24,20 @@ public final class HpackFields {
     public static final int NAME_CONTENT_LENGTH = 28;
     public static final int NAME_TRANSFER_ENCODING = 57;
 
-    private final int[] nameOffsets;
-    private final int[] nameLengths;
-    private final int[] nameIndices;
-    private final int[] valueOffsets;
-    private final int[] valueLengths;
+    private static final int METADATA_STRIDE = 5;
+    private static final int NAME_REFERENCE = 0;
+    private static final int NAME_LENGTH = 1;
+    private static final int NAME_INDEX = 2;
+    private static final int VALUE_REFERENCE = 3;
+    private static final int VALUE_LENGTH = 4;
+
+    /**
+     * Field metadata is consumed together by both the decoder and request
+     * parser, so keep one field's five integers adjacent instead of touching
+     * five independently allocated array cache lines.
+     */
+    private final int[] metadata;
+    private final int maximumFields;
     private int count;
     private int headerListSize;
 
@@ -36,11 +45,11 @@ public final class HpackFields {
         if (maximumFields <= 0) {
             throw new IllegalArgumentException("maximumFields must be positive");
         }
-        this.nameOffsets = new int[maximumFields];
-        this.nameLengths = new int[maximumFields];
-        this.nameIndices = new int[maximumFields];
-        this.valueOffsets = new int[maximumFields];
-        this.valueLengths = new int[maximumFields];
+        if (maximumFields > Integer.MAX_VALUE / METADATA_STRIDE) {
+            throw new IllegalArgumentException("maximumFields is too large");
+        }
+        this.metadata = new int[maximumFields * METADATA_STRIDE];
+        this.maximumFields = maximumFields;
     }
 
     public void reset() {
@@ -58,13 +67,13 @@ public final class HpackFields {
 
     public int nameOffset(int index) {
         checkIndex(index);
-        int offset = nameOffsets[index];
+        int offset = metadata[metadataOffset(index) + NAME_REFERENCE];
         return offset >= 0 ? offset : -1;
     }
 
     public int nameLength(int index) {
         checkIndex(index);
-        return nameLengths[index];
+        return metadata[metadataOffset(index) + NAME_LENGTH];
     }
 
     /**
@@ -75,18 +84,18 @@ public final class HpackFields {
      */
     public int nameIndex(int index) {
         checkIndex(index);
-        return nameIndices[index];
+        return metadata[metadataOffset(index) + NAME_INDEX];
     }
 
     public int valueOffset(int index) {
         checkIndex(index);
-        int offset = valueOffsets[index];
+        int offset = metadata[metadataOffset(index) + VALUE_REFERENCE];
         return offset >= 0 ? offset : -1;
     }
 
     public int valueLength(int index) {
         checkIndex(index);
-        return valueLengths[index];
+        return metadata[metadataOffset(index) + VALUE_LENGTH];
     }
 
     boolean add(int nameOffset, int nameLength, int nameIndex,
@@ -131,42 +140,43 @@ public final class HpackFields {
                           int valueOffset, int valueLength,
                           int maximumHeaderListSize) {
         long fieldSize = (long) nameLength + valueLength + 32;
-        if (count == nameOffsets.length
+        if (count == maximumFields
             || fieldSize > maximumHeaderListSize - (long) headerListSize) {
             return false;
         }
-        nameOffsets[count] = nameOffset;
-        nameLengths[count] = nameLength;
-        nameIndices[count] = nameIndex;
-        valueOffsets[count] = valueOffset;
-        valueLengths[count] = valueLength;
+        int offset = metadataOffset(count);
+        metadata[offset + NAME_REFERENCE] = nameOffset;
+        metadata[offset + NAME_LENGTH] = nameLength;
+        metadata[offset + NAME_INDEX] = nameIndex;
+        metadata[offset + VALUE_REFERENCE] = valueOffset;
+        metadata[offset + VALUE_LENGTH] = valueLength;
         count++;
         headerListSize += (int) fieldSize;
         return true;
     }
 
     byte nameSource(int index) {
-        return source(nameOffsets[index]);
+        return source(metadata[metadataOffset(index) + NAME_REFERENCE]);
     }
 
     int nameReference(int index) {
-        return reference(nameOffsets[index]);
+        return reference(metadata[metadataOffset(index) + NAME_REFERENCE]);
     }
 
     byte valueSource(int index) {
-        return source(valueOffsets[index]);
+        return source(metadata[metadataOffset(index) + VALUE_REFERENCE]);
     }
 
     int valueReference(int index) {
-        return reference(valueOffsets[index]);
+        return reference(metadata[metadataOffset(index) + VALUE_REFERENCE]);
     }
 
     void materializeName(int index, int offset) {
-        nameOffsets[index] = offset;
+        metadata[metadataOffset(index) + NAME_REFERENCE] = offset;
     }
 
     void materializeValue(int index, int offset) {
-        valueOffsets[index] = offset;
+        metadata[metadataOffset(index) + VALUE_REFERENCE] = offset;
     }
 
     private static int encodeReference(byte source, int reference) {
@@ -188,6 +198,10 @@ public final class HpackFields {
 
     private static int reference(int encoded) {
         return encoded >= 0 ? encoded : encoded & REFERENCE_MASK;
+    }
+
+    private static int metadataOffset(int index) {
+        return index * METADATA_STRIDE;
     }
 
     private void checkIndex(int index) {

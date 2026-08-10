@@ -18,7 +18,6 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
     private static final VarHandle IN_FLIGHT;
     private static final VarHandle FREE_TASK_COUNT;
     private static final VarHandle TASK_ACTIVE;
-    private static final VarHandle TASK_ARRAY = MethodHandles.arrayElementVarHandle(ExchangeTask[].class);
 
     static {
         try {
@@ -201,8 +200,8 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
         int available = freeTaskCount();
         if (available != 0) {
             int index = available - 1;
-            ExchangeTask task = (ExchangeTask) TASK_ARRAY.getAcquire(freeTasks, index);
-            TASK_ARRAY.setRelease(freeTasks, index, null);
+            ExchangeTask task = freeTasks[index];
+            freeTasks[index] = null;
             setFreeTaskCount(index);
             return task;
         }
@@ -216,7 +215,7 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
 
     private void releaseTask(ExchangeTask task) {
         int available = freeTaskCount();
-        TASK_ARRAY.setRelease(freeTasks, available, task);
+        freeTasks[available] = task;
         setFreeTaskCount(available + 1);
     }
 

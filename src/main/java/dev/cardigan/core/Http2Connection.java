@@ -48,9 +48,6 @@ final class Http2Connection {
     private static final VarHandle TASK_CANCELLED;
     private static final VarHandle TASK_SEND_WAITER;
     private static final VarHandle TASK_RESPONSE_BODY;
-    private static final VarHandle TASK_ARRAY =
-        MethodHandles.arrayElementVarHandle(Http2Task[].class);
-
     static {
         try {
             MethodHandles.Lookup lookup = MethodHandles.lookup();
@@ -152,6 +149,9 @@ final class Http2Connection {
             }
 
             while (open) {
+                if (!ensureCurrentChunk()) {
+                    break;
+                }
                 MemorySegment header;
                 long headerOffset;
                 if (remaining() >= Http2Frames.HEADER_SIZE) {
@@ -1018,8 +1018,8 @@ final class Http2Connection {
         int available = freeTaskCount();
         if (available != 0) {
             int index = available - 1;
-            Http2Task task = (Http2Task) TASK_ARRAY.getAcquire(freeTasks, index);
-            TASK_ARRAY.setRelease(freeTasks, index, null);
+            Http2Task task = freeTasks[index];
+            freeTasks[index] = null;
             setFreeTaskCount(index);
             return task;
         }
@@ -1033,7 +1033,7 @@ final class Http2Connection {
 
     private void releaseTask(Http2Task task) {
         int available = freeTaskCount();
-        TASK_ARRAY.setRelease(freeTasks, available, task);
+        freeTasks[available] = task;
         setFreeTaskCount(available + 1);
     }
 

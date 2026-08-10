@@ -131,7 +131,8 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
             if (bufferId < 0) {
                 failed = true;
             } else {
-                InboundChunk chunk = new InboundChunk(loop, bufferId, result);
+                InboundChunk chunk =
+                    loop.leaseInboundChunk(bufferId, result);
                 if (closed || (!tryHandoff(chunk) && !offer(chunk))) {
                     chunk.close();
                     if (!closed) {
@@ -241,17 +242,27 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
 
     private boolean tryHandoff(InboundChunk chunk) {
         Thread waiter = receiveWaiter();
-        if (waiter == null
-            || !RECEIVE_WAITER.compareAndSet(this, waiter, null)) {
+        if (waiter == null) {
             return false;
         }
+        // The receive continuation and CQ callback are mounted serially on the
+        // owning io_uring carrier, and there is exactly one receiver waiter.
+        // An acquire read followed by a release clear therefore has no
+        // intervening writer and does not need a locked compare-and-set.
+        setReceiveWaiter(null);
         HANDOFF_CHUNK.setRelease(this, chunk);
         LockSupport.unpark(waiter);
         return true;
     }
 
     private InboundChunk takeHandoff() {
-        return (InboundChunk) HANDOFF_CHUNK.getAndSetAcquire(this, null);
+        InboundChunk chunk = handoffChunk();
+        if (chunk != null) {
+            // The same owner-carrier serialization makes this split consume
+            // safe; acquire still pairs with the CQ callback's release store.
+            HANDOFF_CHUNK.setRelease(this, null);
+        }
+        return chunk;
     }
 
     private InboundChunk handoffChunk() {
@@ -298,8 +309,10 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
 
     private void signalReceiveWaiter() {
         Thread waiter = receiveWaiter();
-        if (waiter != null
-            && RECEIVE_WAITER.compareAndSet(this, waiter, null)) {
+        if (waiter != null) {
+            // See tryHandoff(): no second consumer can clear or replace this
+            // single waiter while the owner callback is mounted.
+            setReceiveWaiter(null);
             LockSupport.unpark(waiter);
         }
     }

@@ -233,6 +233,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private final MemorySegment bufRingSegment;
     private final MemorySegment ringBuffers;
     private final MemorySegment[] ringBufferSegments;
+    /** One exclusive reusable wrapper per plaintext provided-buffer ID. */
+    private final InboundChunk[] inboundChunks;
     private final ArrayDeque<Runnable> inboundBufferWaiters = new ArrayDeque<>();
     private final int[] returnedInboundBufferIds;
     private int returnedInboundBufferCount;
@@ -332,10 +334,13 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
         this.ringBuffers = arena.allocate((long) this.numBuffers * BUFFER_SIZE);
         this.ringBufferSegments = new MemorySegment[this.numBuffers];
+        this.inboundChunks = new InboundChunk[this.numBuffers];
         this.returnedInboundBufferIds = new int[this.numBuffers];
         for (int i = 0; i < this.numBuffers; i++) {
             ringBufferSegments[i] = ringBuffers.asSlice(
                 (long) i * BUFFER_SIZE, BUFFER_SIZE);
+            inboundChunks[i] = new InboundChunk(
+                this, ringBufferSegments[i], i);
         }
 
         this.bufRingSegment = arena.allocate((long) this.numBuffers * 16, 4096);
@@ -880,17 +885,18 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             return;
         }
 
-        task.result = res;
-        task.flags = flags;
         CompletionHandler completionHandler = task.completionHandler;
-        Thread vt = (Thread) TASK_THREAD_HANDLE.getAcquire(task);
-
-        if (completionHandler != null && task.vectorSlot >= 0) {
-            handleAsyncVectorSendCompletion(
-                task, res, flags, completionHandler);
-        } else if (completionHandler != null && task.egressId >= 0) {
-            handleAsyncSendCompletion(task, res, flags, completionHandler);
-        } else if (completionHandler != null) {
+        if (completionHandler != null) {
+            if (task.vectorSlot >= 0) {
+                handleAsyncVectorSendCompletion(
+                    task, res, flags, completionHandler);
+                return;
+            }
+            if (task.egressId >= 0) {
+                handleAsyncSendCompletion(
+                    task, res, flags, completionHandler);
+                return;
+            }
             boolean terminal =
                 (flags & Opcodes.IORING_CQE_F_MORE) == 0;
             if (terminal) {
@@ -898,7 +904,16 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                 releaseTaskId(taskId);
             }
             completionHandler.onCompletion(res, flags, terminal);
-        } else if (vt != null
+            return;
+        }
+
+        // Only synchronous operations publish completion state through the
+        // task before waking their parked virtual thread. Async handlers take
+        // result and flags directly and never acquire task.thread.
+        task.result = res;
+        task.flags = flags;
+        Thread vt = (Thread) TASK_THREAD_HANDLE.getAcquire(task);
+        if (vt != null
                 && (flags & Opcodes.IORING_CQE_F_MORE) == 0) {
             TASK_THREAD_HANDLE.setRelease(task, null);
             LockSupport.unpark(vt);
@@ -1935,6 +1950,13 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         return ringBufferSegments[bufferId];
     }
 
+    InboundChunk leaseInboundChunk(int bufferId, int length) {
+        if (bufferId < 0 || bufferId >= numBuffers) {
+            throw new IllegalArgumentException("Invalid bufferId: " + bufferId);
+        }
+        return inboundChunks[bufferId].lease(length);
+    }
+
     MemorySegment getKtlsBufferSegment(int bufferId) {
         if (!ktlsReceiveBuffers || bufferId < 0 || bufferId >= numBuffers) {
             throw new IllegalArgumentException(
@@ -1971,17 +1993,33 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         return egressBufferSegments[bufferId];
     }
 
+    /**
+     * Returns a buffer obtained through the primitive
+     * {@link #recvSelectedBuffer(int, int, short)} API. Object leases obtained
+     * by the HTTP receive path must return through {@link InboundChunk#close()}.
+     */
     public void returnBuffer(int bufferId) {
         if (bufferId < 0 || bufferId >= numBuffers) {
             throw new IllegalArgumentException("Invalid bufferId: " + bufferId);
         }
         appendReturnedBuffer(bufferId);
+        publishReturnedBuffer();
+    }
+
+    private void publishReturnedBuffer() {
         SHORT_HANDLE.setRelease(bufRingSegment, 14L, pbufTail);
 
         Runnable waiter = inboundBufferWaiters.pollFirst();
         if (waiter != null) {
             waiter.run();
         }
+    }
+
+    void returnInboundChunk(InboundChunk chunk) {
+        int bufferId = validatePooledInboundChunk(chunk);
+        appendReturnedBuffer(bufferId);
+        chunk.markProvided();
+        publishReturnedBuffer();
     }
 
     private void appendReturnedBuffer(int bufferId) {
@@ -2033,9 +2071,18 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     }
 
     void releaseInboundChunk(InboundChunk chunk) {
-        if (inCarrierDomain()) {
-            int bufferId = chunk.bufferId();
-            if (chunk.bufferGroup() == KTLS_BUF_GROUP) {
+        boolean ownerLocal = inCarrierDomain();
+        short bufferGroup = chunk.bufferGroup();
+        int bufferId = chunk.bufferId();
+        if (bufferGroup == BUF_GROUP) {
+            validatePooledInboundChunk(chunk);
+        } else if (bufferGroup != KTLS_BUF_GROUP) {
+            throw new IllegalArgumentException(
+                "Unknown inbound buffer group: " + bufferGroup);
+        }
+        if (ownerLocal) {
+            chunk.beginOwnerReturn();
+            if (bufferGroup == KTLS_BUF_GROUP) {
                 if (returnedKtlsBufferCount == returnedKtlsBufferIds.length) {
                     flushReturnedBuffers();
                 }
@@ -2050,7 +2097,18 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             }
             return;
         }
+        chunk.beginExternalReturn();
         execute(chunk);
+    }
+
+    private int validatePooledInboundChunk(InboundChunk chunk) {
+        int bufferId = chunk.bufferId();
+        if (bufferId < 0 || bufferId >= inboundChunks.length
+                || inboundChunks[bufferId] != chunk) {
+            throw new IllegalArgumentException(
+                "Inbound chunk is not leased from this event loop");
+        }
+        return bufferId;
     }
 
     private void flushReturnedBuffers() {
@@ -2059,6 +2117,9 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             returnedInboundBufferCount = 0;
             for (int i = 0; i < inboundCount; i++) {
                 appendReturnedBuffer(returnedInboundBufferIds[i]);
+            }
+            for (int i = 0; i < inboundCount; i++) {
+                inboundChunks[returnedInboundBufferIds[i]].markProvided();
             }
             SHORT_HANDLE.setRelease(bufRingSegment, 14L, pbufTail);
             for (int i = 0; i < inboundCount; i++) {
@@ -2086,6 +2147,20 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                 waiter.run();
             }
         }
+    }
+
+    int inboundChunkPoolSize() {
+        return inboundChunks.length;
+    }
+
+    int outstandingInboundChunkCount() {
+        int outstanding = 0;
+        for (InboundChunk chunk : inboundChunks) {
+            if (!chunk.isProvided()) {
+                outstanding++;
+            }
+        }
+        return outstanding;
     }
 
     void whenInboundBufferAvailable(Runnable waiter) {

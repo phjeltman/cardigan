@@ -86,6 +86,40 @@ class Http2ControlFramesTest {
     }
 
     @Test
+    void acceptsFrameHeaderSplitAcrossReceiveChunks() {
+        assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
+            try (Socket socket = new Socket("127.0.0.1", PORT)) {
+                socket.setSoTimeout(2_000);
+                InputStream input = socket.getInputStream();
+                OutputStream output = socket.getOutputStream();
+
+                output.write(Http2Frames.CLIENT_PREFACE);
+                output.write(frame(
+                    Http2Frames.SETTINGS, 0, 0, new byte[0]));
+                output.flush();
+
+                assertEquals(Http2Frames.SETTINGS, readFrame(input).type);
+                Frame settingsAck = readFrame(input);
+                assertEquals(Http2Frames.SETTINGS, settingsAck.type);
+                assertEquals(Http2Frames.FLAG_ACK, settingsAck.flags);
+
+                byte[] opaque = {8, 7, 6, 5, 4, 3, 2, 1};
+                byte[] ping = frame(Http2Frames.PING, 0, 0, opaque);
+                output.write(ping, 0, 4);
+                output.flush();
+                Thread.sleep(10);
+                output.write(ping, 4, ping.length - 4);
+                output.flush();
+
+                Frame pingAck = readFrame(input);
+                assertEquals(Http2Frames.PING, pingAck.type);
+                assertEquals(Http2Frames.FLAG_ACK, pingAck.flags);
+                assertArrayEquals(opaque, pingAck.payload);
+            }
+        });
+    }
+
+    @Test
     void invalidFirstFrameProducesGoAway() {
         assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
             try (Socket socket = new Socket("127.0.0.1", PORT)) {
