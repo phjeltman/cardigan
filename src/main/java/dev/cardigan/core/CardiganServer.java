@@ -946,13 +946,46 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                              InboundChunk initialChunk,
                              int initialReadOffset,
                              ConnectionControl control) {
-        boolean keepAlive = true;
-        InboundChunk currentChunk = initialChunk;
-        MemorySegment currentBuf = initialChunk.segment();
-        int readOffset = initialReadOffset;
-        int requestOffset = 0;
-        HttpRequest request = new HttpRequest();
-        Http1ExchangeSequencer exchangeSequencer = null;
+        Http1Session session = new Http1Session(
+            loop,
+            writer,
+            inbound,
+            initialChunk,
+            initialReadOffset,
+            control
+        );
+        try {
+            while (drainHttp1Session(session)) {
+                InboundChunk next = inbound.nextChunk();
+                if (next == null) {
+                    break;
+                }
+                session.accept(next);
+            }
+        } finally {
+            session.close();
+        }
+    }
+
+    /**
+     * Drains the input already owned by {@code session}. The ordinary empty-body
+     * keep-alive path returns {@code true} before acquiring another receive
+     * chunk, allowing this large parse/route frame to unwind before the small
+     * driver parks. Fragment and body coalescing plus streaming request bodies
+     * retain the existing stackful pull path.
+     */
+    private boolean drainHttp1Session(Http1Session session) {
+        UringEventLoop loop = session.loop;
+        ConnectionWriter writer = session.writer;
+        InboundChunkStream inbound = session.inbound;
+        ConnectionControl control = session.control;
+        boolean keepAlive = session.keepAlive;
+        InboundChunk currentChunk = session.currentChunk;
+        MemorySegment currentBuf = session.currentBuf;
+        int readOffset = session.readOffset;
+        int requestOffset = session.requestOffset;
+        HttpRequest request = session.request;
+        Http1ExchangeSequencer exchangeSequencer = session.exchangeSequencer;
         try {
             while (keepAlive) {
                 if (control.draining) {
@@ -964,14 +997,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 }
 
                 if (currentChunk == null) {
-                    currentChunk = inbound.nextChunk();
-                    if (currentChunk == null) {
-                        currentBuf = null;
-                        break;
-                    }
-                    currentBuf = currentChunk.segment();
-                    readOffset = currentChunk.length();
-                    requestOffset = 0;
+                    return true;
                 }
 
                 request.init(currentBuf, requestOffset);
@@ -1301,13 +1327,70 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     break;
                 }
             }
+            return false;
         } finally {
+            session.keepAlive = keepAlive;
+            session.currentChunk = currentChunk;
+            session.currentBuf = currentBuf;
+            session.readOffset = readOffset;
+            session.requestOffset = requestOffset;
+            session.exchangeSequencer = exchangeSequencer;
+        }
+    }
+
+    /** Mutable HTTP/1 state which survives only natural input boundaries. */
+    private static final class Http1Session implements AutoCloseable {
+        private final UringEventLoop loop;
+        private final ConnectionWriter writer;
+        private final InboundChunkStream inbound;
+        private final ConnectionControl control;
+        private final HttpRequest request = new HttpRequest();
+
+        private boolean keepAlive = true;
+        private InboundChunk currentChunk;
+        private MemorySegment currentBuf;
+        private int readOffset;
+        private int requestOffset;
+        private Http1ExchangeSequencer exchangeSequencer;
+
+        private Http1Session(
+            UringEventLoop loop,
+            ConnectionWriter writer,
+            InboundChunkStream inbound,
+            InboundChunk initialChunk,
+            int initialReadOffset,
+            ConnectionControl control
+        ) {
+            this.loop = loop;
+            this.writer = writer;
+            this.inbound = inbound;
+            this.control = control;
+            this.currentChunk = initialChunk;
+            this.currentBuf = initialChunk.segment();
+            this.readOffset = initialReadOffset;
+        }
+
+        private void accept(InboundChunk chunk) {
+            if (currentChunk != null) {
+                throw new IllegalStateException(
+                    "Cannot replace an unconsumed HTTP/1 input chunk");
+            }
+            currentChunk = chunk;
+            currentBuf = chunk.segment();
+            readOffset = chunk.length();
+            requestOffset = 0;
+        }
+
+        @Override
+        public void close() {
             if (currentChunk != null) {
                 try {
                     currentChunk.close();
                 } catch (Throwable ignored) {
                     // The receiver is closing this connection anyway.
                 }
+                currentChunk = null;
+                currentBuf = null;
             }
             if (exchangeSequencer != null) {
                 exchangeSequencer.beginDrain();
