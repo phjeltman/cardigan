@@ -2669,16 +2669,25 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 return;
             }
             if (inputShutdown.compareAndSet(false, true)) {
+                TlsConnection connection = tls;
+                if (connection != null) {
+                    // A direct-kTLS receiver can dynamically fall back to
+                    // SSL_read, so synchronize OpenSSL before every SHUT_RD.
+                    try {
+                        connection.prepareInputShutdown();
+                    } catch (Throwable failure) {
+                        // Still wake the parser, but do not call SSL_shutdown
+                        // on native state whose receive side was not marked.
+                        connection.abortTransportShutdown();
+                    }
+                }
+                // Stop only reads. Admitted handlers may still write; the
+                // connection owner sends close_notify after output drains.
                 socketLifecycleLock.lock();
                 try {
-                    if (done) {
-                        return;
+                    if (!done) {
+                        shutdownSocket(SHUT_RD);
                     }
-                    TlsConnection connection = tls;
-                    if (connection != null) {
-                        connection.close();
-                    }
-                    shutdownSocket(SHUT_RD);
                 } finally {
                     socketLifecycleLock.unlock();
                 }
@@ -2691,6 +2700,10 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             }
             if (!forceStarted.compareAndSet(false, true)) {
                 return;
+            }
+            TlsConnection tlsConnection = tls;
+            if (tlsConnection != null) {
+                tlsConnection.abortTransportShutdown();
             }
             Object http1State = http1;
             if (http1State instanceof Http1ExchangeSequencer sequencer) {

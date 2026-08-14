@@ -4,6 +4,8 @@ package dev.cardigan.core;
 
 import dev.cardigan.core.Http2TestSupport.Frame;
 import dev.cardigan.http.IsolatedRouteStats;
+import dev.cardigan.http.Post;
+import dev.cardigan.http.Response;
 import dev.cardigan.http2.Http2Frames;
 import dev.cardigan.tls.TlsConfig;
 import org.junit.jupiter.api.AfterEach;
@@ -26,6 +28,8 @@ import java.nio.file.Path;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -218,14 +222,7 @@ class GracefulShutdownTest {
     @Test
     void drainsIdleTlsConnectionThroughCloseNotifyPath() {
         assertTimeoutPreemptively(Duration.ofSeconds(8), () -> {
-            Path certificate = Path.of(GracefulShutdownTest.class.getResource(
-                "/tls/localhost-cert.pem").toURI());
-            Path privateKey = Path.of(GracefulShutdownTest.class.getResource(
-                "/tls/localhost-key.pem").toURI());
-            CardiganServer server = TestServers.example(
-                8123, 1, new TlsConfig(certificate, privateKey));
-            server.start();
-            Thread.sleep(100);
+            CardiganServer server = startTlsServer(8123);
 
             SSLContext context = trustAllContext();
             try (SSLSocket socket = (SSLSocket) context.getSocketFactory()
@@ -238,6 +235,68 @@ class GracefulShutdownTest {
                 awaitConnectionCount(server, 1);
 
                 Thread closer = Thread.ofPlatform().start(server::close);
+                assertEquals(-1, socket.getInputStream().read());
+                closer.join(4_000);
+
+                assertFalse(closer.isAlive());
+                assertEquals(0, server.activeConnectionCount());
+                assertEquals(0, server.forcedConnectionCount());
+            } finally {
+                server.close();
+            }
+        });
+    }
+
+    @Test
+    void drainsAdmittedTlsExchangeBeforeCloseNotify() {
+        assertTimeoutPreemptively(Duration.ofSeconds(8), () -> {
+            CardiganServer server = startTlsServer(
+                8130, new TestController(350));
+
+            SSLContext context = trustAllContext();
+            try (SSLSocket socket = (SSLSocket) context.getSocketFactory()
+                    .createSocket("localhost", 8130)) {
+                socket.setSoTimeout(4_000);
+                socket.startHandshake();
+                sendHttp1Get(socket, "/sleepy", true);
+                awaitExchangeWorker(server);
+
+                Thread closer = Thread.ofPlatform().start(server::close);
+                String response = readHttp1Response(socket.getInputStream());
+                assertTrue(response.contains("HTTP/1.1 200 OK"));
+                assertTrue(response.contains("Slept like a baby"));
+                assertTrue(response.contains("Connection: close"));
+                assertEquals(-1, socket.getInputStream().read());
+                closer.join(4_000);
+
+                assertFalse(closer.isAlive());
+                assertEquals(0, server.activeConnectionCount());
+                assertEquals(0, server.forcedConnectionCount());
+            } finally {
+                server.close();
+            }
+        });
+    }
+
+    @Test
+    void drainsParkedDirectTlsHandlerBeforeCloseNotify() {
+        assertTimeoutPreemptively(Duration.ofSeconds(8), () -> {
+            ParkedPostController controller = new ParkedPostController();
+            CardiganServer server = startTlsServer(8131, controller);
+
+            SSLContext context = trustAllContext();
+            try (SSLSocket socket = (SSLSocket) context.getSocketFactory()
+                    .createSocket("localhost", 8131)) {
+                socket.setSoTimeout(4_000);
+                socket.startHandshake();
+                sendHttp1Post(socket, "/parked-post");
+                assertTrue(controller.started.await(2, TimeUnit.SECONDS));
+
+                Thread closer = Thread.ofPlatform().start(server::close);
+                String response = readHttp1Response(socket.getInputStream());
+                assertTrue(response.contains("HTTP/1.1 200 OK"));
+                assertTrue(response.contains("direct handler finished"));
+                assertTrue(response.contains("Connection: close"));
                 assertEquals(-1, socket.getInputStream().read());
                 closer.join(4_000);
 
@@ -291,11 +350,43 @@ class GracefulShutdownTest {
         return server;
     }
 
+    private static CardiganServer startTlsServer(int port) throws Exception {
+        return startTlsServer(port, new TestController());
+    }
+
+    private static CardiganServer startTlsServer(
+            int port, Object controller) throws Exception {
+        Path certificate = Path.of(GracefulShutdownTest.class.getResource(
+            "/tls/localhost-cert.pem").toURI());
+        Path privateKey = Path.of(GracefulShutdownTest.class.getResource(
+            "/tls/localhost-key.pem").toURI());
+        CardiganServer server = CardiganServer.builder()
+            .port(port)
+            .eventLoops(1)
+            .tls(new TlsConfig(certificate, privateKey))
+            .routes(controller)
+            .build();
+        server.start();
+        Thread.sleep(100);
+        return server;
+    }
+
     private static void sendHttp1Get(
             Socket socket, String path, boolean keepAlive) throws Exception {
         String request = "GET " + path + " HTTP/1.1\r\n"
             + "Host: localhost\r\nConnection: "
             + (keepAlive ? "keep-alive" : "close") + "\r\n\r\n";
+        socket.getOutputStream().write(
+            request.getBytes(StandardCharsets.US_ASCII));
+        socket.getOutputStream().flush();
+    }
+
+    private static void sendHttp1Post(Socket socket, String path)
+            throws Exception {
+        String request = "POST " + path + " HTTP/1.1\r\n"
+            + "Host: localhost\r\n"
+            + "Content-Length: 0\r\n"
+            + "Connection: keep-alive\r\n\r\n";
         socket.getOutputStream().write(
             request.getBytes(StandardCharsets.US_ASCII));
         socket.getOutputStream().flush();
@@ -396,6 +487,21 @@ class GracefulShutdownTest {
             Thread.sleep(2);
         }
         assertEquals(expected, IsolatedRouteStats.snapshot().active());
+    }
+
+    public static final class ParkedPostController {
+        private final CountDownLatch started = new CountDownLatch(1);
+
+        @Post("/parked-post")
+        public Response parkedPost() {
+            started.countDown();
+            try {
+                Thread.sleep(350);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            return Response.text("direct handler finished");
+        }
     }
 
     private static SSLContext trustAllContext() throws Exception {

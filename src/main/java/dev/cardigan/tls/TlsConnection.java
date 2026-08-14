@@ -33,6 +33,7 @@ public final class TlsConnection implements AutoCloseable {
     private boolean ktlsSend;
     private boolean ktlsRecv;
     private boolean gracefulShutdown = true;
+    private boolean inputShutdownPrepared;
     private volatile CountDownLatch directSendBarrier;
     private Runnable directSendWaiter;
 
@@ -110,6 +111,9 @@ public final class TlsConnection implements AutoCloseable {
             int result;
             try {
                 synchronized (sslLock) {
+                    if (inputShutdownPrepared) {
+                        return 0;
+                    }
                     result = requirePanama().read(
                         destination, (long) length);
                 }
@@ -319,6 +323,35 @@ public final class TlsConnection implements AutoCloseable {
         return requirePanama().errorMessage();
     }
 
+    /**
+     * Prepares OpenSSL for Cardigan deliberately stopping the transport read
+     * side. Marking receive shutdown before SHUT_RD lets the parser observe
+     * EOF without entering SSL_read's fatal unexpected-EOF path. Application
+     * writes remain valid until the connection owner sends close_notify and
+     * frees the native state.
+     */
+    public void prepareInputShutdown() {
+        synchronized (sslLock) {
+            PanamaTls.Connection current = panama;
+            if (current == null || inputShutdownPrepared) {
+                return;
+            }
+            if (current.markReceivedShutdown() != 1) {
+                throw new TlsException(
+                    "Failed to synchronize local TLS input shutdown");
+            }
+            inputShutdownPrepared = true;
+        }
+    }
+
+    /** Suppresses close_notify after a forced transport shutdown. */
+    public void abortTransportShutdown() {
+        synchronized (sslLock) {
+            gracefulShutdown = false;
+            inputShutdownPrepared = true;
+        }
+    }
+
     @Override
     public void close() {
         PanamaTls.Connection current = panama;
@@ -339,6 +372,9 @@ public final class TlsConnection implements AutoCloseable {
                     break;
                 }
                 synchronized (sslLock) {
+                    if (!gracefulShutdown) {
+                        break;
+                    }
                     result = current.shutdown();
                 }
             }
