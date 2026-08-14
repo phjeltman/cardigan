@@ -1690,6 +1690,15 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             int contentTypeCode = response.contentTypeCode();
             String contentType = response.contentType();
             Object body = response.body();
+            byte[] materializedBytes = null;
+            if (body instanceof byte[] bytes) {
+                materializedBytes = bytes;
+            } else if (body instanceof String text) {
+                materializedBytes = Http2ResponseWriter.asciiBytes(text);
+                if (materializedBytes == null) {
+                    materializedBytes = text.getBytes(StandardCharsets.UTF_8);
+                }
+            }
 
             int res = 0;
             int egressId = loop.acquireEgressBuffer();
@@ -1783,27 +1792,41 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                         res = writer.writeFully(
                             staticBody.segment(), bodyLen);
                     }
-                } else if (body instanceof String text) {
-                    byte[] utf8Bytes = Http2ResponseWriter.asciiBytes(text);
-                    if (utf8Bytes == null) {
-                        utf8Bytes = text.getBytes(StandardCharsets.UTF_8);
+                } else if (materializedBytes != null) {
+                    int bodyLen = materializedBytes.length;
+                    int headersLen = writeHeaders(
+                        respSeg, statusCode, contentTypeCode, contentType,
+                        bodyLen, keepAlive);
+                    int firstBodyLen = Math.min(
+                        bodyLen,
+                        Math.toIntExact(respSeg.byteSize()) - headersLen);
+                    if (firstBodyLen != 0) {
+                        RawSegment.copy(
+                            materializedBytes, 0,
+                            respSeg.address() + headersLen,
+                            firstBodyLen);
                     }
-                    int bodyLen = utf8Bytes.length;
-
-                    if (256 + bodyLen > respSeg.byteSize()) {
-                        if (fallbackArena == null) {
-                            fallbackArena = Arena.ofConfined();
-                        }
-                        respSeg = fallbackArena.allocate(256 + bodyLen);
-                    }
-                    int headersLen = writeHeaders(respSeg, statusCode, contentTypeCode, contentType, bodyLen, keepAlive);
-                    RawSegment.copy(utf8Bytes, 0, respSeg.address() + headersLen, bodyLen);
-                    if (hasPipelinedBytes && keepAlive && egressId >= 0 && fallbackArena == null) {
-                        boolean queued = writer.enqueue(egressId, headersLen + bodyLen);
+                    if (firstBodyLen == bodyLen
+                        && hasPipelinedBytes && keepAlive
+                        && egressId >= 0 && fallbackArena == null) {
+                        boolean queued = writer.enqueue(
+                            egressId, headersLen + bodyLen);
                         egressId = -1;
                         return queued;
                     }
-                    res = writer.writeFully(respSeg, headersLen + bodyLen);
+                    res = writer.writeFully(
+                        respSeg, headersLen + firstBodyLen);
+                    int bodyOffset = firstBodyLen;
+                    int capacity = Math.toIntExact(respSeg.byteSize());
+                    while (res > 0 && bodyOffset < bodyLen) {
+                        int length = Math.min(
+                            capacity, bodyLen - bodyOffset);
+                        RawSegment.copy(
+                            materializedBytes, bodyOffset,
+                            respSeg.address(), length);
+                        res = writer.writeFully(respSeg, length);
+                        bodyOffset += length;
+                    }
                 } else if (body instanceof Record recordBody) {
                     int bodyLen = 0;
                     try {
@@ -1867,6 +1890,9 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             int bodyLength;
             if (body == null) {
                 bodyLength = 0;
+            } else if (body instanceof byte[] bytes) {
+                byteBody = bytes;
+                bodyLength = bytes.length;
             } else if (body instanceof StreamingBody streaming) {
                 streamingBody = streaming;
                 bodyLength = streaming.length();
@@ -1892,7 +1918,21 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 || bodyLength == StreamingBody.UNKNOWN_LENGTH;
             int headerLength = writeMetadataHeaders(
                 buffer, response, bodyLength, keepAlive, chunked);
-            if (writer.writeFully(buffer, headerLength) <= 0) {
+            int byteBodyOffset = 0;
+            int firstLength = headerLength;
+            if (!chunked && byteBody != null) {
+                int available = Math.toIntExact(buffer.byteSize())
+                    - headerLength;
+                byteBodyOffset = Math.min(byteBody.length, available);
+                if (byteBodyOffset != 0) {
+                    RawSegment.copy(
+                        byteBody, 0,
+                        buffer.address() + headerLength,
+                        byteBodyOffset);
+                    firstLength += byteBodyOffset;
+                }
+            }
+            if (writer.writeFully(buffer, firstLength) <= 0) {
                 return false;
             }
 
@@ -1902,7 +1942,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     writer, buffer, streamingBody, chunked);
             } else if (byteBody != null) {
                 sent = sendMetadataByteBody(
-                    writer, buffer, byteBody, chunked);
+                    writer, buffer, byteBody, byteBodyOffset, chunked);
             } else if (segmentBody != null) {
                 sent = sendMetadataSegmentBody(
                     writer, buffer, segmentBody, bodyLength, chunked);
@@ -1975,8 +2015,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             ConnectionWriter writer,
             MemorySegment buffer,
             byte[] body,
+            int offset,
             boolean chunked) {
-        int offset = 0;
         int prefix = chunked ? 10 : 0;
         int suffix = chunked ? 2 : 0;
         int capacity = Math.toIntExact(buffer.byteSize()) - prefix - suffix;

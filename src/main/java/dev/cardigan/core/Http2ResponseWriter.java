@@ -91,6 +91,10 @@ final class Http2ResponseWriter {
             return sendStreamingFrames(
                 streamId, response, streamingBody, flowControl);
         }
+        if (body instanceof byte[] bytes) {
+            return sendByteFrames(
+                streamId, response, bytes, bytes.length, flowControl);
+        }
         if (body instanceof String text) {
             byte[] bytes = asciiBytes(text);
             if (bytes != null) {
@@ -129,6 +133,9 @@ final class Http2ResponseWriter {
             } else if (body instanceof StaticBody staticBody) {
                 bytes = staticBody.segment();
                 length = staticBody.length();
+            } else if (body instanceof byte[] encoded) {
+                bytes = MemorySegment.ofArray(encoded);
+                length = encoded.length;
             } else if (body instanceof String text) {
                 byte[] encoded = text.getBytes(StandardCharsets.UTF_8);
                 bytes = MemorySegment.ofArray(encoded);

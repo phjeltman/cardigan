@@ -2,11 +2,9 @@
 
 package dev.cardigan.httparena;
 
-import dev.cardigan.http.StreamingBody;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.lang.foreign.MemorySegment;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -37,7 +35,8 @@ class HttpArenaDatasetTest {
 
         HttpArenaDataset dataset = HttpArenaDataset.load(datasetFile);
         assertEquals(50, dataset.size());
-        String response = read(dataset.render(2, 3));
+        String response = new String(
+            dataset.render(2, 3), StandardCharsets.UTF_8);
 
         assertTrue(response.startsWith("{\"items\":[{"));
         assertTrue(response.contains("\"id\":1"));
@@ -47,16 +46,4 @@ class HttpArenaDatasetTest {
         assertTrue(response.endsWith("],\"count\":2}"));
     }
 
-    private static String read(StreamingBody body) {
-        byte[] output = new byte[body.length()];
-        MemorySegment destination = MemorySegment.ofArray(output);
-        int offset = 0;
-        while (offset < output.length) {
-            int count = body.read(destination.asSlice(offset));
-            assertTrue(count > 0);
-            offset += count;
-        }
-        assertEquals(output.length, offset);
-        return new String(output, StandardCharsets.UTF_8);
-    }
 }

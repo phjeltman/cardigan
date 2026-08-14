@@ -2,13 +2,11 @@
 
 package dev.cardigan.httparena;
 
-import dev.cardigan.http.StreamingBody;
 import dev.cardigan.serdes.Serdes;
 import dev.cardigan.simdjson.ondemand.Value;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -64,7 +62,7 @@ final class HttpArenaDataset {
         return new HttpArenaDataset(prefixes, totals);
     }
 
-    StreamingBody render(int requestedCount, long multiplier) {
+    byte[] render(int requestedCount, long multiplier) {
         int count = Math.max(0, Math.min(requestedCount, itemPrefixes.length));
         int length = PREFIX.length + COUNT.length + digits(count) + 1;
         for (int index = 0; index < count; index++) {
@@ -95,24 +93,7 @@ final class HttpArenaDataset {
             throw new IllegalStateException("Incorrect JSON response length");
         }
 
-        MemorySegment bytes = MemorySegment.ofArray(output);
-        return StreamingBody.of(output.length, new StreamingBody.Reader() {
-            private int position;
-
-            @Override
-            public int read(MemorySegment destination) {
-                if (position == output.length) {
-                    return -1;
-                }
-                int amount = Math.min(
-                    output.length - position,
-                    Math.toIntExact(destination.byteSize()));
-                MemorySegment.copy(
-                    bytes, position, destination, 0, amount);
-                position += amount;
-                return amount;
-            }
-        });
+        return output;
     }
 
     int size() {

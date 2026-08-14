@@ -74,6 +74,24 @@ class Http2StreamDispatchTest {
     }
 
     @Test
+    void writesMaterializedByteResponse() {
+        assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
+            try (Socket socket = connect()) {
+                InputStream input = socket.getInputStream();
+                sendGet(socket.getOutputStream(), 1, "/bytes");
+
+                byte[] response = readResponse(input, 1, Set.of());
+                assertEquals(5, response.length);
+                assertEquals(0, response[0]);
+                assertEquals(1, response[1]);
+                assertEquals(2, response[2]);
+                assertEquals((byte) 0xfe, response[3]);
+                assertEquals((byte) 0xff, response[4]);
+            }
+        });
+    }
+
+    @Test
     void laterStreamCompletesWhileEarlierStreamSleeps() {
         assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
             try (Socket socket = connect()) {

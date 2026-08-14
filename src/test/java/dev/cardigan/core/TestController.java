@@ -44,6 +44,13 @@ final class TestController {
         return Response.text(LARGE_PAYLOAD);
     }
 
+    @Get("/bytes")
+    public Response getBytes() {
+        return Response.bytes(
+            "application/octet-stream",
+            new byte[] {0, 1, 2, (byte) 0xfe, (byte) 0xff});
+    }
+
     @Get("/stream/{bytes}")
     public Response streamBytes(long bytes) {
         if (bytes < 0 || bytes > 16 * 1024 * 1024L) {

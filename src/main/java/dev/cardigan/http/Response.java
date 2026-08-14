@@ -172,6 +172,15 @@ public final class Response {
         return new Response(200, "text/plain", CT_TEXT, body);
     }
 
+    /**
+     * Responds with bytes that are already encoded for the supplied content
+     * type. The array must not be modified after the response is returned.
+     */
+    public static Response bytes(String contentType, byte[] body) {
+        Objects.requireNonNull(body, "body");
+        return new Response(200, contentType, body);
+    }
+
     public static Response stream(String contentType, StreamingBody body) {
         return new Response(200, contentType, body);
     }
