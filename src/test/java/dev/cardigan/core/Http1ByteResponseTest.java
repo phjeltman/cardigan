@@ -3,12 +3,15 @@
 package dev.cardigan.core;
 
 import dev.cardigan.http.Get;
+import dev.cardigan.http.EncodedBody;
 import dev.cardigan.http.Response;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
@@ -55,7 +58,10 @@ class Http1ByteResponseTest {
             socket.getOutputStream().write((
                 "GET /small HTTP/1.1\r\nHost: localhost\r\n\r\n"
                     + "GET /large HTTP/1.1\r\nHost: localhost\r\n\r\n"
-                    + "GET /metadata HTTP/1.1\r\nHost: localhost\r\n"
+                    + "GET /metadata HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                    + "GET /encoded-small HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                    + "GET /encoded-large HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                    + "GET /encoded-metadata HTTP/1.1\r\nHost: localhost\r\n"
                     + "Connection: close\r\n\r\n")
                 .getBytes(StandardCharsets.US_ASCII));
             socket.getOutputStream().flush();
@@ -63,6 +69,9 @@ class Http1ByteResponseTest {
         }
 
         int offset = assertResponseAt(response, 0, SMALL, false);
+        offset = assertResponseAt(response, offset, LARGE, false);
+        offset = assertResponseAt(response, offset, SMALL, true);
+        offset = assertResponseAt(response, offset, SMALL, false);
         offset = assertResponseAt(response, offset, LARGE, false);
         offset = assertResponseAt(response, offset, SMALL, true);
         assertEquals(response.length, offset);
@@ -134,6 +143,34 @@ class Http1ByteResponseTest {
         public Response metadata() {
             return Response.bytes("application/octet-stream", SMALL)
                 .withHeader("x-byte-test", "present");
+        }
+
+        @Get("/encoded-small")
+        public Response encodedSmall() {
+            return Response.encoded(
+                "application/octet-stream", encode(SMALL));
+        }
+
+        @Get("/encoded-large")
+        public Response encodedLarge() {
+            return Response.encoded(
+                "application/octet-stream", encode(LARGE));
+        }
+
+        @Get("/encoded-metadata")
+        public Response encodedMetadata() {
+            return Response.encoded(
+                    "application/octet-stream", encode(SMALL))
+                .withHeader("x-byte-test", "present");
+        }
+
+        private static EncodedBody encode(byte[] bytes) {
+            return EncodedBody.of(bytes.length, destination -> {
+                MemorySegment.copy(
+                    bytes, 0,
+                    destination, ValueLayout.JAVA_BYTE, 0, bytes.length);
+                return bytes.length;
+            });
         }
     }
 }

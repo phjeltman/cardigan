@@ -16,6 +16,7 @@ import dev.cardigan.pico.Header;
 import dev.cardigan.http.Router;
 import dev.cardigan.http.Response;
 import dev.cardigan.http.ResponseHeaders;
+import dev.cardigan.http.EncodedBody;
 import dev.cardigan.http.StaticBody;
 import dev.cardigan.http.StreamingBody;
 import dev.cardigan.http.PreparedInvocation;
@@ -1721,6 +1722,41 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                         return queued;
                     }
                     res = writer.writeFully(respSeg, headersLen);
+                } else if (body instanceof EncodedBody encodedBody) {
+                    int bodyLen = encodedBody.length();
+                    int headersLen = writeHeaders(
+                        respSeg,
+                        statusCode,
+                        contentTypeCode,
+                        contentType,
+                        bodyLen,
+                        keepAlive
+                    );
+                    int totalLength = Math.addExact(headersLen, bodyLen);
+                    if (totalLength <= respSeg.byteSize()) {
+                        encodedBody.write(
+                            respSeg.asSlice(headersLen, bodyLen));
+                        if (hasPipelinedBytes && keepAlive
+                            && egressId >= 0 && fallbackArena == null) {
+                            boolean queued = writer.enqueue(
+                                egressId, totalLength);
+                            egressId = -1;
+                            return queued;
+                        }
+                        res = writer.writeFully(respSeg, totalLength);
+                    } else {
+                        if (fallbackArena == null) {
+                            fallbackArena = Arena.ofConfined();
+                        }
+                        MemorySegment encodedResponse =
+                            fallbackArena.allocate(totalLength);
+                        MemorySegment.copy(
+                            respSeg, 0, encodedResponse, 0, headersLen);
+                        encodedBody.write(
+                            encodedResponse.asSlice(headersLen, bodyLen));
+                        res = writer.writeFully(
+                            encodedResponse, totalLength);
+                    }
                 } else if (body instanceof StreamingBody streamingBody) {
                     int bodyLen = streamingBody.length();
                     try {
@@ -1902,6 +1938,12 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             } else if (body instanceof String text) {
                 byteBody = text.getBytes(StandardCharsets.UTF_8);
                 bodyLength = byteBody.length;
+            } else if (body instanceof EncodedBody encodedBody) {
+                bodyLength = encodedBody.length();
+                bodyArena = Arena.ofConfined();
+                segmentBody = bodyArena.allocate(
+                    Math.max(1, bodyLength)).asSlice(0, bodyLength);
+                encodedBody.write(segmentBody);
             } else if (body instanceof Record recordBody) {
                 bodyArena = Arena.ofConfined();
                 segmentBody = bodyArena.allocate(2 * 1024 * 1024);

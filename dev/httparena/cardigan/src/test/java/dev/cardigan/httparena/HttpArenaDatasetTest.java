@@ -5,6 +5,9 @@ package dev.cardigan.httparena;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -35,8 +38,15 @@ class HttpArenaDatasetTest {
 
         HttpArenaDataset dataset = HttpArenaDataset.load(datasetFile);
         assertEquals(50, dataset.size());
-        String response = new String(
-            dataset.render(2, 3), StandardCharsets.UTF_8);
+        String response;
+        try (Arena arena = Arena.ofConfined()) {
+            var body = dataset.render(2, 3);
+            MemorySegment output = arena.allocate(body.length());
+            body.write(output);
+            response = new String(
+                output.toArray(ValueLayout.JAVA_BYTE),
+                StandardCharsets.UTF_8);
+        }
 
         assertTrue(response.startsWith("{\"items\":[{"));
         assertTrue(response.contains("\"id\":1"));

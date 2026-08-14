@@ -181,6 +181,11 @@ public final class Response {
         return new Response(200, contentType, body);
     }
 
+    public static Response encoded(String contentType, EncodedBody body) {
+        return new Response(
+            200, contentType, Objects.requireNonNull(body, "body"));
+    }
+
     public static Response stream(String contentType, StreamingBody body) {
         return new Response(200, contentType, body);
     }

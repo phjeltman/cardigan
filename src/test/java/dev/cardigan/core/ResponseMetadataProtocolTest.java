@@ -3,6 +3,7 @@
 package dev.cardigan.core;
 
 import dev.cardigan.core.Http2TestSupport.Frame;
+import dev.cardigan.http.EncodedBody;
 import dev.cardigan.http.Get;
 import dev.cardigan.http.Response;
 import dev.cardigan.http.StreamingBody;
@@ -100,6 +101,52 @@ class ResponseMetadataProtocolTest {
                 "hello", new String(data.payload, StandardCharsets.UTF_8));
             assertEquals(Http2Frames.HEADERS, trailers.type);
             assertTrue((trailers.flags & Http2Frames.FLAG_END_HEADERS) != 0);
+            assertTrue((trailers.flags & Http2Frames.FLAG_END_STREAM) != 0);
+            assertField(trailers.payload, "grpc-status", "0");
+        }
+    }
+
+    @Test
+    void writesEncodedBodyThroughHttp2() throws Exception {
+        try (Socket socket = connectHttp2()) {
+            OutputStream output = socket.getOutputStream();
+            output.write(frame(
+                Http2Frames.HEADERS,
+                Http2Frames.FLAG_END_HEADERS | Http2Frames.FLAG_END_STREAM,
+                1,
+                getBlock("/encoded")));
+            output.flush();
+
+            Frame headers = readFrame(socket.getInputStream());
+            Frame data = readFrame(socket.getInputStream());
+            assertEquals(Http2Frames.HEADERS, headers.type);
+            assertEquals(Http2Frames.DATA, data.type);
+            assertEquals(
+                "encoded-body",
+                new String(data.payload, StandardCharsets.UTF_8));
+            assertTrue((data.flags & Http2Frames.FLAG_END_STREAM) != 0);
+        }
+    }
+
+    @Test
+    void writesEncodedBodyWithHttp2Metadata() throws Exception {
+        try (Socket socket = connectHttp2()) {
+            OutputStream output = socket.getOutputStream();
+            output.write(frame(
+                Http2Frames.HEADERS,
+                Http2Frames.FLAG_END_HEADERS | Http2Frames.FLAG_END_STREAM,
+                1,
+                getBlock("/encoded-metadata")));
+            output.flush();
+
+            Frame headers = readFrame(socket.getInputStream());
+            Frame data = readFrame(socket.getInputStream());
+            Frame trailers = readFrame(socket.getInputStream());
+            assertField(headers.payload, "x-encoded", "yes");
+            assertEquals(
+                "encoded-body",
+                new String(data.payload, StandardCharsets.UTF_8));
+            assertEquals(0, data.flags & Http2Frames.FLAG_END_STREAM);
             assertTrue((trailers.flags & Http2Frames.FLAG_END_STREAM) != 0);
             assertField(trailers.payload, "grpc-status", "0");
         }
@@ -295,6 +342,30 @@ class ResponseMetadataProtocolTest {
                     }))
                 .withHeader("x-stream", "known")
                 .withTrailer("grpc-status", "0");
+        }
+
+        @Get("/encoded")
+        public Response encoded() {
+            return Response.encoded(
+                "application/octet-stream", encodedBody());
+        }
+
+        @Get("/encoded-metadata")
+        public Response encodedMetadata() {
+            return Response.encoded(
+                    "application/octet-stream", encodedBody())
+                .withHeader("x-encoded", "yes")
+                .withTrailer("grpc-status", "0");
+        }
+
+        private static EncodedBody encodedBody() {
+            byte[] bytes = "encoded-body".getBytes(StandardCharsets.UTF_8);
+            return EncodedBody.of(bytes.length, destination -> {
+                MemorySegment.copy(
+                    bytes, 0,
+                    destination, ValueLayout.JAVA_BYTE, 0, bytes.length);
+                return bytes.length;
+            });
         }
     }
 }

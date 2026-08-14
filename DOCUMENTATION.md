@@ -89,6 +89,12 @@ Responses use `StreamingBody.of(length, producer)` when the size is known and
 honour the declared length, must not return zero, and must release promptly when
 closed. Cardigan supplies framing, backpressure, flow control, and cancellation.
 
+`EncodedBody.of(length, encoder)` is the fixed-length alternative for a
+serializer that can write the complete response directly into transport-owned
+native memory. The encoder is invoked once, must return exactly the declared
+length, and must not retain the supplied segment. A reused body is invoked once
+per response emission.
+
 The handler returns its `Response` after consuming the request. Cardigan does
 not currently expose simultaneous request and response streaming on one
 exchange, bidirectional gRPC handlers, or interactive tunnelling. Other HTTP/2
