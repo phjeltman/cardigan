@@ -282,10 +282,16 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
 
     private void discardCompletedResponses() {
         for (int i = 0; i < completedResponses.length; i++) {
-            if (completedResponses[i] != null) {
-                closeResponseBody(completedResponses[i]);
+            Response response = completedResponses[i];
+            if (response != null) {
+                // Detach ownership before application cleanup. A throwing
+                // close action must not retain the slot or strand accounting.
                 completedResponses[i] = null;
-                setInFlight(inFlight() - 1);
+                try {
+                    closeResponseBody(response);
+                } finally {
+                    setInFlight(inFlight() - 1);
+                }
             }
         }
     }
@@ -293,7 +299,11 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
     private static void closeResponseBody(Response response) {
         if (response != null
             && response.body() instanceof StreamingBody streamingBody) {
-            streamingBody.close();
+            try {
+                streamingBody.close();
+            } catch (Throwable ignored) {
+                // Transport retirement cannot depend on application cleanup.
+            }
         }
     }
 
