@@ -138,6 +138,7 @@ they are not dynamically reloadable. Defaults remain experimental.
 | `cardigan.http2.max.header.list.size` | 16 KiB | Decoded header-list limit |
 | `cardigan.http2.max.streaming.bodies.per.connection` | 16 | Streaming request bodies per connection |
 | `cardigan.http2.max.streaming.buffer.bytes` | 256 MiB | Process-wide streaming-buffer budget |
+| `cardigan.ingress.buffers.per.loop` | 128 | 16 KiB provided receive buffers per event loop; power of two |
 | `cardigan.egress.buffers.max` | max(4096, 256 x event loops) | Process-wide lazily allocated egress-buffer limit |
 | `cardigan.egress.pool.stats` | `false` | Report shared egress-pool occupancy and batch counters |
 | `cardigan.fixed.files.mode` | `auto` | `auto`, `legacy`, `async-explicit`, `async-alloc`, or `direct`; auto uses direct plaintext accept and async allocation for TLS |
@@ -213,10 +214,13 @@ holds the fixed-file and task-pool capacities explicit for an HTTP/2 run:
 The pinned task count, 16,896, is `2 * 8192 + 512`: the runtime-derived default
 for this fixed-file capacity and the launcher's 512-entry rings. Compare
 revisions on an otherwise quiet host with the same JDK and disjoint
-server/client CPU placement. The launcher pins server loops but not the client,
-so arrange client affinity externally. Scheduler and fixed-file counters are
-cumulative over server startup, warm-up, measurement, and shutdown; use them to
-explain a run, not as measurement-window rates.
+server/client CPU placement. The launcher first gives the load generator every
+hardware thread on physical cores without event loops. If that is fewer CPUs
+than `--threads`, it adds unused SMT siblings from server cores, but never the
+event-loop CPUs themselves. Use `--no-client-affinity` only when intentionally
+allowing it onto those CPUs as well. Scheduler and fixed-file counters are
+cumulative over server startup, warm-up, measurement, and shutdown; use them
+to explain a run, not as measurement-window rates.
 
 To study fixed-file lifecycle separately, vary one fixed-file mode at a time
 and use a connection-churn workload rather than a persistent cohort. Use

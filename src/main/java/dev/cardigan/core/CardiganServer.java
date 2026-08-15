@@ -368,12 +368,14 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 + ", fixed-files=" + effectiveFixedFilesMode() + "...");
 
         try {
+            int ingressBuffersPerLoop =
+                configuredIngressBuffersPerLoop();
             for (int i = 0; i < cores; i++) {
                 int cpuId = eventLoopCpus[i];
                 eventLoops.add(new UringEventLoop(
                     cpuId,
                     512,
-                    512,
+                    ingressBuffersPerLoop,
                     directKtlsReceiveConfigured,
                     egressBufferPool));
             }
@@ -416,6 +418,18 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             throw new IllegalStateException(
                 "Cardigan startup failed", failure);
         }
+    }
+
+    static int configuredIngressBuffersPerLoop() {
+        int configured = Integer.getInteger(
+            "cardigan.ingress.buffers.per.loop", 128);
+        if (configured <= 0 || configured > 32_768
+                || Integer.bitCount(configured) != 1) {
+            throw new IllegalArgumentException(
+                "cardigan.ingress.buffers.per.loop must be a power of two "
+                    + "between 1 and 32768");
+        }
+        return configured;
     }
 
     private String effectiveFixedFilesMode() {

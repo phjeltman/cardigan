@@ -47,6 +47,10 @@ DURATION="60s"
 WARMUP_DURATION="5s"
 WRK_THREADS=4
 CONNECTIONS=200
+CLIENT_AFFINITY=true
+SERVER_CPU_LIST=""
+CLIENT_CPU_LIST=""
+CLIENT_USES_SERVER_SMT=false
 PAYLOAD_SIZE=65536
 SLEEP_MILLIS=2000
 HEAVY_ITERATIONS=5000000
@@ -104,6 +108,8 @@ Options:
   --threads=N                Client worker thread count (default: 4)
   --connections=N            Client connection count (default: 200)
   --cpus=N                   Server event-loop count
+  --no-client-affinity       Allow the load generator on server event-loop CPUs
+                             (default: prefer client-only physical cores)
   --isolated-carriers=N      Carrier count for Cardigan @Isolated routes
                              (default: same as --cpus)
   --isolated-cpus=LIST       CPU list for @Isolated carriers, e.g. 2 or 2-3
@@ -482,6 +488,10 @@ while [ "$#" -gt 0 ]; do
             CONNECTIONS="$2"
             shift 2
             ;;
+        --no-client-affinity)
+            CLIENT_AFFINITY=false
+            shift
+            ;;
         --payload-size=*)
             PAYLOAD_SIZE="${1#*=}"
             shift
@@ -703,6 +713,165 @@ if [ "$CHUNKED_UPLOAD" = true ] &&
    [ "$ENDPOINT_CHOICE" != "8" ]; then
     echo "--chunked-upload requires endpoint 6 or 8" >&2
     exit 2
+fi
+
+expand_cpu_list() {
+    local cpu_list="$1"
+    local range
+    local first
+    local last
+    local cpu
+    local -a ranges
+    EXPANDED_CPUS=()
+
+    IFS=',' read -r -a ranges <<< "$cpu_list"
+    for range in "${ranges[@]}"; do
+        if [[ "$range" == *-* ]]; then
+            first="${range%-*}"
+            last="${range#*-}"
+            for ((cpu = first; cpu <= last; cpu++)); do
+                EXPANDED_CPUS+=("$cpu")
+            done
+        else
+            EXPANDED_CPUS+=("$range")
+        fi
+    done
+}
+
+cpu_core_key() {
+    local cpu="$1"
+    local topology="/sys/devices/system/cpu/cpu$cpu/topology"
+    local package_id
+    local core_id
+
+    if [ -r "$topology/physical_package_id" ] &&
+       [ -r "$topology/core_id" ]; then
+        IFS= read -r package_id < "$topology/physical_package_id"
+        IFS= read -r core_id < "$topology/core_id"
+        printf '%s:%s' "$package_id" "$core_id"
+    else
+        # Match ThreadAffinity's fallback: missing topology makes this logical
+        # CPU a core of its own.
+        printf 'cpu:%s' "$cpu"
+    fi
+}
+
+join_cpu_list() {
+    local IFS=,
+    printf '%s' "$*"
+}
+
+configure_benchmark_affinity() {
+    local allowed_list
+    local cpu
+    local core
+    local selected=0
+    local -a allowed_cpus
+    local -a server_cpus=()
+    local -a client_cpus=()
+    local -A selected_cpus=()
+    local -A server_cores=()
+    local -A selected_client_cpus=()
+
+    allowed_list=$(awk '/^Cpus_allowed_list:/ { print $2 }' /proc/self/status)
+    if [ -z "$allowed_list" ]; then
+        echo "Unable to read the benchmark process CPU allowance" >&2
+        exit 2
+    fi
+
+    expand_cpu_list "$allowed_list"
+    allowed_cpus=("${EXPANDED_CPUS[@]}")
+    if [ "$CPUS" -gt "${#allowed_cpus[@]}" ]; then
+        echo "Requested $CPUS server CPUs, but this process may use only ${#allowed_cpus[@]}" >&2
+        exit 2
+    fi
+
+    # Mirror ThreadAffinity.processCpus(int): take one hardware thread from
+    # each physical core before selecting any SMT sibling.
+    for cpu in "${allowed_cpus[@]}"; do
+        core=$(cpu_core_key "$cpu")
+        if [ -z "${server_cores[$core]+present}" ]; then
+            server_cpus+=("$cpu")
+            selected_cpus[$cpu]=1
+            server_cores[$core]=1
+            selected=$((selected + 1))
+            if [ "$selected" -eq "$CPUS" ]; then
+                break
+            fi
+        fi
+    done
+    if [ "$selected" -lt "$CPUS" ]; then
+        for cpu in "${allowed_cpus[@]}"; do
+            if [ -z "${selected_cpus[$cpu]+present}" ]; then
+                server_cpus+=("$cpu")
+                selected_cpus[$cpu]=1
+                server_cores[$(cpu_core_key "$cpu")]=1
+                selected=$((selected + 1))
+                if [ "$selected" -eq "$CPUS" ]; then
+                    break
+                fi
+            fi
+        done
+    fi
+    SERVER_CPU_LIST=$(join_cpu_list "${server_cpus[@]}")
+
+    if [ "$CLIENT_AFFINITY" = false ]; then
+        return
+    fi
+    if ! command -v taskset >/dev/null 2>&1; then
+        echo "Default client isolation requires taskset (util-linux)" >&2
+        echo "Install it or pass --no-client-affinity" >&2
+        exit 2
+    fi
+
+    # Keep the load generator on physical cores without event loops whenever
+    # those cores can host all client workers. Include every SMT sibling on
+    # such cores: they are client capacity, not wasted server capacity.
+    for cpu in "${allowed_cpus[@]}"; do
+        core=$(cpu_core_key "$cpu")
+        if [ -z "${server_cores[$core]+present}" ]; then
+            selected_client_cpus[$cpu]=1
+        fi
+    done
+    if [ "${#selected_client_cpus[@]}" -lt "$WRK_THREADS" ]; then
+        # A server using most physical cores may leave too few client-only
+        # hardware threads. Add unused SMT siblings until each requested
+        # client worker can have a logical CPU, without admitting the actual
+        # event-loop CPUs.
+        for cpu in "${allowed_cpus[@]}"; do
+            if [ -z "${selected_cpus[$cpu]+present}" ] &&
+               [ -z "${selected_client_cpus[$cpu]+present}" ]; then
+                selected_client_cpus[$cpu]=1
+                CLIENT_USES_SERVER_SMT=true
+                if [ "${#selected_client_cpus[@]}" -ge "$WRK_THREADS" ]; then
+                    break
+                fi
+            fi
+        done
+    fi
+    for cpu in "${allowed_cpus[@]}"; do
+        if [ -n "${selected_client_cpus[$cpu]+present}" ]; then
+            client_cpus+=("$cpu")
+        fi
+    done
+    if [ "${#client_cpus[@]}" -eq 0 ]; then
+        echo "--cpus=$CPUS occupies every logical CPU available to this process" >&2
+        echo "Reduce --cpus or pass --no-client-affinity to share event-loop CPUs" >&2
+        exit 2
+    fi
+    CLIENT_CPU_LIST=$(join_cpu_list "${client_cpus[@]}")
+}
+
+run_load_client() {
+    if [ "$CLIENT_AFFINITY" = true ]; then
+        taskset --cpu-list "$CLIENT_CPU_LIST" "$@"
+    else
+        "$@"
+    fi
+}
+
+if [ "$MICRO_ONLY" = false ]; then
+    configure_benchmark_affinity
 fi
 
 CARDIGAN_PID=""
@@ -1062,7 +1231,7 @@ run_wrk() {
     if [ -s "$script_path" ]; then
         args=(-s "$script_path" "${args[@]}")
     fi
-    wrk "${args[@]}" "$url"
+    run_load_client wrk "${args[@]}" "$url"
 }
 
 run_h2load() {
@@ -1092,7 +1261,7 @@ run_h2load() {
     elif [ "$endpoint" = "6" ] || [ "$endpoint" = "8" ]; then
         args+=(-d "$STREAM_BODY_FILE")
     fi
-    h2load "${args[@]}" "$url"
+    run_load_client h2load "${args[@]}" "$url"
 }
 
 print_runtime_configuration() {
@@ -1113,6 +1282,16 @@ print_runtime_configuration() {
     fi
     echo "Scheduler: topological causal epochs, stats=$SCHEDULER_STATS"
     echo "Egress pool stats: $EGRESS_POOL_STATS"
+    echo "Server event-loop CPUs: $SERVER_CPU_LIST"
+    if [ "$CLIENT_AFFINITY" = true ]; then
+        if [ "$CLIENT_USES_SERVER_SMT" = true ]; then
+            echo "Load-generator CPUs: $CLIENT_CPU_LIST (includes unused server-core SMT siblings)"
+        else
+            echo "Load-generator CPUs: $CLIENT_CPU_LIST (client-only physical cores)"
+        fi
+    else
+        echo "Load-generator CPUs: unrestricted (--no-client-affinity)"
+    fi
 }
 
 run_http2_flow_control() {
@@ -1130,7 +1309,7 @@ run_http2_flow_control() {
     echo "Cycles: $FLOW_CYCLES"
     print_runtime_configuration
 
-    java \
+    run_load_client java \
         --enable-preview \
         -cp "target/classes:dev/benchmarks/target/classes" \
         dev.cardigan.benchmark.Http2FlowControlProbe \

@@ -29,7 +29,9 @@ class InboundChunkPoolIntegrationTest {
                 server.start();
                 Thread.sleep(100);
                 UringEventLoop loop = eventLoop(server);
-                assertEquals(512, loop.inboundChunkPoolSize());
+                assertEquals(
+                    CardiganServer.configuredIngressBuffersPerLoop(),
+                    loop.inboundChunkPoolSize());
 
                 try (Socket socket = new Socket("127.0.0.1", PORT)) {
                     socket.setSoTimeout(2_000);
@@ -57,7 +59,9 @@ class InboundChunkPoolIntegrationTest {
                     Thread.sleep(10);
                 }
                 assertEquals(0, loop.outstandingInboundChunkCount());
-                assertEquals(512, loop.inboundChunkPoolSize());
+                assertEquals(
+                    CardiganServer.configuredIngressBuffersPerLoop(),
+                    loop.inboundChunkPoolSize());
             } finally {
                 server.close();
             }
