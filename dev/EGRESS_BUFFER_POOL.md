@@ -1,6 +1,6 @@
 # Shared egress buffer pool design
 
-Status: design for future implementation.
+Status: implemented.
 
 ## Objective
 
@@ -13,14 +13,23 @@ owner-local, allocation-free, and compatible with
 
 A server owns one lazily grown `EgressBufferPool`. Each event loop owns a small
 LIFO magazine of integer buffer IDs. Acquiring and releasing a buffer normally
-touches only that magazine. An empty magazine refills a batch from the shared
-pool; a magazine above its high-water mark spills a batch back.
+touches only that magazine and an owner-local publication epoch. An empty
+magazine refills 32 IDs from the shared pool; a full 64-ID magazine spills 32
+IDs back.
+
+The carrier serializes physical execution, but successive virtual threads are
+still distinct Java threads. Short non-parking mutation sections therefore use
+a release/acquire epoch to publish magazine state between them. A shared-pool
+operation is never performed inside such a section, so waiting for another
+loop cannot strand the carrier behind a local lock.
 
 The shared pool allocates native memory from a server-owned shared arena in
-fixed-size chunks and creates each `MemorySegment` view once. Chunks remain
-alive until server shutdown. Growth is bounded by a process-wide maximum and
-retained at the observed high-water mark; runtime shrinking is deliberately
-excluded from the first implementation.
+256-buffer chunks (about 4 MiB) and creates each `MemorySegment` view once.
+Chunks remain alive until server shutdown. Growth is bounded by a process-wide
+maximum and retained at the observed high-water mark; runtime shrinking is
+deliberately excluded. The default maximum is the larger of 4,096 buffers and
+256 buffers per event loop, and may be bounded explicitly with
+`cardigan.egress.buffers.max`.
 
 The shared free-ID structure may use an ordinary lock. It is reached per batch,
 not per response, so a simple critical section is preferable to a complicated
@@ -39,10 +48,10 @@ memory does not share submission or completion work.
 
 ## Locality and pressure
 
-The initial magazine is intentionally small. A new chunk should be allocated by
-the already-pinned event-loop thread requesting growth so Linux first-touch
-placement follows the consumer. Batch sizes and magazine watermarks are
-structural defaults, not workload-specific pool capacities.
+The initial magazine is empty. A new chunk is allocated by the already-pinned
+event-loop thread requesting growth so Linux first-touch placement follows the
+consumer. Batch sizes and magazine watermarks are structural defaults, not
+workload-specific pool capacities.
 
 When the configured global maximum is reached, acquisition reports exhaustion
 and the existing bounded fallback/backpressure path remains authoritative. The
@@ -53,10 +62,16 @@ pool must expose:
 - allocated chunks and global peak leases;
 - capacity exhaustion and fallback counts.
 
+Exact global lease accounting is opt-in through
+`cardigan.egress.pool.stats`; its atomic counters are absent from ordinary
+runs. Batch and allocation counters are updated only while holding the shared
+pool lock.
+
 ## Validation
 
-Tests must cover exclusive leasing, terminal-CQE release, cancellation and send
-failure, batch transfer between loops, shutdown with outstanding sends, and
-HTTP/2 bursts large enough to exhaust a local magazine. Performance validation
-must confirm that the steady-state acquire/release path contains no atomic or
-shared-memory operation.
+Tests cover exclusive leasing, batch transfer, bounded exhaustion, shutdown
+with outstanding leases, and pipelined transport recovery under a deliberately
+small global pool. Protocol integration tests cover terminal-CQE release,
+cancellation, and send failure. Performance validation must confirm that the
+steady-state acquire/release path contains no atomic read-modify-write or
+cross-core shared operation when statistics are disabled.

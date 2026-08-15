@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.ArrayDeque;
+import java.util.Objects;
 
 public class UringEventLoop implements AutoCloseable, java.util.concurrent.Executor {
     private static final int EINTR = 4;
@@ -42,9 +43,16 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private static final VarHandle INT_HANDLE = ValueLayout.JAVA_INT.varHandle();
     private static final VarHandle SHORT_HANDLE = ValueLayout.JAVA_SHORT.varHandle();
     private static final VarHandle TASK_THREAD_HANDLE;
+    private static final VarHandle EGRESS_BUFFER_EPOCH_HANDLE;
     static {
         try {
-            TASK_THREAD_HANDLE = MethodHandles.lookup().findVarHandle(UringTask.class, "thread", Thread.class);
+            MethodHandles.Lookup lookup = MethodHandles.lookup();
+            TASK_THREAD_HANDLE = lookup.findVarHandle(
+                UringTask.class, "thread", Thread.class);
+            EGRESS_BUFFER_EPOCH_HANDLE = lookup.findVarHandle(
+                UringEventLoop.class,
+                "egressBufferEpoch",
+                int.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -263,10 +271,35 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private static final long VECTOR_IOV_OFFSET = 64;
     private static final long IOV_SIZE = 16;
     private static final long VECTOR_SLOT_SIZE = VECTOR_IOV_OFFSET + MAX_SEND_VECTORS * IOV_SIZE;
-    private final int numEgressBuffers;
-    private final MemorySegment egressBufferRing;
-    private final MemorySegment[] egressBufferSegments;
-    private final IntIdPool freeEgressIds;
+    private static final int EGRESS_REFILL_BATCH = 32;
+    private static final int EGRESS_LOCAL_CAPACITY = 64;
+    private static final int EGRESS_SPILL_BATCH = 32;
+    private final EgressBufferPool egressBufferPool;
+    private final boolean ownsEgressBufferPool;
+    private final int[] freeEgressIds =
+        new int[EGRESS_LOCAL_CAPACITY];
+    private final int[] transferEgressIds =
+        new int[Math.max(EGRESS_REFILL_BATCH, EGRESS_SPILL_BATCH)];
+    /*
+     * Different virtual threads use this state, but all are mounted on this
+     * loop's sole carrier. The mutation sections contain no parking operation,
+     * so they cannot overlap physically; the epoch supplies the Java-memory-
+     * model handoff between successive logical threads. Shared-pool batch
+     * transfers happen outside those sections.
+     */
+    @SuppressWarnings("unused")
+    private volatile int egressBufferEpoch;
+    private boolean egressTransferInProgress;
+    private int freeEgressCount;
+    private int activeEgressBuffers;
+    private int peakActiveEgressBuffers;
+    private long egressRefillMisses;
+    private long egressSpills;
+    private long egressAcquisitions;
+    private long egressReleases;
+    private long egressRefilledBuffers;
+    private long egressSpilledBuffers;
+    private boolean egressLocalRegistered;
     private final MemorySegment vectorScratch;
     private final IntIdPool freeVectorSlots;
 
@@ -319,8 +352,40 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     public UringEventLoop(
             int cpuId, int entries, int numBuffers,
             boolean ktlsReceiveBuffers) {
+        this(
+            cpuId,
+            entries,
+            numBuffers,
+            ktlsReceiveBuffers,
+            new EgressBufferPool(
+                EgressBufferPool.configuredMaxBuffers(1),
+                EGRESS_FRAME_SIZE),
+            true);
+    }
+
+    UringEventLoop(
+            int cpuId, int entries, int numBuffers,
+            boolean ktlsReceiveBuffers,
+            EgressBufferPool egressBufferPool) {
+        this(
+            cpuId,
+            entries,
+            numBuffers,
+            ktlsReceiveBuffers,
+            egressBufferPool,
+            false);
+    }
+
+    private UringEventLoop(
+            int cpuId, int entries, int numBuffers,
+            boolean ktlsReceiveBuffers,
+            EgressBufferPool egressBufferPool,
+            boolean ownsEgressBufferPool) {
         validateSchedulerConfiguration();
         this.cpuId = cpuId;
+        this.egressBufferPool = Objects.requireNonNull(
+            egressBufferPool, "egressBufferPool");
+        this.ownsEgressBufferPool = ownsEgressBufferPool;
         int bufCap = 1;
         while (bufCap < numBuffers) {
             bufCap <<= 1;
@@ -373,16 +438,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             this.returnedKtlsBufferIds = null;
         }
 
-        this.numEgressBuffers = Math.max(this.numBuffers, 4096);
-        this.egressBufferRing = arena.allocate((long) this.numEgressBuffers * EGRESS_FRAME_SIZE);
-        this.egressBufferSegments =
-            new MemorySegment[this.numEgressBuffers];
-        for (int i = 0; i < this.numEgressBuffers; i++) {
-            egressBufferSegments[i] = egressBufferRing.asSlice(
-                (long) i * EGRESS_FRAME_SIZE, EGRESS_FRAME_SIZE);
-        }
-        this.freeEgressIds = new IntIdPool(this.numEgressBuffers);
-        int numVectorSlots = this.numEgressBuffers >> 1;
+        int numVectorSlots = Math.max(this.numBuffers, 4096) >> 1;
         this.vectorScratch = arena.allocate((long) numVectorSlots * VECTOR_SLOT_SIZE, 64);
         this.freeVectorSlots = new IntIdPool(numVectorSlots);
         this.maxHttp2ParkedSenders = configuredMaxHttp2ParkedSenders();
@@ -395,6 +451,10 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             Thread.Builder.OfVirtual builder = (Thread.Builder.OfVirtual) ctor.newInstance(this);
             factory = builder.name("cardigan-vt-core" + cpuId + "-", 0).factory();
         } catch (Throwable t) {
+            arena.close();
+            if (ownsEgressBufferPool) {
+                egressBufferPool.close();
+            }
             throw new RuntimeException("Missing JVM argument: --add-opens java.base/java.lang=ALL-UNNAMED", t);
         }
         this.virtualThreadFactory = factory;
@@ -415,6 +475,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         }
         this.emptyFdSegment = arena.allocate(4);
         this.emptyFdSegment.set(ValueLayout.JAVA_INT, 0, -1);
+        egressBufferPool.registerLocal();
+        this.egressLocalRegistered = true;
 
         CountDownLatch initLatch = new CountDownLatch(1);
         AtomicReference<Throwable> initError = new AtomicReference<>();
@@ -424,19 +486,27 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             .name("cardigan-loop-" + cpuId)
             .unstarted(() -> runLoop(entries, initLatch, initError));
         this.carrierDomain = new CarrierDomain(loopThread);
-        loopThread.start();
+        try {
+            loopThread.start();
+        } catch (RuntimeException | Error failure) {
+            arena.close();
+            closeEgressAfterInitializationFailure(failure);
+            throw failure;
+        }
 
         try {
             initLatch.await();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             arena.close();
+            closeEgressAfterInitializationFailure(e);
             throw new RuntimeException("Interrupted initializing UringEventLoop for CPU " + cpuId, e);
         }
 
         if (initError.get() != null) {
             arena.close();
             Throwable failure = initError.get();
+            closeEgressAfterInitializationFailure(failure);
             if (failure instanceof UnsupportedKernelException unsupported) {
                 throw unsupported;
             }
@@ -445,6 +515,45 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                     + ": " + failure.getMessage(),
                 failure);
         }
+    }
+
+    private void closeEgressAfterInitializationFailure(Throwable failure) {
+        try {
+            closeLocalEgressBuffers();
+        } catch (Throwable cleanupFailure) {
+            failure.addSuppressed(cleanupFailure);
+        }
+        if (ownsEgressBufferPool) {
+            try {
+                egressBufferPool.close();
+            } catch (Throwable cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+        }
+    }
+
+    private void closeLocalEgressBuffers() {
+        if (!egressLocalRegistered) {
+            return;
+        }
+        EGRESS_BUFFER_EPOCH_HANDLE.getAcquire(this);
+        if (egressTransferInProgress) {
+            throw new IllegalStateException(
+                "Cannot close egress buffers during a batch transfer");
+        }
+        egressBufferPool.closeLocal(
+            freeEgressIds,
+            freeEgressCount,
+            activeEgressBuffers,
+            peakActiveEgressBuffers,
+            egressRefillMisses,
+            egressSpills,
+            egressAcquisitions,
+            egressReleases,
+            egressRefilledBuffers,
+            egressSpilledBuffers);
+        freeEgressCount = 0;
+        egressLocalRegistered = false;
     }
 
     private void runLoop(int entries, CountDownLatch initLatch, AtomicReference<Throwable> initError) {
@@ -1966,7 +2075,32 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     }
 
     public int acquireEgressBuffer() {
-        int bufferId = freeEgressIds.poll();
+        assert inCarrierDomain()
+            : "Egress buffers must be acquired in their carrier domain";
+        if (EgressBufferPool.STATS_ENABLED && !inCarrierDomain()) {
+            egressBufferPool.externalAcquire();
+        }
+        int bufferId = -1;
+        boolean refill = false;
+        int publication = beginEgressBufferMutation();
+        try {
+            if (freeEgressCount != 0) {
+                bufferId = acquireLocalEgressBuffer();
+            } else {
+                if (EgressBufferPool.STATS_ENABLED) {
+                    egressRefillMisses++;
+                }
+                if (!egressTransferInProgress) {
+                    egressTransferInProgress = true;
+                    refill = true;
+                }
+            }
+        } finally {
+            endEgressBufferMutation(publication);
+        }
+        if (refill) {
+            bufferId = refillAndAcquireEgressBuffer();
+        }
         if (Http2ResourceStats.ENABLED) {
             if (bufferId >= 0) {
                 Http2ResourceStats.egressBufferAcquired();
@@ -1979,7 +2113,67 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
     public void releaseEgressBuffer(int bufferId) {
         if (bufferId >= 0) {
-            freeEgressIds.offer(bufferId);
+            assert inCarrierDomain()
+                : "Egress buffers must be released in their carrier domain";
+            if (EgressBufferPool.STATS_ENABLED && !inCarrierDomain()) {
+                egressBufferPool.externalRelease();
+            }
+            boolean spillBatch = false;
+            boolean spillOne = false;
+            int publication = beginEgressBufferMutation();
+            try {
+                if (activeEgressBuffers <= 0) {
+                    throw new IllegalStateException(
+                        "Egress buffer released without a live lease");
+                }
+                if (freeEgressCount == EGRESS_LOCAL_CAPACITY) {
+                    if (egressTransferInProgress) {
+                        spillOne = true;
+                    } else {
+                        int first = freeEgressCount
+                            - EGRESS_SPILL_BATCH;
+                        System.arraycopy(
+                            freeEgressIds,
+                            first,
+                            transferEgressIds,
+                            0,
+                            EGRESS_SPILL_BATCH);
+                        freeEgressCount = first;
+                        egressTransferInProgress = true;
+                        spillBatch = true;
+                    }
+                    if (EgressBufferPool.STATS_ENABLED) {
+                        egressSpills++;
+                        egressSpilledBuffers += spillOne
+                            ? 1 : EGRESS_SPILL_BATCH;
+                    }
+                }
+                if (!spillOne) {
+                    freeEgressIds[freeEgressCount++] = bufferId;
+                }
+                activeEgressBuffers--;
+                if (EgressBufferPool.STATS_ENABLED) {
+                    egressReleases++;
+                    egressBufferPool.leaseReleased();
+                }
+            } finally {
+                endEgressBufferMutation(publication);
+            }
+            if (spillBatch) {
+                try {
+                    egressBufferPool.spill(
+                        transferEgressIds, 0, EGRESS_SPILL_BATCH);
+                } finally {
+                    publication = beginEgressBufferMutation();
+                    try {
+                        egressTransferInProgress = false;
+                    } finally {
+                        endEgressBufferMutation(publication);
+                    }
+                }
+            } else if (spillOne) {
+                egressBufferPool.spill(bufferId);
+            }
             if (Http2ResourceStats.ENABLED) {
                 Http2ResourceStats.egressBufferReleased();
             }
@@ -1987,10 +2181,84 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     }
 
     public MemorySegment getEgressBufferSegment(int bufferId) {
-        if (bufferId < 0 || bufferId >= numEgressBuffers) {
-            throw new IllegalArgumentException("Invalid egress bufferId: " + bufferId);
+        return egressBufferPool.segment(bufferId);
+    }
+
+    private int refillAndAcquireEgressBuffer() {
+        int supplied;
+        try {
+            supplied = egressBufferPool.refill(
+                transferEgressIds, 0, EGRESS_REFILL_BATCH);
+        } catch (Throwable failure) {
+            finishEgressTransfer();
+            throw failure;
         }
-        return egressBufferSegments[bufferId];
+
+        int accepted;
+        int bufferId = -1;
+        int publication = beginEgressBufferMutation();
+        try {
+            accepted = Math.min(
+                supplied,
+                EGRESS_LOCAL_CAPACITY - freeEgressCount);
+            System.arraycopy(
+                transferEgressIds, 0,
+                freeEgressIds, freeEgressCount,
+                accepted);
+            freeEgressCount += accepted;
+            if (EgressBufferPool.STATS_ENABLED) {
+                egressRefilledBuffers += accepted;
+            }
+            if (freeEgressCount != 0) {
+                bufferId = acquireLocalEgressBuffer();
+            }
+            if (accepted == supplied) {
+                egressTransferInProgress = false;
+            }
+        } finally {
+            endEgressBufferMutation(publication);
+        }
+
+        int overflow = supplied - accepted;
+        if (overflow != 0) {
+            try {
+                egressBufferPool.spill(
+                    transferEgressIds, accepted, overflow);
+            } finally {
+                finishEgressTransfer();
+            }
+        }
+        return bufferId;
+    }
+
+    private int acquireLocalEgressBuffer() {
+        int bufferId = freeEgressIds[--freeEgressCount];
+        activeEgressBuffers++;
+        if (EgressBufferPool.STATS_ENABLED) {
+            egressAcquisitions++;
+            if (activeEgressBuffers > peakActiveEgressBuffers) {
+                peakActiveEgressBuffers = activeEgressBuffers;
+            }
+            egressBufferPool.leaseAcquired();
+        }
+        return bufferId;
+    }
+
+    private void finishEgressTransfer() {
+        int publication = beginEgressBufferMutation();
+        try {
+            egressTransferInProgress = false;
+        } finally {
+            endEgressBufferMutation(publication);
+        }
+    }
+
+    private int beginEgressBufferMutation() {
+        return (int) EGRESS_BUFFER_EPOCH_HANDLE.getAcquire(this);
+    }
+
+    private void endEgressBufferMutation(int publication) {
+        EGRESS_BUFFER_EPOCH_HANDLE.setRelease(this, publication + 1);
     }
 
     /**
@@ -2667,8 +2935,34 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             System.err.println("Error during io_uring_queue_exit: " + t.getMessage());
         }
 
-        arena.close();
+        Throwable cleanupFailure = null;
+        try {
+            closeLocalEgressBuffers();
+        } catch (Throwable failure) {
+            cleanupFailure = failure;
+        }
+        if (ownsEgressBufferPool && cleanupFailure == null) {
+            try {
+                egressBufferPool.close();
+            } catch (Throwable failure) {
+                cleanupFailure = failure;
+            }
+        }
+        try {
+            arena.close();
+        } catch (Throwable failure) {
+            if (cleanupFailure == null) {
+                cleanupFailure = failure;
+            } else {
+                cleanupFailure.addSuppressed(failure);
+            }
+        }
         resourcesClosed = true;
+        if (cleanupFailure != null) {
+            throw new IllegalStateException(
+                "Failed to release event-loop resources for CPU " + cpuId,
+                cleanupFailure);
+        }
         System.out.println("Closed UringEventLoop for CPU " + cpuId);
     }
 

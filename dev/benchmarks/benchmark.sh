@@ -27,6 +27,7 @@ TLS_CERTIFICATE=""
 TLS_PRIVATE_KEY=""
 TLS_STATS=false
 HTTP2_RESOURCE_STATS=false
+EGRESS_POOL_STATS=false
 SCHEDULER_STATS=false
 FIXED_FILE_STATS=false
 FIXED_FILES_MODE="auto"
@@ -82,6 +83,7 @@ Options:
   --tls-private-key=PATH     PEM private key (default: generated test key)
   --tls-stats                Print opt-in TLS transport counters at shutdown
   --http2-resource-stats     Print opt-in HTTP/2 resource high-water marks
+  --egress-pool-stats        Print shared egress-pool occupancy and batching
   --scheduler-stats          Print per-loop epoch/lane/range counters
   --fixed-file-stats         Print fixed-file capacity and admission counters
   --fixed-files=MODE         auto, legacy, async-explicit, async-alloc, direct
@@ -197,6 +199,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --scheduler-stats)
             SCHEDULER_STATS=true
+            shift
+            ;;
+        --egress-pool-stats)
+            EGRESS_POOL_STATS=true
             shift
             ;;
         --scheduler-mode|--scheduler-mode=*)
@@ -1106,6 +1112,7 @@ print_runtime_configuration() {
         echo "io_uring task pool: runtime-derived from fixed-file capacity and SQ entries"
     fi
     echo "Scheduler: topological causal epochs, stats=$SCHEDULER_STATS"
+    echo "Egress pool stats: $EGRESS_POOL_STATS"
 }
 
 run_http2_flow_control() {
@@ -1329,6 +1336,7 @@ java "${JAVA_ARGS[@]}" \
         -Dcardigan.benchmark.payloadSize="$PAYLOAD_SIZE" \
         -Dcardigan.benchmark.sleepMillis="$SLEEP_MILLIS" \
         -Dcardigan.benchmark.heavyIterations="$HEAVY_ITERATIONS" \
+        -Dcardigan.egress.pool.stats="$EGRESS_POOL_STATS" \
         -Dcardigan.http2.resource.stats="$HTTP2_RESOURCE_STATS" \
         -Dcardigan.http2.max.parked.senders.per.loop="$HTTP2_MAX_PARKED_SENDERS" \
         -Dcardigan.isolated.carriers="$ISOLATED_CARRIERS" \

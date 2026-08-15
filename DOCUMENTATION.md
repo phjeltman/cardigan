@@ -138,6 +138,8 @@ they are not dynamically reloadable. Defaults remain experimental.
 | `cardigan.http2.max.header.list.size` | 16 KiB | Decoded header-list limit |
 | `cardigan.http2.max.streaming.bodies.per.connection` | 16 | Streaming request bodies per connection |
 | `cardigan.http2.max.streaming.buffer.bytes` | 256 MiB | Process-wide streaming-buffer budget |
+| `cardigan.egress.buffers.max` | max(4096, 256 x event loops) | Process-wide lazily allocated egress-buffer limit |
+| `cardigan.egress.pool.stats` | `false` | Report shared egress-pool occupancy and batch counters |
 | `cardigan.fixed.files.mode` | `auto` | `auto`, `legacy`, `async-explicit`, `async-alloc`, or `direct`; auto uses direct plaintext accept and async allocation for TLS |
 | `cardigan.fixed.files.capacity` | 8192 | Registered socket slots per event loop |
 | `cardigan.max.tasks` | 2 x fixed-file capacity + SQ entries | io_uring task slots per event loop |
@@ -162,9 +164,9 @@ they are not dynamically reloadable. Defaults remain experimental.
 | `cardigan.tls.stats` | `false` | Report TLS counters at shutdown |
 | `cardigan.http2.resource.stats` | `false` | Report HTTP/2 resource high-water marks |
 
-The fixed-file table, io_uring task pool, exchange queue, and retained-worker
-limit are resource capacities. They bound admission and storage; they do not
-select or tune the scheduler's epoch policy.
+The egress pool, fixed-file table, io_uring task pool, exchange queue, and
+retained-worker limit are resource capacities. They bound admission and
+storage; they do not select or tune the scheduler's epoch policy.
 
 ## Validation
 

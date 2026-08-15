@@ -53,6 +53,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
     private final TlsContext tlsContext;
     private final FixedFilesMode fixedFilesMode;
     private final boolean directAccept;
+    private final EgressBufferPool egressBufferPool;
     private final List<UringEventLoop> eventLoops = new ArrayList<>();
     private final List<Integer> serverFds = new ArrayList<>();
     private final List<AcceptHandler> acceptHandlers = new ArrayList<>();
@@ -222,6 +223,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             ? ThreadAffinity.processCpus(threadCount)
             : ThreadAffinity.processCpus(cpuList);
         this.cores = eventLoopCpus.length;
+        int maxEgressBuffers =
+            EgressBufferPool.configuredMaxBuffers(cores);
         Objects.requireNonNull(protocolMode, "protocolMode");
         this.http2Only = protocolMode == ProtocolMode.HTTP2_ONLY;
         this.http1Only = protocolMode == ProtocolMode.HTTP1_ONLY;
@@ -238,6 +241,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         this.tlsContext = tlsConfig == null
             ? null
             : new TlsContext(tlsConfig, http2Only, http1Only);
+        this.egressBufferPool = new EgressBufferPool(
+            maxEgressBuffers, UringEventLoop.EGRESS_FRAME_SIZE);
         this.gracefulShutdownMillis = Math.max(
             0L,
             Long.getLong("cardigan.shutdown.grace.millis", 30_000L));
@@ -366,7 +371,11 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             for (int i = 0; i < cores; i++) {
                 int cpuId = eventLoopCpus[i];
                 eventLoops.add(new UringEventLoop(
-                    cpuId, 512, 512, directKtlsReceiveConfigured));
+                    cpuId,
+                    512,
+                    512,
+                    directKtlsReceiveConfigured,
+                    egressBufferPool));
             }
 
             CountDownLatch listenersReady = new CountDownLatch(cores);
@@ -503,6 +512,10 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
 
     int activeConnectionCount() {
         return activeConnectionCount.get();
+    }
+
+    EgressBufferPool.Stats egressBufferPoolStats() {
+        return egressBufferPool.stats();
     }
 
     boolean isDraining() {
@@ -2588,6 +2601,19 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 } else {
                     loopCloseFailure.addSuppressed(e);
                 }
+            }
+        }
+        if (loopCloseFailure == null) {
+            if (EgressBufferPool.STATS_ENABLED) {
+                System.out.println(
+                    "Egress buffer pool: "
+                        + egressBufferPool.stats().summary());
+            }
+            try {
+                egressBufferPool.close();
+            } catch (Exception e) {
+                loopCloseFailure = new IllegalStateException(
+                    "Egress buffer pool could not be closed safely", e);
             }
         }
         if (loopCloseFailure != null) {
