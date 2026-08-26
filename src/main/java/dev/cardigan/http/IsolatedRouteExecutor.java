@@ -24,13 +24,7 @@ final class IsolatedRouteExecutor {
             ThreadAffinity.validateCpuList(CONFIGURED_CPUS);
         }
     }
-    private static final int PARALLELISM = Math.max(
-        1,
-        Integer.getInteger(
-            "cardigan.isolated.carriers",
-            Runtime.getRuntime().availableProcessors()
-        )
-    );
+    private static final int PARALLELISM = configuredParallelism();
     private static final int MAX_TASKS = Math.max(
         1,
         Integer.getInteger("cardigan.isolated.max.tasks", 4_096)
@@ -86,8 +80,20 @@ final class IsolatedRouteExecutor {
         );
     }
 
+    static int parallelism() {
+        return PARALLELISM;
+    }
+
     static ForkJoinWorkerThread newCarrier(ForkJoinPool pool) {
         return new IsolatedCarrier(pool, CARRIER_IDS.getAndIncrement());
+    }
+
+    private static int configuredParallelism() {
+        Integer configured = Integer.getInteger(
+            "cardigan.isolated.carriers");
+        return configured == null
+            ? ThreadAffinity.processCpus().length
+            : Math.max(1, configured);
     }
 
     private static ThreadFactory newVirtualThreadFactory(Executor scheduler) {

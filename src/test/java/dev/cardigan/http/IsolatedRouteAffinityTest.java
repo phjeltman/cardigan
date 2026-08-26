@@ -62,6 +62,11 @@ class IsolatedRouteAffinityTest {
         assertEquals(1, cpuCount(pinnedParentMask.get()));
         assertArrayEquals(processMask, carrierMask.get(),
             "Isolated carrier retained its creator's pinned CPU mask");
+        assertEquals(
+            cpuCount(processMask),
+            IsolatedRouteExecutor.parallelism(),
+            "Pinned initialization reduced isolated carrier parallelism"
+        );
     }
 
     @Test
