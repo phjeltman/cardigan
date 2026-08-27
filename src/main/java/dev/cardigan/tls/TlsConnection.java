@@ -186,9 +186,8 @@ public final class TlsConnection implements AutoCloseable {
     }
 
     /**
-     * Once OpenSSL has installed the transmit key and record sequence in the
-     * socket, ordinary sends are TLS application-data records. Cardigan can
-     * therefore retain its io_uring write path without crossing SSL_write.
+     * Reports whether the socket can frame io_uring writes as TLS
+     * application-data records with keys installed by OpenSSL.
      */
     public boolean directKtlsSend() {
         return ktlsSend && context.directKtlsSend();
@@ -229,9 +228,9 @@ public final class TlsConnection implements AutoCloseable {
     }
 
     /**
-     * TLS 1.2 has no post-handshake KeyUpdate. When OpenSSL has installed the
-     * receive key in the socket, Cardigan may consume application records with
-     * its normal io_uring receive path. Control records still require recvmsg.
+     * TLS 1.2 has no post-handshake KeyUpdate. Once OpenSSL installs the
+     * receive key, io_uring can consume application records; recvmsg handles
+     * control records.
      */
     public boolean directKtlsReceive() {
         return context.directKtlsReceive() && ktlsRecv;

@@ -281,9 +281,8 @@ public final class Stage2Parser {
     }
 
     /**
-     * Heap-specialized Stage 2. The state identifies what token is expected,
-     * so punctuation is consumed directly instead of redispatched through a
-     * generic character switch for every structural index.
+     * Heap-specialized Stage 2. The parser state identifies the expected token
+     * and selects its punctuation path at each structural index.
      */
     private SimdJsonError parseHeap(
             byte[] input, int inputBase, int jsonLength,

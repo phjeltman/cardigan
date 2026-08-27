@@ -10,10 +10,9 @@ import java.util.Objects;
 /**
  * Identifies every Java thread currently mounted on one platform carrier.
  *
- * <p>Cardigan already opens {@code java.lang} to construct virtual threads
- * with a private scheduler. Reusing that opening for
- * {@code Thread.currentCarrierThread()} avoids adding an export of
- * {@code jdk.internal.misc.CarrierThreadLocal} to every launcher.</p>
+ * <p>The server's required {@code java.lang} opening permits a private lookup of
+ * {@code Thread.currentCarrierThread()}, giving the platform thread and its
+ * mounted virtual threads the same carrier identity.</p>
  */
 final class CarrierDomain {
     private static final MethodHandle CURRENT_CARRIER_THREAD =

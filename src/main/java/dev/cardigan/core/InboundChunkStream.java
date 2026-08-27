@@ -5,8 +5,8 @@ package dev.cardigan.core;
 import java.lang.foreign.MemorySegment;
 
 /**
- * Preserves stream order while copying only request fragments which span
- * independently owned multishot receive buffers.
+ * Preserves stream order across independently owned multishot receive buffers
+ * and copies request fragments that span buffer boundaries.
  */
 final class InboundChunkStream implements AutoCloseable {
     private final UringEventLoop loop;

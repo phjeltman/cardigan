@@ -284,10 +284,9 @@ public final class HpackDecoder {
 
     /**
      * Production request decoding has already validated the native receive and
-     * decoded-header slabs. Use absolute offsets into one constant, zero-based
-     * native segment inside the byte-at-a-time HPACK loop. This lets C2 fold
-     * the segment base, size, and global scope instead of loading that metadata
-     * from a differently based segment for every prefix and Huffman transition.
+     * decoded-header slabs. Absolute offsets into one constant, zero-based
+     * native segment give C2 a stable segment base, size, and scope throughout
+     * each prefix and Huffman transition.
      */
     private int decodeNativeRequest(
             MemorySegment boundedSource, long sourceOffset, int encodedLength,

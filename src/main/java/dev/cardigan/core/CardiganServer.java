@@ -838,8 +838,9 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                         "Direct accept produced a raw descriptor");
                 };
                 if (fixedSlot < 0) {
-                    // The fixed-file table is the connection-admission
-                    // boundary; never silently switch to raw-descriptor I/O.
+                    // The fixed-file table defines connection admission;
+                    // exhaustion rejects the connection and preserves
+                    // fixed-descriptor I/O.
                     return;
                 }
             }
@@ -852,7 +853,6 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 control.tls = tls;
                 reportTlsCapabilities(tls);
             }
-            writer = new ConnectionWriter(loop, clientFd, fixedSlot, tls);
             boolean directKtlsReceive =
                 tls != null && tls.directKtlsReceive();
             if (tls == null) {
@@ -902,6 +902,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             }
 
             if (possibleHttp2 && readOffset >= Http2Frames.CLIENT_PREFACE.length) {
+                writer = ConnectionWriter.forHttp2(
+                    loop, clientFd, fixedSlot, tls);
                 Http2Connection http2 = new Http2Connection(
                     inbound,
                     writer,
@@ -920,6 +922,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 http2.run();
                 return;
             }
+
+            writer = new ConnectionWriter(loop, clientFd, fixedSlot, tls);
 
             // The HTTP/2 prior-knowledge preface begins with a deliberately
             // distinctive HTTP/1-looking request line. Once that line has
@@ -946,7 +950,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     try {
                         currentChunk.close();
                     } catch (Throwable t) {
-                        // Connection teardown releases the receiver resources below.
+                        // Continue teardown so the stream and receiver release
+                        // their resources.
                     }
                     currentChunk = null;
                 }
@@ -996,11 +1001,11 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
     }
 
     /**
-     * Drains the input already owned by {@code session}. The ordinary empty-body
-     * keep-alive path returns {@code true} before acquiring another receive
-     * chunk, allowing this large parse/route frame to unwind before the small
-     * driver parks. Fragment and body coalescing plus streaming request bodies
-     * retain the existing stackful pull path.
+     * Drains the input already owned by {@code session}. For an empty-body
+     * keep-alive request, this method returns before the receive driver acquires
+     * another chunk, so the parser frame is absent when that driver parks.
+     * Fragmented headers, coalesced bodies, and streaming bodies may consume
+     * multiple chunks through {@link InboundChunkStream}.
      */
     private boolean drainHttp1Session(Http1Session session) {
         UringEventLoop loop = session.loop;
@@ -1366,7 +1371,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         }
     }
 
-    /** Mutable HTTP/1 state which survives only natural input boundaries. */
+    /** Carries HTTP/1 parser and sequencing state across receive-chunk boundaries. */
     private static final class Http1Session implements AutoCloseable {
         private final UringEventLoop loop;
         private final ConnectionWriter writer;
@@ -1568,8 +1573,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         }
 
         if (transferEncodingSeen) {
-            // Cardigan supports only HTTP/1.1's terminal chunked coding. It
-            // intentionally rejects CL+TE instead of choosing one framing.
+            // Cardigan supports only HTTP/1.1's terminal chunked coding;
+            // Content-Length plus Transfer-Encoding is ambiguous framing.
             if (contentLengthSeen || request.version() != 1) {
                 return HTTP1_FRAMING_INVALID;
             }
@@ -2798,13 +2803,15 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     try {
                         connection.prepareInputShutdown();
                     } catch (Throwable failure) {
-                        // Still wake the parser, but do not call SSL_shutdown
-                        // on native state whose receive side was not marked.
+                        // Wake the parser after aborting TLS shutdown
+                        // synchronization; SSL_shutdown requires successfully
+                        // marked native receive state.
                         connection.abortTransportShutdown();
                     }
                 }
-                // Stop only reads. Admitted handlers may still write; the
-                // connection owner sends close_notify after output drains.
+                // SHUT_RD wakes the parser while preserving writes from
+                // admitted handlers. The connection owner sends close_notify
+                // after output drains.
                 socketLifecycleLock.lock();
                 try {
                     if (!done) {

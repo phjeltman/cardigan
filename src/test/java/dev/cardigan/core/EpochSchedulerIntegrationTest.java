@@ -215,7 +215,9 @@ final class EpochSchedulerIntegrationTest {
     }
 
     private static UringEventLoop epochLoop() {
-        return new UringEventLoop(0, 64, 512, false);
+        return new UringEventLoop(
+            0, 64, 512, false,
+            UringEventLoop.SchedulerMode.EPOCH);
     }
 
     private static InboundReceiver immediateReceiver(

@@ -170,13 +170,11 @@ final class Http2Connection {
     }
 
     /**
-     * Drains complete frames from the currently owned receive chunk. The
-     * ordinary frame-aligned path returns before acquiring another chunk so
-     * this large parser frame is not captured by the idle receive park.
-     * Fragmented headers and payloads retain the stackful {@link #readFully}
-     * fallback. Frame dispatch deliberately remains here so this method stays
-     * a stable HotSpot continuation boundary instead of being inlined back
-     * into the receive driver.
+     * Drains complete frames from the currently owned receive chunk. Returning
+     * at a frame-aligned chunk boundary lets the receive driver park without
+     * retaining this parser frame. {@link #readFully} handles fragmented
+     * headers and payloads. Keeping frame dispatch in this method provides a
+     * stable HotSpot continuation boundary for the receive driver.
      */
     private boolean drainAvailableFrames(FrameBuffers buffers) {
         while (open) {

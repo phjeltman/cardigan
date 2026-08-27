@@ -85,8 +85,8 @@ public final class PreparedInvocation {
     }
 
     /**
-     * Invokes an isolated handler while tying resource release to the actual
-     * handler lifetime rather than to its cancellable caller.
+     * Invokes an isolated handler and releases resources when the handler
+     * completes, including after caller cancellation.
      */
     public Response invokeWithCompletion(Runnable completion) {
         if (!(handler instanceof IsolatedRouteHandler isolated)) {

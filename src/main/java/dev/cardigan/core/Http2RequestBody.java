@@ -147,8 +147,8 @@ final class Http2RequestBody implements RequestBody {
     }
 
     void dispose() {
-        // The ordinary streaming path has one owner and closes directly. The
-        // atomic path exists only after an isolated handler retained the ring.
+        // Single-owner streaming bodies close directly. Isolated handlers
+        // retain the ring and require the atomic release path.
         if ((int) OWNERS.getAcquire(this) == 1) {
             arena.close();
         } else {

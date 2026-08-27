@@ -19,6 +19,11 @@ import java.util.ArrayDeque;
 import java.util.Objects;
 
 public class UringEventLoop implements AutoCloseable, java.util.concurrent.Executor {
+    enum SchedulerMode {
+        BUDGETED,
+        EPOCH
+    }
+
     private static final int EINTR = 4;
     private static final String[] REMOVED_SCHEDULER_PROPERTIES = {
         "cardigan.scheduler.mode",
@@ -31,8 +36,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         "cardigan.scheduler.egressTasksPerTurn",
         "cardigan.scheduler.externalTasksPerTurn",
         "cardigan.scheduler.protocolQuantumMicros",
-        "cardigan.scheduler.protocolCheckpointInterval",
-        "cardigan.exchange.max.batch"
+        "cardigan.scheduler.protocolCheckpointInterval"
     };
     private static final boolean TASK_POOL_STATS_ENABLED =
         Boolean.getBoolean("cardigan.uring.task.stats");
@@ -40,6 +44,12 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         Boolean.getBoolean("cardigan.scheduler.stats");
     private static final boolean FIXED_FILE_STATS_ENABLED =
         Boolean.getBoolean("cardigan.fixed.files.stats");
+    private static final int CQE_TURN_BUDGET = 256;
+    private static final int COMPLETION_TURN_BUDGET = 256;
+    private static final int PROTOCOL_TURN_BUDGET = 128;
+    private static final int HANDLER_TURN_BUDGET = 32;
+    private static final int EGRESS_TURN_BUDGET = 256;
+    private static final int EXTERNAL_TURN_BUDGET = 64;
     private static final VarHandle INT_HANDLE = ValueLayout.JAVA_INT.varHandle();
     private static final VarHandle SHORT_HANDLE = ValueLayout.JAVA_SHORT.varHandle();
     private static final VarHandle TASK_THREAD_HANDLE;
@@ -96,6 +106,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
     private final Thread loopThread;
     private final CarrierDomain carrierDomain;
+    private final SchedulerMode schedulerMode;
 
     /** Continuations made runnable by the current CQE batch. */
     private final ArrayDeque<Runnable> completionReadyTasks =
@@ -263,7 +274,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
      */
     public static final int EGRESS_FRAME_SIZE =
         Http2Frames.DEFAULT_MAX_FRAME_SIZE + 64;
-    static final int MAX_SEND_VECTORS = 16;
+    static final int MAX_SEND_VECTORS = 32;
     private static final long MSGHDR_IOV_OFFSET = 16;
     private static final long MSGHDR_IOV_COUNT_OFFSET = 24;
     private static final long MSGHDR_CONTROL_LENGTH_OFFSET = 40;
@@ -271,9 +282,9 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private static final long VECTOR_IOV_OFFSET = 64;
     private static final long IOV_SIZE = 16;
     private static final long VECTOR_SLOT_SIZE = VECTOR_IOV_OFFSET + MAX_SEND_VECTORS * IOV_SIZE;
-    private static final int EGRESS_REFILL_BATCH = 32;
-    private static final int EGRESS_LOCAL_CAPACITY = 64;
-    private static final int EGRESS_SPILL_BATCH = 32;
+    private static final int EGRESS_REFILL_BATCH = 256;
+    private static final int EGRESS_LOCAL_CAPACITY = 512;
+    private static final int EGRESS_SPILL_BATCH = 256;
     private final EgressBufferPool egressBufferPool;
     private final boolean ownsEgressBufferPool;
     private final int[] freeEgressIds =
@@ -300,6 +311,10 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private long egressRefilledBuffers;
     private long egressSpilledBuffers;
     private boolean egressLocalRegistered;
+    private final int numPrivateEgressBuffers;
+    private final MemorySegment privateEgressBufferRing;
+    private final MemorySegment[] privateEgressBufferSegments;
+    private final IntIdPool privateEgressIds;
     private final MemorySegment vectorScratch;
     private final IntIdPool freeVectorSlots;
 
@@ -360,7 +375,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             new EgressBufferPool(
                 EgressBufferPool.configuredMaxBuffers(1),
                 EGRESS_FRAME_SIZE),
-            true);
+            true,
+            SchedulerMode.EPOCH);
     }
 
     UringEventLoop(
@@ -373,16 +389,36 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             numBuffers,
             ktlsReceiveBuffers,
             egressBufferPool,
-            false);
+            false,
+            SchedulerMode.EPOCH);
+    }
+
+    UringEventLoop(
+            int cpuId, int entries, int numBuffers,
+            boolean ktlsReceiveBuffers,
+            SchedulerMode schedulerMode) {
+        this(
+            cpuId,
+            entries,
+            numBuffers,
+            ktlsReceiveBuffers,
+            new EgressBufferPool(
+                EgressBufferPool.configuredMaxBuffers(1),
+                EGRESS_FRAME_SIZE),
+            true,
+            schedulerMode);
     }
 
     private UringEventLoop(
             int cpuId, int entries, int numBuffers,
             boolean ktlsReceiveBuffers,
             EgressBufferPool egressBufferPool,
-            boolean ownsEgressBufferPool) {
+            boolean ownsEgressBufferPool,
+            SchedulerMode schedulerMode) {
         validateSchedulerConfiguration();
         this.cpuId = cpuId;
+        this.schedulerMode = Objects.requireNonNull(
+            schedulerMode, "schedulerMode");
         this.egressBufferPool = Objects.requireNonNull(
             egressBufferPool, "egressBufferPool");
         this.ownsEgressBufferPool = ownsEgressBufferPool;
@@ -438,7 +474,19 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             this.returnedKtlsBufferIds = null;
         }
 
-        int numVectorSlots = Math.max(this.numBuffers, 4096) >> 1;
+        this.numPrivateEgressBuffers = Math.max(this.numBuffers, 4096);
+        this.privateEgressBufferRing = arena.allocate(
+            (long) this.numPrivateEgressBuffers * EGRESS_FRAME_SIZE);
+        this.privateEgressBufferSegments =
+            new MemorySegment[this.numPrivateEgressBuffers];
+        for (int i = 0; i < this.numPrivateEgressBuffers; i++) {
+            privateEgressBufferSegments[i] =
+                privateEgressBufferRing.asSlice(
+                    (long) i * EGRESS_FRAME_SIZE, EGRESS_FRAME_SIZE);
+        }
+        this.privateEgressIds =
+            new IntIdPool(this.numPrivateEgressBuffers);
+        int numVectorSlots = this.numPrivateEgressBuffers >> 1;
         this.vectorScratch = arena.allocate((long) numVectorSlots * VECTOR_SLOT_SIZE, 64);
         this.freeVectorSlots = new IntIdPool(numVectorSlots);
         this.maxHttp2ParkedSenders = configuredMaxHttp2ParkedSenders();
@@ -571,9 +619,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                 "Pinned cardigan-loop-" + cpuId + " to Linux CPU " + cpuId);
 
             int flags = Opcodes.IORING_SETUP_SINGLE_ISSUER
-                | Opcodes.IORING_SETUP_SUBMIT_ALL
-                | Opcodes.IORING_SETUP_DEFER_TASKRUN
-                | Opcodes.IORING_SETUP_TASKRUN_FLAG;
+                | Opcodes.IORING_SETUP_DEFER_TASKRUN;
             this.ring = new RawUring(arena, entries, flags);
 
             this.evfd = (int) Libc.eventfd.invokeExact(0, 0);
@@ -622,6 +668,43 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
         while (!closed && wakeupFailure == null) {
             try {
+                if (!usesEpochScheduler()) {
+                    runSchedulerTurn();
+                    if (hasSchedulerWork()) {
+                        if (sqePending || ring.hasPendingSubmissions()) {
+                            submitPendingOperations();
+                        }
+                        continue;
+                    }
+
+                    isSleeping = true;
+                    VarHandle.fullFence();
+                    if (hasSchedulerWork()) {
+                        isSleeping = false;
+                        continue;
+                    }
+
+                    try {
+                        boolean submitted = sqePending
+                            || ring.hasPendingSubmissions();
+                        int ret;
+                        try {
+                            ret = ring.submitAndWait(1);
+                        } finally {
+                            sqePending = ring.hasPendingSubmissions();
+                        }
+                        schedulerWaits++;
+                        if (submitted) {
+                            schedulerSubmits++;
+                        }
+                        checkEnterResult(
+                            ret, "waiting for io_uring completions");
+                    } finally {
+                        isSleeping = false;
+                    }
+                    continue;
+                }
+
                 runSchedulerEpoch();
                 if (hasEpochSourceExcludingPendingSq()) {
                     submitEpochBoundary();
@@ -666,6 +749,82 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         }
     }
 
+    /** Runs one bounded reactor turn without draining any lane indefinitely. */
+    private void runSchedulerTurn() {
+        schedulerEpochs++;
+        schedulerEpoch++;
+
+        int reaped = reapCompletionBudget(CQE_TURN_BUDGET);
+        schedulerCqes += reaped;
+
+        if (reaped < CQE_TURN_BUDGET
+                && (ring.taskWorkPending() || ring.overflowPending())) {
+            boolean submitted = sqePending
+                || ring.hasPendingSubmissions();
+            int result;
+            try {
+                result = ring.enterGetEvents();
+            } finally {
+                sqePending = ring.hasPendingSubmissions();
+            }
+            schedulerTaskWorkEnters++;
+            if (submitted) {
+                schedulerSubmits++;
+            }
+            checkEnterResult(result, "running deferred io_uring task work");
+            schedulerCqes += reapCompletionBudget(
+                CQE_TURN_BUDGET - reaped);
+        }
+
+        schedulerExternalTasks += drainExternalTasks(EXTERNAL_TURN_BUDGET);
+        schedulerCompletionTasks += drainReadyTasks(
+            completionReadyTasks, COMPLETION_TURN_BUDGET, false);
+        schedulerProtocolTasks += drainReadyTasks(
+            protocolReadyTasks, PROTOCOL_TURN_BUDGET, false);
+        schedulerHandlerTasks += drainReadyTasks(
+            handlerReadyTasks, HANDLER_TURN_BUDGET, true);
+        flushReturnedBuffers();
+        schedulerEgressTasks += drainReadyTasks(
+            egressReadyTasks, EGRESS_TURN_BUDGET, false);
+    }
+
+    private int reapCompletionBudget(int budget) {
+        int head = (int) INT_HANDLE.getAcquire(kheadSegment, 0L);
+        int tail = (int) INT_HANDLE.getAcquire(ktailSegment, 0L);
+        int available = tail - head;
+        int snapshotTail = head + Math.min(available, budget);
+        return reapCompletionEpochSnapshot(head, snapshotTail);
+    }
+
+    private int drainReadyTasks(
+            ArrayDeque<Runnable> tasks, int budget,
+            boolean includeAppended) {
+        int turnSize = includeAppended
+            ? budget
+            : Math.min(budget, tasks.size());
+        int count = 0;
+        Runnable task;
+        while (count < turnSize && (task = tasks.pollFirst()) != null) {
+            runReadyTask(task);
+            count++;
+        }
+        return count;
+    }
+
+    private boolean hasSchedulerWork() {
+        return !completionReadyTasks.isEmpty()
+            || !protocolReadyTasks.isEmpty()
+            || !handlerReadyTasks.isEmpty()
+            || !egressReadyTasks.isEmpty()
+            || !readyTasks.isEmpty()
+            || returnedInboundBufferCount != 0
+            || returnedKtlsBufferCount != 0
+            || hasCompletions()
+            || ring.hasPendingSubmissions()
+            || ring.taskWorkPending()
+            || ring.overflowPending();
+    }
+
     /**
      * Runs one topological scheduler epoch. Kernel work is materialized before
      * the CQ snapshot, then each downstream lane consumes exactly the work
@@ -705,9 +864,9 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         int externalSnapshotSize = readyTasks.publishedSnapshotSize();
         schedulerExternalTasks += drainExternalTasks(externalSnapshotSize);
 
-        // Handler-originated submissions are deliberately not admitted until
-        // this later epoch. Seal that prior tail before current completion and
-        // protocol producers append their own causal ranges.
+        // Handler submissions beyond the previous handler cutoff form the
+        // first causal range of this epoch. Seal that range before completion
+        // and protocol producers append their ranges.
         if (exchangeExecutor.sealDeferredHandlerRange()) {
             schedulerHandlerRanges++;
         }
@@ -716,18 +875,18 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         schedulerProtocolTasks += drainProducerTaskSnapshot(
             protocolReadyTasks);
 
-        // Direct protocol output has no handler range. Prepare it before the
-        // range worker starts so a range boundary drains only its downstream
-        // egress, not unrelated output from the producer phases.
+        // Flush direct protocol output before handler ranges. A range boundary
+        // then drains egress produced by that range without absorbing output
+        // from the producer phases.
         flushReturnedBuffers();
         schedulerEgressTasks += drainReadyTaskSnapshot(egressReadyTasks);
 
         exchangeExecutor.beginHandlerEpoch();
         schedulerHandlerTasks += drainReadyTaskSnapshot(handlerReadyTasks);
 
-        // A handler continuation can park before its range frontier is crossed,
-        // or can be a directly scheduled handler rather than an exchange worker.
-        // Preserve the ordinary phase-end drain for output from those cases.
+        // Phase-end draining publishes output from handlers that parked before
+        // their range frontier and from handlers scheduled outside an
+        // exchange-worker range.
         flushReturnedBuffers();
         schedulerEgressTasks += drainReadyTaskSnapshot(egressReadyTasks);
     }
@@ -751,11 +910,11 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     }
 
     /**
-     * Direct downstream handoff from a mounted exchange worker. EgressTask is
-     * an owner-internal marker (ConnectionWriter in production), so this path
-     * prepares SQEs and wakes framework waiters but cannot invoke a route.
-     * Publication through io_uring_enter remains at the normal epoch boundary,
-     * except for the existing SQ-full reserve path.
+     * Publishes downstream work from a mounted exchange worker. {@link EgressTask}
+     * is owner-internal, so draining it prepares SQEs and wakes framework waiters
+     * without invoking a route. {@code io_uring_enter} publishes the prepared
+     * SQEs at the epoch boundary; SQ exhaustion may publish them earlier to
+     * obtain capacity.
      */
     void handlerRangeBoundary() {
         if (!inCarrierDomain()) {
@@ -826,11 +985,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     }
 
     /**
-     * Natural epoch safe-point used before an owner-domain consumer moves to
-     * another receiver-owned chunk. It has no time or request-count policy:
-     * it yields only when another scheduler, kernel, submission,
-     * buffer-return, or deferred-exchange source already needs the fused
-     * carrier.
+     * Yields at a receive-chunk boundary when scheduler, kernel, submission,
+     * buffer-return, or deferred-exchange work is ready on the fused carrier.
      */
     void inboundChunkBoundary() {
         if (!inCarrierDomain()) {
@@ -943,9 +1099,9 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     }
 
     /**
-     * Consumes exactly the CQ interval captured at epoch entry. Publish each
-     * consumed head before invoking Java code so an unbounded snapshot cannot
-     * keep a full CQ artificially occupied while a callback submits more I/O.
+     * Consumes the CQ interval captured at epoch entry and publishes each
+     * advanced head before invoking Java callbacks, preserving CQ capacity
+     * while callbacks submit more I/O.
      */
     private int reapCompletionEpochSnapshot(int head, int snapshotTail) {
         if (head == snapshotTail) {
@@ -1572,7 +1728,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         return slot;
     }
 
-    /** Benchmark-only baseline retaining the old synchronous update path. */
+    /** Installs a descriptor synchronously with {@code io_uring_register}. */
     int registerFixedFdLegacy(int clientFd) {
         if (!useFixedFiles) {
             throw new IllegalStateException(
@@ -2075,32 +2231,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     }
 
     public int acquireEgressBuffer() {
-        assert inCarrierDomain()
-            : "Egress buffers must be acquired in their carrier domain";
-        if (EgressBufferPool.STATS_ENABLED && !inCarrierDomain()) {
-            egressBufferPool.externalAcquire();
-        }
-        int bufferId = -1;
-        boolean refill = false;
-        int publication = beginEgressBufferMutation();
-        try {
-            if (freeEgressCount != 0) {
-                bufferId = acquireLocalEgressBuffer();
-            } else {
-                if (EgressBufferPool.STATS_ENABLED) {
-                    egressRefillMisses++;
-                }
-                if (!egressTransferInProgress) {
-                    egressTransferInProgress = true;
-                    refill = true;
-                }
-            }
-        } finally {
-            endEgressBufferMutation(publication);
-        }
-        if (refill) {
-            bufferId = refillAndAcquireEgressBuffer();
-        }
+        int bufferId = privateEgressIds.poll();
         if (Http2ResourceStats.ENABLED) {
             if (bufferId >= 0) {
                 Http2ResourceStats.egressBufferAcquired();
@@ -2113,67 +2244,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
     public void releaseEgressBuffer(int bufferId) {
         if (bufferId >= 0) {
-            assert inCarrierDomain()
-                : "Egress buffers must be released in their carrier domain";
-            if (EgressBufferPool.STATS_ENABLED && !inCarrierDomain()) {
-                egressBufferPool.externalRelease();
-            }
-            boolean spillBatch = false;
-            boolean spillOne = false;
-            int publication = beginEgressBufferMutation();
-            try {
-                if (activeEgressBuffers <= 0) {
-                    throw new IllegalStateException(
-                        "Egress buffer released without a live lease");
-                }
-                if (freeEgressCount == EGRESS_LOCAL_CAPACITY) {
-                    if (egressTransferInProgress) {
-                        spillOne = true;
-                    } else {
-                        int first = freeEgressCount
-                            - EGRESS_SPILL_BATCH;
-                        System.arraycopy(
-                            freeEgressIds,
-                            first,
-                            transferEgressIds,
-                            0,
-                            EGRESS_SPILL_BATCH);
-                        freeEgressCount = first;
-                        egressTransferInProgress = true;
-                        spillBatch = true;
-                    }
-                    if (EgressBufferPool.STATS_ENABLED) {
-                        egressSpills++;
-                        egressSpilledBuffers += spillOne
-                            ? 1 : EGRESS_SPILL_BATCH;
-                    }
-                }
-                if (!spillOne) {
-                    freeEgressIds[freeEgressCount++] = bufferId;
-                }
-                activeEgressBuffers--;
-                if (EgressBufferPool.STATS_ENABLED) {
-                    egressReleases++;
-                    egressBufferPool.leaseReleased();
-                }
-            } finally {
-                endEgressBufferMutation(publication);
-            }
-            if (spillBatch) {
-                try {
-                    egressBufferPool.spill(
-                        transferEgressIds, 0, EGRESS_SPILL_BATCH);
-                } finally {
-                    publication = beginEgressBufferMutation();
-                    try {
-                        egressTransferInProgress = false;
-                    } finally {
-                        endEgressBufferMutation(publication);
-                    }
-                }
-            } else if (spillOne) {
-                egressBufferPool.spill(bufferId);
-            }
+            privateEgressIds.offer(bufferId);
             if (Http2ResourceStats.ENABLED) {
                 Http2ResourceStats.egressBufferReleased();
             }
@@ -2181,7 +2252,11 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     }
 
     public MemorySegment getEgressBufferSegment(int bufferId) {
-        return egressBufferPool.segment(bufferId);
+        if (bufferId < 0 || bufferId >= numPrivateEgressBuffers) {
+            throw new IllegalArgumentException(
+                "Invalid egress bufferId: " + bufferId);
+        }
+        return privateEgressBufferSegments[bufferId];
     }
 
     private int refillAndAcquireEgressBuffer() {
@@ -2574,6 +2649,10 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
     boolean inCarrierDomain() {
         return carrierDomain.containsCurrentThread();
+    }
+
+    boolean usesEpochScheduler() {
+        return schedulerMode == SchedulerMode.EPOCH;
     }
 
     long schedulerEpoch() {

@@ -10,10 +10,9 @@ public final class RawSegment {
     /**
      * A process-wide, zero-based view of the native address space.
      *
-     * <p>Hot native-memory loops can use an absolute address as the offset
-     * into this constant segment. That gives C2 a constant segment base,
-     * size, and global scope instead of constructing a differently based
-     * segment for every buffer.</p>
+     * <p>Hot native-memory loops use absolute addresses as offsets into this
+     * segment, giving C2 a constant base, size, and global scope for every
+     * buffer access.</p>
      */
     public static final MemorySegment ADDRESS_SPACE =
         MemorySegment.ofAddress(0).reinterpret(Long.MAX_VALUE);

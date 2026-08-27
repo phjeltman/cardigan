@@ -625,9 +625,8 @@ public final class Stage1Indexer {
         firstControlBits |= scannedVectorControlBits << 32;
         firstNonAsciiBits |= scannedVectorNonAsciiBits << 32;
 
-        // Commit block one before loading block two. Besides shortening the
-        // live ranges of six masks, this lets C2 keep the two classification
-        // groups independent instead of spilling block one around block two.
+        // Commit block one before loading block two, shortening six mask live
+        // ranges and letting C2 compile the classification groups independently.
         pairFirstQuoteBits = firstQuoteBits;
         pairFirstBackslashBits = firstBackslashBits;
         pairFirstOperatorBits = firstOperatorBits;

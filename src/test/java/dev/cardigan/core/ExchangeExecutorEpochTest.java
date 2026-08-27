@@ -19,7 +19,8 @@ class ExchangeExecutorEpochTest {
     void offerFromRunningHandlerExecutesInLaterSchedulerEpoch()
             throws Exception {
         try (UringEventLoop loop = new UringEventLoop(
-                0, 64, 512, false)) {
+                0, 64, 512, false,
+                UringEventLoop.SchedulerMode.EPOCH)) {
             ExchangeExecutor executor = loop.exchangeExecutor();
             CompletableFuture<Long> firstEpoch = new CompletableFuture<>();
             CompletableFuture<Long> deferredEpoch = new CompletableFuture<>();

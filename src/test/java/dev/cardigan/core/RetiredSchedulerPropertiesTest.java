@@ -25,8 +25,7 @@ final class RetiredSchedulerPropertiesTest {
         "cardigan.scheduler.egressTasksPerTurn",
         "cardigan.scheduler.externalTasksPerTurn",
         "cardigan.scheduler.protocolQuantumMicros",
-        "cardigan.scheduler.protocolCheckpointInterval",
-        "cardigan.exchange.max.batch"
+        "cardigan.scheduler.protocolCheckpointInterval"
     );
 
     @Test

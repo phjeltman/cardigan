@@ -32,9 +32,8 @@ public final class HpackFields {
     private static final int VALUE_LENGTH = 4;
 
     /**
-     * Field metadata is consumed together by both the decoder and request
-     * parser, so keep one field's five integers adjacent instead of touching
-     * five independently allocated array cache lines.
+     * Stores each field's five metadata integers contiguously for decoder and
+     * parser locality.
      */
     private final int[] metadata;
     private final int maximumFields;

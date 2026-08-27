@@ -38,6 +38,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
     private final int fixedSlot;
     private final TlsConnection tls;
     private final boolean directKtlsSend;
+    private final boolean completionSendChaining;
 
     private int[] bufferIds;
     private long[] addresses;
@@ -63,16 +64,23 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
     private Runnable drainHandoff;
 
     ConnectionWriter(UringEventLoop loop, int clientFd, int fixedSlot) {
-        this(loop, clientFd, fixedSlot, null);
+        this(loop, clientFd, fixedSlot, null, false);
     }
 
     ConnectionWriter(UringEventLoop loop, int clientFd, int fixedSlot,
                      TlsConnection tls) {
+        this(loop, clientFd, fixedSlot, tls, false);
+    }
+
+    private ConnectionWriter(UringEventLoop loop, int clientFd, int fixedSlot,
+                             TlsConnection tls,
+                             boolean completionSendChaining) {
         this.loop = loop;
         this.clientFd = clientFd;
         this.fixedSlot = fixedSlot;
         this.tls = tls;
         this.directKtlsSend = tls != null && tls.directKtlsSend();
+        this.completionSendChaining = completionSendChaining;
     }
 
     UringEventLoop eventLoop() {
@@ -139,10 +147,10 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
             }
         }
         if (waited && failure == 0 && drainWaiterCount != 0) {
-            // The resumed producer normally queues another burst, whose send
-            // completion advances the FIFO. If cancellation makes it return
-            // without writing, this deferred check hands the idle writer to
-            // the next producer instead of stranding the queue.
+            // A resumed producer normally queues a burst whose completion
+            // advances the FIFO. If cancellation returns without writing,
+            // this deferred check transfers the idle writer to the next
+            // producer.
             Runnable handoff = drainHandoff;
             if (handoff == null) {
                 drainHandoff = handoff = this::signalIfDrained;
@@ -196,7 +204,13 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         }
 
         if (queueSize != 0) {
-            if (!startScheduled) {
+            if (completionSendChaining) {
+                // Queued buffers predate this completion and belong to the
+                // same causal egress range. Prepare the successor SQE
+                // immediately; it is published at the epoch boundary, keeping
+                // the connection's single-send pipeline full.
+                startNextSend();
+            } else if (!startScheduled) {
                 startScheduled = true;
                 loop.executeEgress(this);
             }
@@ -549,5 +563,10 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
 
     private void setPendingFrames(int value) {
         PENDING_FRAMES.setRelease(this, value);
+    }
+
+    static ConnectionWriter forHttp2(UringEventLoop loop, int clientFd,
+                                     int fixedSlot, TlsConnection tls) {
+        return new ConnectionWriter(loop, clientFd, fixedSlot, tls, true);
     }
 }

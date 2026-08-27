@@ -258,8 +258,8 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
     private InboundChunk takeHandoff() {
         InboundChunk chunk = handoffChunk();
         if (chunk != null) {
-            // The same owner-carrier serialization makes this split consume
-            // safe; acquire still pairs with the CQ callback's release store.
+            // Owner-carrier serialization guarantees a single consumer here;
+            // the acquire read pairs with the CQ callback's release store.
             HANDOFF_CHUNK.setRelease(this, null);
         }
         return chunk;
@@ -291,9 +291,8 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
         }
         long token = loop.recvMultishot(clientFd, UringEventLoop.BUF_GROUP, fixedSlot, this);
         if (token < 0) {
-            // Submission-resource exhaustion is not evidence of a missing
-            // kernel feature. Reject this connection instead of changing its
-            // I/O model underneath the handler.
+            // Submission-resource exhaustion rejects this connection while
+            // preserving the configured multishot receive model.
             failed = true;
             signalReceiveWaiter();
             return;

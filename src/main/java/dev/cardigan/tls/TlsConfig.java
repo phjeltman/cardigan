@@ -40,8 +40,8 @@ public record TlsConfig(
 
     /**
      * Returns the system-property configuration, or {@code null} when TLS is
-     * not configured. Supplying only one path is treated as a configuration
-     * error rather than silently starting a plaintext listener.
+     * not configured. Supplying exactly one path is a configuration error and
+     * prevents a plaintext listener from starting.
      */
     public static TlsConfig fromSystemProperties() {
         String certificate = System.getProperty(CERTIFICATE_PROPERTY, "").trim();

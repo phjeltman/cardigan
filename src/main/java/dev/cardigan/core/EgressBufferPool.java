@@ -14,7 +14,7 @@ final class EgressBufferPool implements AutoCloseable {
         Boolean.getBoolean("cardigan.egress.pool.stats");
     private static final int DEFAULT_CHUNK_BUFFERS = 256;
     private static final int MINIMUM_DEFAULT_BUFFERS = 4096;
-    private static final int DEFAULT_BUFFERS_PER_LOOP = 256;
+    private static final int DEFAULT_BUFFERS_PER_LOOP = 1024;
 
     private final Arena arena = Arena.ofShared();
     private final int bufferSize;
