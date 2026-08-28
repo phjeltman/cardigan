@@ -3,7 +3,7 @@
 This directory is a submission tree ready to be copied directly under
 HttpArena's `frameworks/` directory. Its canonical `cardigan` directory is an
 independent Maven application pinned to the public
-`dev.cardigan:cardigan:0.1.0-alpha3` artifact. Cardigan itself owns no
+`dev.cardigan:cardigan:0.1.0-alpha.3` artifact. Cardigan itself owns no
 HttpArena routes or dataset assumptions; this application supplies only the
 arena routes and selects its listener protocol through `ProtocolMode`.
 
@@ -23,7 +23,7 @@ mvn -q -f dev/httparena/cardigan/pom.xml test
 
 The submission exposes the profiles that fit Cardigan's current transport
 model as seven independent framework variants. They deliberately share the
-display name `Cardigan`, while each container starts exactly one listener and
+display name `cardigan`, while each container starts exactly one listener and
 therefore does not spend benchmark CPUs or memory on unrelated protocols.
 
 | Variant | Listener | Profiles |
@@ -70,7 +70,7 @@ do
 done
 ```
 
-The variants share the display name `Cardigan`; HttpArena groups their
+The variants share the display name `cardigan`; HttpArena groups their
 non-overlapping results into one leaderboard and composite-score entry.
 
 Cardigan requires the three io_uring system calls that Docker's default

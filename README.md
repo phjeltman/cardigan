@@ -29,7 +29,7 @@ correctness, resource bounds, and performance.
 <dependency>
     <groupId>dev.cardigan</groupId>
     <artifactId>cardigan</artifactId>
-    <version>0.1.0-alpha3</version>
+    <version>0.1.0-alpha.3</version>
 </dependency>
 ```
 
