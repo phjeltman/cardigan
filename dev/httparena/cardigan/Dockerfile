@@ -31,8 +31,6 @@ ENTRYPOINT ["java", \
     "-Xms512m", "-Xmx2g", \
     "-XX:MaxInlineSize=150", \
     "-XX:FreqInlineSize=600", \
-    "-Djdk.readPollers=1", \
-    "-Djdk.writePollers=1", \
     "-Dcardigan.tls.handshake.max.pending.per.loop=256", \
     "-cp", "/app/cardigan-httparena.jar:/app/lib/*", \
     "dev.cardigan.httparena.HttpArenaMain"]
