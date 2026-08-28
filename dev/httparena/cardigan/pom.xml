@@ -15,7 +15,6 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.deploy.skip>true</maven.deploy.skip>
         <cardigan.version>0.1.0-alpha.3</cardigan.version>
-        <pg-java.version>0.1.0-SNAPSHOT</pg-java.version>
         <junit.jupiter.version>5.11.0</junit.jupiter.version>
     </properties>
 
@@ -24,11 +23,6 @@
             <groupId>dev.cardigan</groupId>
             <artifactId>cardigan</artifactId>
             <version>${cardigan.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>org.postgresql</groupId>
-            <artifactId>postgresql-client</artifactId>
-            <version>${pg-java.version}</version>
         </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
