@@ -101,16 +101,16 @@ public final class HttpArenaMain {
                         server.close();
                         if (plaintext != null) plaintext.close();
                     }));
+            server.start();
+            System.out.println(
+                "Cardigan HttpArena mode " + mode
+                    + " is listening on " + port);
             if (plaintext != null) {
                 plaintext.start();
                 System.out.println(
                     "Cardigan HttpArena baseline readiness is listening"
                         + " on 8080");
             }
-            server.start();
-            System.out.println(
-                "Cardigan HttpArena mode " + mode
-                    + " is listening on " + port);
             Thread.currentThread().join();
         }
     }
