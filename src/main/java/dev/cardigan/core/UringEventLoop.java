@@ -416,6 +416,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             boolean ownsEgressBufferPool,
             SchedulerMode schedulerMode) {
         validateSchedulerConfiguration();
+        JdkSocketPollerBootstrap.initialize();
         this.cpuId = cpuId;
         this.schedulerMode = Objects.requireNonNull(
             schedulerMode, "schedulerMode");
@@ -474,7 +475,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             this.returnedKtlsBufferIds = null;
         }
 
-        this.numPrivateEgressBuffers = Math.max(this.numBuffers, 4096);
+        this.numPrivateEgressBuffers =
+            configuredEgressBuffersPerLoop(this.numBuffers);
         this.privateEgressBufferRing = arena.allocate(
             (long) this.numPrivateEgressBuffers * EGRESS_FRAME_SIZE);
         this.privateEgressBufferSegments =
@@ -2675,6 +2677,18 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                 1_024
             )
         );
+    }
+
+    static int configuredEgressBuffersPerLoop(int minimumCapacity) {
+        int configured = Integer.getInteger(
+            "cardigan.egress.buffers.per.loop", 4096);
+        if (configured < 128 || configured > 32_768
+                || Integer.bitCount(configured) != 1) {
+            throw new IllegalArgumentException(
+                "cardigan.egress.buffers.per.loop must be a power of two "
+                    + "between 128 and 32768");
+        }
+        return Math.max(configured, minimumCapacity);
     }
 
     static int configuredTaskCapacity(int entries) {
