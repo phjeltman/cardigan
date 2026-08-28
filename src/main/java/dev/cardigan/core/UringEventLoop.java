@@ -416,6 +416,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             boolean ownsEgressBufferPool,
             SchedulerMode schedulerMode) {
         validateSchedulerConfiguration();
+        JdkSocketPollerBootstrap.initialize();
         this.cpuId = cpuId;
         this.schedulerMode = Objects.requireNonNull(
             schedulerMode, "schedulerMode");
