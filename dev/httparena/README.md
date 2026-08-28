@@ -45,7 +45,8 @@ JSON responses are generated per request from immutable dataset item fragments;
 only the source data is preloaded. The database variant reads `DATABASE_URL`
 and sizes its lazy connection pool from `DATABASE_MAX_CONN`. Every pg-java
 connection owns one server-prepared range query, and completed rows are
-encoded through `EncodedBody` directly into Cardigan's response storage.
+encoded once as final UTF-8 JSON before `EncodedBody` copies that representation
+into Cardigan's response storage.
 The gRPC variants implement the canonical
 `benchmark.BenchmarkService` wire contract directly: requests are decoded from
 their protobuf envelope and replies are streamed into Cardigan's HTTP/2 egress

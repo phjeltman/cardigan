@@ -30,6 +30,7 @@ class HttpRequestDetachTest {
             assertTrue(HttpRequestParser.parse(segment, bytes.length, source));
 
             HttpRequest detached = source.detachedCopy();
+            assertEquals(3, detached.picoRequest().headers.length);
             source.init(MemorySegment.ofArray("GET / HTTP/1.0\r\n\r\n".getBytes(StandardCharsets.US_ASCII)));
 
             assertEquals("POST", detached.method().toString());
@@ -58,12 +59,28 @@ class HttpRequestDetachTest {
 
         HttpRequest detached = source.detachedCopy();
 
+        assertEquals(1, detached.picoRequest().headers.length);
         assertEquals(2, detached.version());
         assertEquals("GET", detached.method().toString());
         assertEquals("/users/423", detached.path().toString());
         assertEquals("value", detached.getHeader("x-test").toString());
         assertEquals("body", detached.body().toString());
         assertTrue(detached.isKeepAlive());
+    }
+
+    @Test
+    void detachesARequestWithoutAllocatingUnusedHeaderSlots() {
+        byte[] bytes = "GET / HTTP/1.0\r\n\r\n"
+            .getBytes(StandardCharsets.US_ASCII);
+        HttpRequest source = new HttpRequest();
+        assertTrue(HttpRequestParser.parse(
+            MemorySegment.ofArray(bytes), bytes.length, source));
+
+        HttpRequest detached = source.detachedCopy();
+
+        assertEquals(0, detached.picoRequest().headers.length);
+        assertEquals("GET", detached.method().toString());
+        assertEquals("/", detached.path().toString());
     }
 
     @Test

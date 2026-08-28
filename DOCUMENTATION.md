@@ -139,6 +139,7 @@ they are not dynamically reloadable. Defaults remain experimental.
 | `cardigan.http2.max.streaming.bodies.per.connection` | 16 | Streaming request bodies per connection |
 | `cardigan.http2.max.streaming.buffer.bytes` | 256 MiB | Process-wide streaming-buffer budget |
 | `cardigan.ingress.buffers.per.loop` | 128 | 16 KiB provided receive buffers per event loop; power of two |
+| `cardigan.egress.buffers.per.loop` | 4096 | Private 16 KiB response buffers per event loop; power of two from 128 to 32768 and never below ingress capacity |
 | `cardigan.egress.buffers.max` | max(4096, 256 x event loops) | Process-wide lazily allocated egress-buffer limit |
 | `cardigan.egress.pool.stats` | `false` | Report shared egress-pool occupancy and batch counters |
 | `cardigan.fixed.files.mode` | `auto` | `auto`, `legacy`, `async-explicit`, `async-alloc`, or `direct`; auto uses direct plaintext accept and async allocation for TLS |

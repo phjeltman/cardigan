@@ -9,13 +9,14 @@ import dev.cardigan.pico.Request;
 import dev.cardigan.ffi.RawSegment;
 
 public class HttpRequest {
+    private static final int DEFAULT_MAX_HEADERS = 64;
     private static final long QUESTION_MARKS = 0x3f3f_3f3f_3f3f_3f3fL;
     private static final long BYTE_ONES = 0x0101_0101_0101_0101L;
     private static final long BYTE_HIGH_BITS = 0x8080_8080_8080_8080L;
     private MemorySegment segment;
     private long address;
     private long messageOffset;
-    private final Request picoRequest = new Request(64);
+    private final Request picoRequest;
     private final long[] segPacked = new long[16];
 
     private long bodyOffset;
@@ -26,6 +27,14 @@ public class HttpRequest {
     private boolean routeResolved;
 
     private int keepAliveState = -1;
+
+    public HttpRequest() {
+        this(DEFAULT_MAX_HEADERS);
+    }
+
+    private HttpRequest(int maxHeaders) {
+        this.picoRequest = new Request(maxHeaders);
+    }
 
     public void init(MemorySegment segment) {
         init(segment, 0);
@@ -369,7 +378,7 @@ public class HttpRequest {
         MemorySegment.copy(
             segment, messageOffset, detachedSegment, 0, requestLength);
 
-        HttpRequest detached = new HttpRequest();
+        HttpRequest detached = new HttpRequest(picoRequest.numHeaders);
         detached.segment = detachedSegment;
         detached.address = detachedSegment.address();
         detached.messageOffset = messageOffset;

@@ -46,6 +46,44 @@ class HttpArenaDatabaseResultTest {
             encode(HttpArenaDatabaseResult.empty()));
     }
 
+    @Test
+    void escapesEveryJsonControlAndMalformedSurrogates() {
+        HttpArenaDatabaseResult result = HttpArenaDatabaseResult.of(List.of(
+            new HttpArenaDatabaseResult.ItemData(
+                Integer.MIN_VALUE,
+                "\u0000\b\f\n\r\t\\\"\ud800",
+                "emoji 😀", Integer.MAX_VALUE, -1, true,
+                "[\"café\",\"😀\"]", -2, Integer.MIN_VALUE)
+        ));
+
+        assertEquals(
+            "{\"items\":[{\"id\":-2147483648,"
+                + "\"name\":\"\\u0000\\b\\f\\n\\r\\t\\\\\\\"?\","
+                + "\"category\":\"emoji 😀\",\"price\":2147483647,"
+                + "\"quantity\":-1,\"active\":true,"
+                + "\"tags\":[\"café\",\"😀\"],"
+                + "\"rating\":{\"score\":-2,\"count\":-2147483648}}],"
+                + "\"count\":1}",
+            encode(result));
+    }
+
+    @Test
+    void growsPastTheInitialBufferWithoutChangingUtf8() {
+        String name = "café 😀 ".repeat(800);
+        HttpArenaDatabaseResult result = HttpArenaDatabaseResult.of(List.of(
+            new HttpArenaDatabaseResult.ItemData(
+                1, name, "large", 2, 3, false,
+                "[]", 4, 5)
+        ));
+
+        assertEquals(
+            "{\"items\":[{\"id\":1,\"name\":\"" + name
+                + "\",\"category\":\"large\",\"price\":2,"
+                + "\"quantity\":3,\"active\":false,\"tags\":[],"
+                + "\"rating\":{\"score\":4,\"count\":5}}],\"count\":1}",
+            encode(result));
+    }
+
     private static String encode(HttpArenaDatabaseResult result) {
         EncodedBody body = result.encodedBody();
         try (Arena arena = Arena.ofConfined()) {
