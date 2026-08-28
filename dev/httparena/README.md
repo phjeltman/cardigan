@@ -28,13 +28,13 @@ therefore does not spend benchmark CPUs or memory on unrelated protocols.
 
 | Variant | Listener | Profiles |
 | --- | --- | --- |
-| `cardigan` | HTTP/1.1 `:8080` | baseline, pipelined, limited-conn |
+| `cardigan` | HTTP/1.1 `:8080` | baseline, latency-1m, pipelined, limited-conn |
 | `cardigan-db` | HTTP/1.1 `:8080` | async-db |
 | `cardigan-json-tls` | HTTP/1.1 + TLS `:8081` | json-tls |
 | `cardigan-h2` | HTTP/2 + TLS `:8443` | baseline-h2, static-h2 |
 | `cardigan-h2c` | prior-knowledge h2c `:8082` | baseline-h2c |
-| `cardigan-grpc` | prior-knowledge h2c `:8080` | unary-grpc, stream-grpc |
-| `cardigan-grpc-tls` | HTTP/2 + TLS `:8443` | unary-grpc-tls, stream-grpc-tls |
+| `cardigan-grpc` | prior-knowledge h2c `:8080` | unary-grpc |
+| `cardigan-grpc-tls` | HTTP/2 + TLS `:8443` | unary-grpc-tls |
 
 The launcher consumes HttpArena's standard read-only mounts:
 `/data/dataset.json`, `/data/static`, and `/certs/server.{crt,key}`. Static
