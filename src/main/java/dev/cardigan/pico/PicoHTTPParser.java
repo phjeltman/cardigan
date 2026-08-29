@@ -43,26 +43,21 @@ public class PicoHTTPParser {
     private static final ValueLayout.OfInt JAVA_INT_UNALIGNED_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
     private static final ValueLayout.OfLong JAVA_LONG_UNALIGNED_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
-    private static final VectorSpecies<Byte> SPECIES = ByteVector.SPECIES_128;
+    private static final VectorSpecies<Byte> RANGE_SPECIES =
+        ByteVector.SPECIES_256;
+    private static final VectorSpecies<Byte> TOKEN_SPECIES =
+        ByteVector.SPECIES_128;
+    private static final int RANGE_VECTOR_WIDTH = RANGE_SPECIES.length();
+    private static final int TOKEN_VECTOR_WIDTH = TOKEN_SPECIES.length();
 
     // SIMD Nibble Shuffle Lookup Tables (vpshufb via selectFrom)
-    private static final byte[] R1_LOW = { (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x02, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x07 };
-    private static final byte[] R1_HIGH = { (byte) 0x01, (byte) 0x02, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x04, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00 };
-
-    private static final byte[] R2_LOW = { (byte) 0x03, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x05 };
-    private static final byte[] R2_HIGH = { (byte) 0x01, (byte) 0x01, (byte) 0x02, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x04, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00 };
-
     private static final byte[] RT_LOW = { (byte) 0x0b, (byte) 0x01, (byte) 0x03, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x03, (byte) 0x03, (byte) 0x05, (byte) 0x35, (byte) 0x17, (byte) 0x35, (byte) 0x05, (byte) 0x27 };
     private static final byte[] RT_HIGH = { (byte) 0x01, (byte) 0x01, (byte) 0x02, (byte) 0x04, (byte) 0x08, (byte) 0x10, (byte) 0x00, (byte) 0x20, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01 };
 
-    private static final ByteVector V_R1_LOW = ByteVector.fromArray(SPECIES, R1_LOW, 0);
-    private static final ByteVector V_R1_HIGH = ByteVector.fromArray(SPECIES, R1_HIGH, 0);
-
-    private static final ByteVector V_R2_LOW = ByteVector.fromArray(SPECIES, R2_LOW, 0);
-    private static final ByteVector V_R2_HIGH = ByteVector.fromArray(SPECIES, R2_HIGH, 0);
-
-    private static final ByteVector V_RT_LOW = ByteVector.fromArray(SPECIES, RT_LOW, 0);
-    private static final ByteVector V_RT_HIGH = ByteVector.fromArray(SPECIES, RT_HIGH, 0);
+    private static final ByteVector V_RT_LOW =
+        ByteVector.fromArray(TOKEN_SPECIES, RT_LOW, 0);
+    private static final ByteVector V_RT_HIGH =
+        ByteVector.fromArray(TOKEN_SPECIES, RT_HIGH, 0);
 
     private static final boolean[] TOKEN_CHAR_MAP = new boolean[256];
     static {
@@ -96,19 +91,16 @@ public class PicoHTTPParser {
                                                long offset, long limit) {
         long i = offset;
         long len = limit - offset;
-        if (len >= 16) {
-            long left = len & ~15;
+        if (len >= RANGE_VECTOR_WIDTH) {
+            long left = len - len % RANGE_VECTOR_WIDTH;
             long end = offset + left;
-            for (; i < end; i += 16) {
+            for (; i < end; i += RANGE_VECTOR_WIDTH) {
                 ByteVector v = ByteVector.fromMemorySegment(
-                    SPECIES, ms, base + i, ByteOrder.nativeOrder());
-                ByteVector lowIdx = v.and((byte) 0x0F);
-                ByteVector highIdx = v.lanewise(VectorOperators.LSHR, 4).and((byte) 0x0F);
-
-                ByteVector lowMask = lowIdx.selectFrom(V_R1_LOW);
-                ByteVector highMask = highIdx.selectFrom(V_R1_HIGH);
-
-                VectorMask<Byte> match = lowMask.and(highMask).compare(VectorOperators.NE, (byte) 0);
+                    RANGE_SPECIES, ms, base + i, ByteOrder.nativeOrder());
+                VectorMask<Byte> match = v.compare(
+                    VectorOperators.ULT, (byte) 0x20).and(
+                        v.compare(VectorOperators.NE, (byte) '\t')).or(
+                            v.compare(VectorOperators.EQ, (byte) 0x7f));
                 if (match.anyTrue()) {
                     return i + match.firstTrue();
                 }
@@ -136,19 +128,15 @@ public class PicoHTTPParser {
                                                long offset, long limit) {
         long i = offset;
         long len = limit - offset;
-        if (len >= 16) {
-            long left = len & ~15;
+        if (len >= RANGE_VECTOR_WIDTH) {
+            long left = len - len % RANGE_VECTOR_WIDTH;
             long end = offset + left;
-            for (; i < end; i += 16) {
+            for (; i < end; i += RANGE_VECTOR_WIDTH) {
                 ByteVector v = ByteVector.fromMemorySegment(
-                    SPECIES, ms, base + i, ByteOrder.nativeOrder());
-                ByteVector lowIdx = v.and((byte) 0x0F);
-                ByteVector highIdx = v.lanewise(VectorOperators.LSHR, 4).and((byte) 0x0F);
-
-                ByteVector lowMask = lowIdx.selectFrom(V_R2_LOW);
-                ByteVector highMask = highIdx.selectFrom(V_R2_HIGH);
-
-                VectorMask<Byte> match = lowMask.and(highMask).compare(VectorOperators.NE, (byte) 0);
+                    RANGE_SPECIES, ms, base + i, ByteOrder.nativeOrder());
+                VectorMask<Byte> match = v.compare(
+                    VectorOperators.ULE, (byte) 0x20).or(
+                        v.compare(VectorOperators.EQ, (byte) 0x7f));
                 if (match.anyTrue()) {
                     return i + match.firstTrue();
                 }
@@ -172,14 +160,15 @@ public class PicoHTTPParser {
                                             long offset, long limit) {
         long i = offset;
         long len = limit - offset;
-        if (len >= 16) {
-            long left = len & ~15;
+        if (len >= TOKEN_VECTOR_WIDTH) {
+            long left = len - len % TOKEN_VECTOR_WIDTH;
             long end = offset + left;
-            for (; i < end; i += 16) {
+            for (; i < end; i += TOKEN_VECTOR_WIDTH) {
                 ByteVector v = ByteVector.fromMemorySegment(
-                    SPECIES, ms, base + i, ByteOrder.nativeOrder());
+                    TOKEN_SPECIES, ms, base + i, ByteOrder.nativeOrder());
                 ByteVector lowIdx = v.and((byte) 0x0F);
-                ByteVector highIdx = v.lanewise(VectorOperators.LSHR, 4).and((byte) 0x0F);
+                ByteVector highIdx = v.lanewise(VectorOperators.LSHR, 4)
+                    .and((byte) 0x0F);
 
                 ByteVector lowMask = lowIdx.selectFrom(V_RT_LOW);
                 ByteVector highMask = highIdx.selectFrom(V_RT_HIGH);
