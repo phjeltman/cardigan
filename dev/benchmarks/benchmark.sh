@@ -18,6 +18,7 @@ OPTIMIZATION_JSON_FIELDS_ONLY=false
 OPTIMIZATION_JSON_WRITER_ONLY=false
 OPTIMIZATION_QUADRATIC_ONLY=false
 OPTIMIZATION_SCHEDULER_ONLY=false
+OPTIMIZATION_REQUEST_STORAGE_ONLY=false
 CHUNKED_UPLOAD=false
 CHUNK_SIZES="64,1024,16384"
 CHUNK_SIZE=""
@@ -139,6 +140,8 @@ Options:
                              Benchmark record JSON writing and materialization
   --optimization-quadratic  Benchmark collection and helper API scaling
   --optimization-scheduler  Benchmark external-ready queue snapshot draining
+  --optimization-request-storage
+                             Benchmark request-aware handler storage
   --jvmti                    Build with debug symbols and load perf-jvmti
   -h, --help                 Show this help
 
@@ -168,6 +171,7 @@ Examples:
   ./dev/benchmarks/benchmark.sh --optimization-json-writer
   ./dev/benchmarks/benchmark.sh --optimization-quadratic
   ./dev/benchmarks/benchmark.sh --optimization-scheduler
+  ./dev/benchmarks/benchmark.sh --optimization-request-storage
 EOF
 }
 
@@ -248,6 +252,12 @@ while [ "$#" -gt 0 ]; do
             RUN_MICROBENCHMARKS=true
             MICRO_ONLY=true
             OPTIMIZATION_SCHEDULER_ONLY=true
+            shift
+            ;;
+        --optimization-request-storage)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_REQUEST_STORAGE_ONLY=true
             shift
             ;;
         --scheduler-stats)
@@ -1037,6 +1047,8 @@ if [ "$RUN_MICROBENCHMARKS" = true ]; then
         MICROBENCHMARK_ARGS+=(--optimization-quadratic)
     elif [ "$OPTIMIZATION_SCHEDULER_ONLY" = true ]; then
         MICROBENCHMARK_ARGS+=(--optimization-scheduler)
+    elif [ "$OPTIMIZATION_REQUEST_STORAGE_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-request-storage)
     elif [ "$HPACK_HUFFMAN_ONLY" = true ]; then
         MICROBENCHMARK_ARGS+=(--hpack-huffman)
     elif [ "$HTTP2_RESPONSE_ONLY" = true ]; then

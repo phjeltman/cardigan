@@ -1323,8 +1323,20 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                             exchangeSequencer.beginDrain();
                         }
                     }
+                    AutoCloseable requestStorage = null;
+                    if (jumboArena != null) {
+                        requestStorage = jumboArena;
+                        jumboArena = null;
+                    } else if (leftover == 0) {
+                        requestStorage = currentChunk;
+                        currentChunk = null;
+                        currentBuf = null;
+                    }
                     sentOk = exchangeSequencer.submit(
-                        router, request, requestKeepAlive);
+                        router,
+                        request,
+                        requestKeepAlive,
+                        requestStorage);
                 } else if (exchangeSequencer != null
                     && exchangeSequencer.hasInFlight()) {
                     PreparedInvocation invocation = router.prepare(request);
@@ -1347,7 +1359,9 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     readOffset = 0;
                     requestOffset = 0;
                 } else if (leftover == 0) {
-                    currentChunk.close();
+                    if (currentChunk != null) {
+                        currentChunk.close();
+                    }
                     currentChunk = null;
                     currentBuf = null;
                     readOffset = 0;

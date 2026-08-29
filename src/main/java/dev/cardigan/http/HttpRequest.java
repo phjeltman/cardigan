@@ -348,6 +348,12 @@ public class HttpRequest {
     }
 
     HttpRequest detachedCopy() {
+        long requestLength = detachedLength();
+        MemorySegment detachedSegment = Arena.ofAuto().allocate(requestLength);
+        return detachedCopyInto(null, detachedSegment, requestLength);
+    }
+
+    long detachedLength() {
         long requestEnd = bodyOffset + bodyLength;
         requestEnd = Math.max(
             requestEnd,
@@ -373,14 +379,45 @@ public class HttpRequest {
                 picoRequest.headers[i].valueOffset + picoRequest.headers[i].valueLen
             );
         }
-        long requestLength = requestEnd - messageOffset;
-        MemorySegment detachedSegment = Arena.ofAuto().allocate(requestLength);
+        return requestEnd - messageOffset;
+    }
+
+    HttpRequest detachedCopyInto(
+            HttpRequest reusable, MemorySegment detachedSegment) {
+        long requestLength = detachedLength();
+        if (detachedSegment.byteSize() < requestLength) {
+            throw new IllegalArgumentException(
+                "Detached request storage is too small");
+        }
+        return detachedCopyInto(reusable, detachedSegment, requestLength);
+    }
+
+    private HttpRequest detachedCopyInto(
+            HttpRequest reusable,
+            MemorySegment detachedSegment,
+            long requestLength) {
         MemorySegment.copy(
             segment, messageOffset, detachedSegment, 0, requestLength);
 
-        HttpRequest detached = new HttpRequest(picoRequest.numHeaders);
-        detached.segment = detachedSegment;
-        detached.address = detachedSegment.address();
+        HttpRequest detached = copyViewInto(reusable, detachedSegment);
+        detached.rebase(-messageOffset);
+        return detached;
+    }
+
+    HttpRequest retainedView(HttpRequest reusable) {
+        return copyViewInto(reusable, segment);
+    }
+
+    private HttpRequest copyViewInto(
+            HttpRequest reusable, MemorySegment targetSegment) {
+        HttpRequest detached = reusable;
+        if (detached == null
+                || detached.picoRequest.headers.length
+                    < picoRequest.numHeaders) {
+            detached = new HttpRequest(picoRequest.numHeaders);
+        }
+        detached.segment = targetSegment;
+        detached.address = targetSegment.address();
         detached.messageOffset = messageOffset;
         detached.bodyOffset = bodyOffset;
         detached.bodyLength = bodyLength;
@@ -396,7 +433,6 @@ public class HttpRequest {
         }
         detached.keepAliveState = keepAliveState;
         copyRequestMetadata(picoRequest, detached.picoRequest);
-        detached.rebase(-messageOffset);
         return detached;
     }
 

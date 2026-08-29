@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import dev.cardigan.json.JsonWriter;
 
@@ -201,6 +202,49 @@ public class RouterTest {
                 () -> materializations[0]++);
             assertEquals(1, materializations[0]);
             assertEquals("present", invocation.invoke().body());
+        }
+    }
+
+    @Test
+    void preparedInvocationOwnsTransferredRequestStorageUntilInvoke() {
+        Router router = new Router();
+        router.registerController(new TestController());
+
+        try (Arena arena = Arena.ofConfined()) {
+            HttpRequest requestAware = new HttpRequest();
+            MemorySegment requestSegment = arena.allocateFrom(
+                "GET /request HTTP/1.1\r\nX-Test: retained\r\n\r\n");
+            assertTrue(HttpRequestParser.parse(
+                requestSegment, (int) requestSegment.byteSize() - 1,
+                requestAware));
+            AtomicInteger releases = new AtomicInteger();
+            PreparedInvocation target = new PreparedInvocation();
+
+            PreparedInvocation invocation = router.prepare(
+                requestAware,
+                target,
+                null,
+                releases::incrementAndGet);
+            assertEquals(0, releases.get());
+            requestAware.init(arena.allocateFrom(
+                "GET /reused HTTP/1.1\r\n\r\n"));
+
+            assertEquals("retained", invocation.invoke().body());
+            assertEquals(1, releases.get());
+
+            HttpRequest ordinary = new HttpRequest();
+            MemorySegment ordinarySegment = arena.allocateFrom(
+                "GET /users/427 HTTP/1.1\r\n\r\n");
+            assertTrue(HttpRequestParser.parse(
+                ordinarySegment, (int) ordinarySegment.byteSize() - 1,
+                ordinary));
+            router.prepare(
+                ordinary,
+                target,
+                null,
+                releases::incrementAndGet);
+            assertEquals(2, releases.get(),
+                "routes without request arguments must release immediately");
         }
     }
 

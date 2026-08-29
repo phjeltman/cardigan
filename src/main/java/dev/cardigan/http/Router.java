@@ -535,6 +535,36 @@ public class Router {
 
     public PreparedInvocation prepare(HttpRequest request, PreparedInvocation target,
                                       Runnable requestMaterializer) {
+        return prepare(request, target, requestMaterializer, null);
+    }
+
+    /**
+     * Prepares a request while optionally transferring ownership of the
+     * request's backing storage. Storage not needed by the matched route is
+     * closed before this method returns.
+     */
+    public PreparedInvocation prepare(
+            HttpRequest request,
+            PreparedInvocation target,
+            Runnable requestMaterializer,
+            AutoCloseable requestStorage) {
+        target.beginPreparation();
+        try {
+            return prepareInternal(
+                request, target, requestMaterializer, requestStorage);
+        } finally {
+            if (requestStorage != null
+                    && !target.ownsRequestStorage(requestStorage)) {
+                closeRequestStorage(requestStorage);
+            }
+        }
+    }
+
+    private PreparedInvocation prepareInternal(
+            HttpRequest request,
+            PreparedInvocation target,
+            Runnable requestMaterializer,
+            AutoCloseable requestStorage) {
         Utf8Slice path = request.path();
         if (path == null) {
             return target.setImmediate(Response.notFound(), false);
@@ -570,6 +600,7 @@ public class Router {
                 request,
                 target,
                 requestMaterializer,
+                requestStorage,
                 request.resolvedSegmentCount()
             );
         }
@@ -588,7 +619,7 @@ public class Router {
                     );
                     return prepareMatchedRoute(
                         prefixRoute.route, request, pathLong, target,
-                        requestMaterializer);
+                        requestMaterializer, requestStorage);
                 }
             }
         }
@@ -603,6 +634,7 @@ public class Router {
             request,
             target,
             requestMaterializer,
+            requestStorage,
             request.resolvedSegmentCount()
         );
     }
@@ -612,6 +644,7 @@ public class Router {
         HttpRequest request,
         PreparedInvocation target,
         Runnable requestMaterializer,
+        AutoCloseable requestStorage,
         int segmentCount
     ) {
         try {
@@ -630,7 +663,8 @@ public class Router {
                 }
             }
             return prepareMatchedRoute(
-                route, request, pathLong, target, requestMaterializer);
+                route, request, pathLong, target,
+                requestMaterializer, requestStorage);
         } catch (Throwable t) {
             return target.setImmediate(
                 Response.error("Internal Server Error: " + t.getMessage()),
@@ -641,12 +675,16 @@ public class Router {
 
     private PreparedInvocation prepareMatchedRoute(Route route, HttpRequest request, long pathLong,
                                                     PreparedInvocation target,
-                                                    Runnable requestMaterializer) {
+                                                    Runnable requestMaterializer,
+                                                    AutoCloseable requestStorage) {
         boolean safe = route.methodCode == 1;
         try {
             if (route.handler == null) {
                 materializeRequest(requestMaterializer);
-                return target.setFallback(this, detachRequest(request), safe);
+                return target.setFallback(
+                    this,
+                    target.storeRequest(request, requestStorage, false),
+                    safe);
             }
 
             if (route.longBodyDecoder != null) {
@@ -675,7 +713,8 @@ public class Router {
             HttpRequest handlerRequest = null;
             if (route.requiresRequestStorage) {
                 materializeRequest(requestMaterializer);
-                handlerRequest = detachRequest(request);
+                handlerRequest = target.storeRequest(
+                    request, requestStorage, route.isIsolated);
             }
             return target.setHandler(route.handler, handlerRequest, pathLong, bodyRecord, safe);
         } catch (Throwable t) {
@@ -692,8 +731,12 @@ public class Router {
         }
     }
 
-    private static HttpRequest detachRequest(HttpRequest request) {
-        return request.detachedCopy();
+    private static void closeRequestStorage(AutoCloseable storage) {
+        try {
+            storage.close();
+        } catch (Throwable ignored) {
+            // Request preparation has already produced its result.
+        }
     }
 
     public Response dispatch(HttpRequest request) {

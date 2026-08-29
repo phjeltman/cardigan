@@ -171,6 +171,8 @@ public final class BenchmarkSuite {
                     runQuadraticBehaviorBenchmarks();
                 case "--optimization-scheduler" ->
                     MpscArrayQueueBenchmark.run();
+                case "--optimization-request-storage" ->
+                    RequestStorageBenchmark.run();
                 case "--request-parsers" -> runRequestParserBenchmarks();
                 case "--hpack-huffman" -> HpackHuffmanBenchmark.run();
                 case "--http2-response" -> Http2ResponseBenchmark.run();
@@ -200,6 +202,7 @@ public final class BenchmarkSuite {
                 + "|--optimization-json-writer"
                 + "|--optimization-quadratic"
                 + "|--optimization-scheduler"
+                + "|--optimization-request-storage"
                 + "|--request-parsers"
                 + "|--hpack-huffman|--http2-response"
                 + "|--http1-chunked]");

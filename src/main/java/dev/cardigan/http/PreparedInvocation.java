@@ -3,6 +3,8 @@
 package dev.cardigan.http;
 
 import dev.cardigan.util.SimpleWaiter;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
 
 /**
  * Route matching and request-bound argument extraction separated from the
@@ -15,12 +17,52 @@ public final class PreparedInvocation {
     private Object bodyRecord;
     private Router fallbackRouter;
     private Response immediateResponse;
+    private HttpRequest reusableStoredRequest;
+    private MemorySegment reusableDetachedStorage;
+    private AutoCloseable requestStorage;
     private boolean safe;
     private volatile boolean cancelled;
     private Thread cancellableThread;
     private SimpleWaiter<?> cancellationWaiter;
 
     public PreparedInvocation() {
+    }
+
+    void beginPreparation() {
+        releaseRequestStorage();
+    }
+
+    HttpRequest storeRequest(
+            HttpRequest source,
+            AutoCloseable retainedStorage,
+            boolean isolated) {
+        if (retainedStorage != null && !isolated) {
+            reusableStoredRequest = source.retainedView(
+                reusableStoredRequest);
+            requestStorage = retainedStorage;
+            return reusableStoredRequest;
+        }
+        if (isolated) {
+            return source.detachedCopy();
+        }
+
+        long required = source.detachedLength();
+        if (reusableDetachedStorage == null
+                || reusableDetachedStorage.byteSize() < required) {
+            reusableDetachedStorage = Arena.ofAuto().allocate(
+                reusableCapacity(required));
+        }
+        reusableStoredRequest = source.detachedCopyInto(
+            reusableStoredRequest, reusableDetachedStorage);
+        return reusableStoredRequest;
+    }
+
+    boolean ownsRequestStorage(AutoCloseable storage) {
+        return storage != null && requestStorage == storage;
+    }
+
+    public void discard() {
+        releaseRequestStorage();
     }
 
     PreparedInvocation setHandler(RouteHandler handler, HttpRequest request, long pathParamLong,
@@ -47,6 +89,7 @@ public final class PreparedInvocation {
     }
 
     PreparedInvocation setImmediate(Response response, boolean safe) {
+        releaseRequestStorage();
         this.handler = null;
         this.request = null;
         this.pathParamLong = 0;
@@ -62,10 +105,13 @@ public final class PreparedInvocation {
     }
 
     public Response invoke() {
+        AutoCloseable storage = takeRequestStorage();
         if (cancelled) {
+            closeStorage(storage);
             return null;
         }
         if (immediateResponse != null) {
+            closeStorage(storage);
             return immediateResponse;
         }
         try {
@@ -81,6 +127,8 @@ public final class PreparedInvocation {
             return fallbackRouter.dispatch(request);
         } catch (Throwable t) {
             return Response.error("Internal Server Error: " + t.getMessage());
+        } finally {
+            closeStorage(storage);
         }
     }
 
@@ -174,5 +222,38 @@ public final class PreparedInvocation {
         cancelled = false;
         cancellableThread = null;
         cancellationWaiter = null;
+    }
+
+    private AutoCloseable takeRequestStorage() {
+        AutoCloseable storage = requestStorage;
+        requestStorage = null;
+        return storage;
+    }
+
+    private void releaseRequestStorage() {
+        closeStorage(takeRequestStorage());
+    }
+
+    private static void closeStorage(AutoCloseable storage) {
+        if (storage == null) {
+            return;
+        }
+        try {
+            storage.close();
+        } catch (Throwable ignored) {
+            // Request-storage retirement must not replace a handler response.
+        }
+    }
+
+    private static long reusableCapacity(long required) {
+        long capacity = 64;
+        while (capacity < required) {
+            long grown = capacity << 1;
+            if (grown <= capacity) {
+                return required;
+            }
+            capacity = grown;
+        }
+        return capacity;
     }
 }

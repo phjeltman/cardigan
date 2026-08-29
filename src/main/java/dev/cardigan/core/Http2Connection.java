@@ -73,6 +73,8 @@ final class Http2Connection {
         ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
     private static final ValueLayout.OfLong LONG_BE =
         ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
+    private static final AutoCloseable STREAM_OWNS_REQUEST_STORAGE = () -> {
+    };
 
     private final InboundChunkStream inbound;
     private final ConnectionWriter writer;
@@ -668,11 +670,8 @@ final class Http2Connection {
         int sendWindow = pending.sendWindow;
         HttpRequest pendingRequest = pending.request;
         detachPendingStream(pending);
-        try {
-            return submit(streamId, pendingRequest, sendWindow);
-        } finally {
-            releasePendingStream(pending);
-        }
+        return submit(
+            streamId, pendingRequest, sendWindow, null, pending);
     }
 
     private boolean processData(int flags, int streamId, MemorySegment payload,
@@ -777,11 +776,12 @@ final class Http2Connection {
         }
 
         detachPendingStream(pending);
-        try {
-            return submit(streamId, pending.request, pending.sendWindow);
-        } finally {
-            releasePendingStream(pending);
-        }
+        return submit(
+            streamId,
+            pending.request,
+            pending.sendWindow,
+            null,
+            pending);
     }
 
     private boolean prepareRequest(int decodedLength,
@@ -986,7 +986,7 @@ final class Http2Connection {
     }
 
     private void releasePendingStream(PendingStream pending) {
-        pending.release();
+        pending.reset();
         freePendingStreams[freePendingStreamCount++] = pending;
     }
 
@@ -997,7 +997,8 @@ final class Http2Connection {
     }
 
     private boolean submit(int streamId, HttpRequest streamRequest, int initialSendWindow) {
-        return submit(streamId, streamRequest, initialSendWindow, null);
+        return submit(
+            streamId, streamRequest, initialSendWindow, null, null);
     }
 
     private boolean submit(
@@ -1005,6 +1006,21 @@ final class Http2Connection {
         HttpRequest streamRequest,
         int initialSendWindow,
         PendingStream requestBodyOwner
+    ) {
+        return submit(
+            streamId,
+            streamRequest,
+            initialSendWindow,
+            requestBodyOwner,
+            null);
+    }
+
+    private boolean submit(
+        int streamId,
+        HttpRequest streamRequest,
+        int initialSendWindow,
+        PendingStream requestBodyOwner,
+        AutoCloseable requestStorage
     ) {
         int pendingAdjustment = requestBodyOwner == null ? 0 : 1;
         if (failed || (draining && streamId > drainLastStreamId)
@@ -1014,6 +1030,7 @@ final class Http2Connection {
                 requestBodyOwner.exchangeEnded = true;
                 removePendingStream(requestBodyOwner);
             }
+            closeRequestStorage(requestStorage);
             return sendRstStream(streamId, Http2Frames.REFUSED_STREAM);
         }
 
@@ -1027,7 +1044,14 @@ final class Http2Connection {
             router.prepare(
                 streamRequest, task.invocation, requestMaterializer);
         } else {
-            router.prepare(streamRequest, task.invocation);
+            AutoCloseable retainedStorage = requestBodyOwner != null
+                ? STREAM_OWNS_REQUEST_STORAGE
+                : requestStorage;
+            router.prepare(
+                streamRequest,
+                task.invocation,
+                null,
+                retainedStorage);
         }
         setInFlight(inFlight() + 1);
         if (Http2ResourceStats.ENABLED) {
@@ -1040,6 +1064,7 @@ final class Http2Connection {
             }
             setTaskActive(task, false);
             task.requestBodyOwner = null;
+            task.invocation.discard();
             releaseTask(task);
             if (requestBodyOwner != null) {
                 requestBodyOwner.exchangeEnded = true;
@@ -1051,6 +1076,17 @@ final class Http2Connection {
             lastAdmittedStreamId = streamId;
         }
         return true;
+    }
+
+    private static void closeRequestStorage(AutoCloseable storage) {
+        if (storage == null) {
+            return;
+        }
+        try {
+            storage.close();
+        } catch (Throwable ignored) {
+            // Rejected streams must still retire their bookkeeping.
+        }
     }
 
     private Http2Task acquireTask() {
@@ -1555,7 +1591,7 @@ final class Http2Connection {
         }
     }
 
-    private final class PendingStream {
+    private final class PendingStream implements AutoCloseable, Runnable {
         private final HttpRequest request = new HttpRequest();
         private int streamId;
         private int headerLength;
@@ -1669,11 +1705,11 @@ final class Http2Connection {
 
         private void ensureArena() {
             if (arena == null) {
-                arena = Arena.ofConfined();
+                arena = Arena.ofShared();
             }
         }
 
-        private void release() {
+        private void reset() {
             if (streamingBody != null) {
                 streamingBody.dispose();
                 streamingBody = null;
@@ -1701,6 +1737,20 @@ final class Http2Connection {
                 storage = null;
                 capacity = 0;
             }
+        }
+
+        @Override
+        public void close() {
+            if (writer.eventLoop().inCarrierDomain()) {
+                run();
+            } else {
+                writer.eventLoop().execute(this);
+            }
+        }
+
+        @Override
+        public void run() {
+            releasePendingStream(this);
         }
 
         private void dispose() {

@@ -73,18 +73,37 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
     }
 
     boolean submit(Router router, HttpRequest request, boolean requestKeepAlive) {
+        return submit(router, request, requestKeepAlive, null);
+    }
+
+    boolean submit(
+            Router router,
+            HttpRequest request,
+            boolean requestKeepAlive,
+            AutoCloseable requestStorage) {
         if (!awaitCapacity()) {
+            closeRequestStorage(requestStorage);
             return false;
         }
 
         long id = nextSubmission++;
         setInFlight(inFlight() + 1);
         ExchangeTask task = acquireTask();
-        router.prepare(request, task.exchange.invocation());
+        try {
+            router.prepare(
+                request,
+                task.exchange.invocation(),
+                null,
+                requestStorage);
+        } finally {
+            // Router either retained the storage or closed it before return.
+            requestStorage = null;
+        }
         task.exchange.prepare(id, requestKeepAlive);
         task.setActive(true);
         if (!executor.submit(task)) {
             task.setActive(false);
+            task.exchange.invocation().discard();
             releaseTask(task);
             setInFlight(inFlight() - 1);
             failed = true;
@@ -92,6 +111,17 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
             return false;
         }
         return true;
+    }
+
+    private static void closeRequestStorage(AutoCloseable storage) {
+        if (storage == null) {
+            return;
+        }
+        try {
+            storage.close();
+        } catch (Throwable ignored) {
+            // A failed submission must still retire the exchange cleanly.
+        }
     }
 
     boolean hasInFlight() {
