@@ -17,12 +17,31 @@ public final class ResponseHeaders {
     private static final int MAX_FIELDS = 64;
     private static final int MAX_BYTES = 8 * 1024;
 
-    private final String[] fields;
+    private volatile String[] fields;
     private final int bytes;
+    private final int count;
+    private final ResponseHeaders parent;
+    private final String appendedName;
+    private final String appendedValue;
 
     private ResponseHeaders(String[] fields, int bytes) {
         this.fields = fields;
         this.bytes = bytes;
+        this.count = fields.length >>> 1;
+        this.parent = null;
+        this.appendedName = null;
+        this.appendedValue = null;
+    }
+
+    private ResponseHeaders(
+            ResponseHeaders parent, String name, String value,
+            int bytes) {
+        this.fields = null;
+        this.bytes = bytes;
+        this.count = parent.count + 1;
+        this.parent = parent;
+        this.appendedName = name;
+        this.appendedValue = value;
     }
 
     public static ResponseHeaders of(String name, String value) {
@@ -34,26 +53,76 @@ public final class ResponseHeaders {
     }
 
     public int size() {
-        return fields.length >>> 1;
+        return count;
     }
 
     public boolean isEmpty() {
-        return fields.length == 0;
+        return count == 0;
     }
 
     public String name(int index) {
         checkIndex(index);
-        return fields[index << 1];
+        return materializedFields()[index << 1];
     }
 
     public String value(int index) {
         checkIndex(index);
-        return fields[(index << 1) + 1];
+        return materializedFields()[(index << 1) + 1];
     }
 
     /** Upper bound for the uncompressed name/value bytes. */
     public int byteSize() {
         return bytes;
+    }
+
+    ResponseHeaders append(String name, String value) {
+        Objects.requireNonNull(name, "name");
+        Objects.requireNonNull(value, "value");
+        if (count == MAX_FIELDS) {
+            throw new IllegalArgumentException(
+                "Too many response header fields");
+        }
+        String normalized = normalizeName(name);
+        validateValue(value);
+        int nextBytes = bytes + normalized.length() + value.length();
+        if (nextBytes > MAX_BYTES) {
+            throw new IllegalArgumentException(
+                "Response header fields exceed " + MAX_BYTES + " bytes");
+        }
+        return new ResponseHeaders(this, normalized, value, nextBytes);
+    }
+
+    String lastName() {
+        return appendedName != null
+            ? appendedName : name(count - 1);
+    }
+
+    private String[] materializedFields() {
+        String[] materialized = fields;
+        if (materialized != null) {
+            return materialized;
+        }
+        synchronized (this) {
+            materialized = fields;
+            if (materialized != null) {
+                return materialized;
+            }
+            materialized = new String[count << 1];
+            ResponseHeaders node = this;
+            int offset = materialized.length;
+            while (node.appendedName != null) {
+                offset -= 2;
+                materialized[offset] = node.appendedName;
+                materialized[offset + 1] = node.appendedValue;
+                node = node.parent;
+            }
+            String[] prefix = node.fields;
+            if (prefix != null && prefix.length != 0) {
+                System.arraycopy(prefix, 0, materialized, 0, prefix.length);
+            }
+            fields = materialized;
+            return materialized;
+        }
     }
 
     private void checkIndex(int index) {

@@ -9,6 +9,7 @@ import dev.cardigan.http.HttpRequestParser;
 import dev.cardigan.http.Post;
 import dev.cardigan.http.PreparedInvocation;
 import dev.cardigan.http.Response;
+import dev.cardigan.http.ResponseHeaders;
 import dev.cardigan.http.Router;
 import dev.cardigan.http2.HpackDecoder;
 import dev.cardigan.http2.HpackFields;
@@ -16,14 +17,22 @@ import dev.cardigan.http2.HpackHuffmanBenchmark;
 import dev.cardigan.http2.Http2Frames;
 import dev.cardigan.http2.Http2RequestParser;
 import dev.cardigan.json.JsonWriter;
+import dev.cardigan.json.JsonReader;
 import dev.cardigan.serdes.Serdes;
+import dev.cardigan.simdjson.SimdJson;
+import dev.cardigan.simdjson.ondemand.OnDemandParser;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.io.OutputStream;
+import java.io.PrintStream;
+import java.lang.reflect.Method;
 
 /** Microbenchmarks for code paths used by the Cardigan runtime. */
 public final class BenchmarkSuite {
-    private static final int WARMUP_SECONDS = 2;
-    private static final int RUN_SECONDS = 3;
+    private static final int WARMUP_SECONDS = Integer.getInteger(
+        "cardigan.benchmark.warmup.seconds", 2);
+    private static final int RUN_SECONDS = Integer.getInteger(
+        "cardigan.benchmark.run.seconds", 3);
     private static final int BATCH_SIZE = 1_024;
     private static final int FRAME_VARIANTS = 256;
     private static final int FRAME_VARIANT_MASK = FRAME_VARIANTS - 1;
@@ -82,6 +91,37 @@ public final class BenchmarkSuite {
     public record User(String name, int id, boolean active) {
     }
 
+    public record WideJsonRecord(
+        int field03,
+        int field07,
+        int field11,
+        int field15,
+        int field19,
+        int field23,
+        int field27,
+        int field31
+    ) {
+    }
+
+    public record KeyHeavyRecord(
+        int customerAccountIdentifier,
+        int organizationMembershipIdentifier,
+        int primaryShippingAddressIdentifier,
+        int preferredPaymentMethodIdentifier,
+        int activeSubscriptionPlanIdentifier,
+        int customerSupportRegionIdentifier,
+        int marketingCampaignSourceIdentifier,
+        int authenticationProviderIdentifier,
+        int lastSuccessfulOrderIdentifier,
+        int currentShoppingCartIdentifier,
+        int preferredNotificationChannelIdentifier,
+        int accountSecurityPolicyIdentifier
+    ) {
+    }
+
+    public record LargeStringRecord(String payload) {
+    }
+
     public static final class TestController {
         @Get("/users/{id}")
         public Response getUser(long id) {
@@ -104,6 +144,12 @@ public final class BenchmarkSuite {
         }
     }
 
+    public static final class RouteScaleController {
+        public Response route() {
+            return Response.text("ok");
+        }
+    }
+
     private BenchmarkSuite() {
     }
 
@@ -114,6 +160,14 @@ public final class BenchmarkSuite {
 
         if (args.length == 1) {
             switch (args[0]) {
+                case "--optimization-routing" ->
+                    runRoutingScaleBenchmarks();
+                case "--optimization-json-fields" ->
+                    runJsonFieldAccessBenchmarks();
+                case "--optimization-json-writer" ->
+                    runJsonWriterOptimizationBenchmarks();
+                case "--optimization-quadratic" ->
+                    runQuadraticBehaviorBenchmarks();
                 case "--request-parsers" -> runRequestParserBenchmarks();
                 case "--hpack-huffman" -> HpackHuffmanBenchmark.run();
                 case "--http2-response" -> Http2ResponseBenchmark.run();
@@ -139,8 +193,281 @@ public final class BenchmarkSuite {
     private static IllegalArgumentException usage() {
         return new IllegalArgumentException(
             "Usage: BenchmarkSuite "
-                + "[--request-parsers|--hpack-huffman|--http2-response"
+                + "[--optimization-routing|--optimization-json-fields"
+                + "|--optimization-json-writer"
+                + "|--optimization-quadratic"
+                + "|--request-parsers"
+                + "|--hpack-huffman|--http2-response"
                 + "|--http1-chunked]");
+    }
+
+    private static void runRoutingScaleBenchmarks() {
+        System.out.println("\n--- Route lookup scaling ---");
+        Router parameterized = registeredRouter(new TestController());
+        Router small = syntheticRouter(8);
+        Router large = syntheticRouter(256);
+        measureQuietly(
+            "register 64 same-depth routes",
+            1,
+            () -> System.identityHashCode(syntheticRouter(64)));
+        measureQuietly(
+            "register 256 same-depth routes",
+            1,
+            () -> System.identityHashCode(syntheticRouter(256)));
+        runRoutingBenchmark(
+            "single parameterized-route hit",
+            "GET /users/427 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            parameterized);
+        runRoutingBenchmark(
+            "uncached miss among 8 same-depth routes",
+            "GET /catalog/candidate9999/detail HTTP/1.1\r\n"
+                + "Host: localhost\r\n\r\n",
+            small);
+        runRoutingBenchmark(
+            "uncached miss among 256 same-depth routes",
+            "GET /catalog/candidate9999/detail HTTP/1.1\r\n"
+                + "Host: localhost\r\n\r\n",
+            large);
+    }
+
+    private static Router registeredRouter(Object controller) {
+        Router router = new Router();
+        PrintStream originalOut = System.out;
+        try (PrintStream sink = new PrintStream(OutputStream.nullOutputStream())) {
+            System.setOut(sink);
+            router.registerController(controller);
+            return router;
+        } finally {
+            System.setOut(originalOut);
+        }
+    }
+
+    private static void runJsonFieldAccessBenchmarks() {
+        System.out.println("\n--- On-demand JSON field access ---");
+        String encoded = wideJsonObject(32);
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment input = arena.allocateFrom(encoded);
+            int length = (int) input.byteSize() - 1;
+            measure("one late field from a 32-field object", () ->
+                Serdes.parseOnDemand(input, 0, length)
+                    .get("field31").getLong());
+            measure("eight fields from a 32-field object", () -> {
+                var value = Serdes.parseOnDemand(input, 0, length);
+                return value.get("field03").getLong()
+                    + value.get("field07").getLong()
+                    + value.get("field11").getLong()
+                    + value.get("field15").getLong()
+                    + value.get("field19").getLong()
+                    + value.get("field23").getLong()
+                    + value.get("field27").getLong()
+                    + value.get("field31").getLong();
+            });
+            measure("record projection from on-demand value", () -> {
+                var value = Serdes.parseOnDemand(input, 0, length);
+                WideJsonRecord record = Serdes.readRecordFromValue(
+                    value, WideJsonRecord.class);
+                return record.field31();
+            });
+        }
+    }
+
+    private static String wideJsonObject(int fields) {
+        StringBuilder json = new StringBuilder(fields * 14);
+        json.append('{');
+        for (int index = 0; index < fields; index++) {
+            if (index != 0) {
+                json.append(',');
+            }
+            json.append('"')
+                .append("field%02d".formatted(index))
+                .append("\":")
+                .append(index);
+        }
+        return json.append('}').toString();
+    }
+
+    private static void runJsonWriterOptimizationBenchmarks() {
+        System.out.println("\n--- JSON record writer ---");
+        User small = new User("Alice Smith", 427, true);
+        KeyHeavyRecord keyHeavy = new KeyHeavyRecord(
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+        LargeStringRecord oneKiB = new LargeStringRecord("x".repeat(1_024));
+        LargeStringRecord sixteenKiB =
+            new LargeStringRecord("x".repeat(16 * 1_024));
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment output = arena.allocate(32 * 1_024);
+            measure("write 3-field record into caller buffer",
+                () -> JsonWriter.writeRecord(output, 0, small));
+            measure("write 12 long-key fields into caller buffer",
+                () -> JsonWriter.writeRecord(output, 0, keyHeavy));
+            measure("materialize 1 KiB record as byte[]",
+                () -> Serdes.toJsonBytes(oneKiB).length);
+            measure("materialize 16 KiB record as byte[]",
+                () -> Serdes.toJsonBytes(sixteenKiB).length);
+        }
+    }
+
+    private static void runQuadraticBehaviorBenchmarks() {
+        System.out.println("\n--- Quadratic API behavior ---");
+        String arrayJson = integerArray(128);
+        var domArray = new SimdJson().parse(arrayJson).getArray();
+        var onDemandArray = new OnDemandParser()
+            .parse(arrayJson).getArray();
+        String objectJson = wideJsonObject(32);
+        var domObject = new SimdJson().parse(objectJson).getObject();
+        SimdJson domArrayParser = new SimdJson();
+        OnDemandParser onDemandArrayParser = new OnDemandParser();
+        SimdJson domObjectParser = new SimdJson();
+        String[] headerNames = new String[32];
+        for (int index = 0; index < headerNames.length; index++) {
+            headerNames[index] = "x-benchmark-" + index;
+        }
+
+        measure("DOM array indexed traversal, 128 elements", () -> {
+            long sum = 0;
+            for (int index = 0; index < domArray.size(); index++) {
+                sum += domArray.get(index).getLong();
+            }
+            return sum;
+        });
+        measure("DOM array iterator traversal, 128 elements", () -> {
+            long sum = 0;
+            for (var value : domArray) {
+                sum += value.getLong();
+            }
+            return sum;
+        });
+        measure("DOM parse + indexed traversal, 128 elements", () -> {
+            var array = domArrayParser.parse(arrayJson).getArray();
+            long sum = 0;
+            for (int index = 0; index < array.size(); index++) {
+                sum += array.get(index).getLong();
+            }
+            return sum;
+        });
+        measure("on-demand indexed traversal, 128 elements", () -> {
+            long sum = 0;
+            for (int index = 0; index < 128; index++) {
+                sum += onDemandArray.get(index).getLong();
+            }
+            return sum;
+        });
+        measure("on-demand parse + traversal, 128 elements", () -> {
+            var array = onDemandArrayParser.parse(arrayJson).getArray();
+            long sum = 0;
+            for (int index = 0; index < 128; index++) {
+                sum += array.get(index).getLong();
+            }
+            return sum;
+        });
+        measure("eight DOM object field lookups", () ->
+            domObject.get("field03").getLong()
+                + domObject.get("field07").getLong()
+                + domObject.get("field11").getLong()
+                + domObject.get("field15").getLong()
+                + domObject.get("field19").getLong()
+                + domObject.get("field23").getLong()
+                + domObject.get("field27").getLong()
+                + domObject.get("field31").getLong());
+        measure("DOM parse + eight object field lookups", () -> {
+            var object = domObjectParser.parse(objectJson).getObject();
+            return object.get("field03").getLong()
+                + object.get("field07").getLong()
+                + object.get("field11").getLong()
+                + object.get("field15").getLong()
+                + object.get("field19").getLong()
+                + object.get("field23").getLong()
+                + object.get("field27").getLong()
+                + object.get("field31").getLong();
+        });
+
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment object = arena.allocateFrom(wideJsonObject(32));
+            int objectLength = (int) object.byteSize() - 1;
+            measure("eight JsonReader field lookups", () -> {
+                JsonReader.IndexedObject indexed = JsonReader.indexObject(
+                    object, 0, objectLength);
+                return indexed.findInt("field03", -1)
+                    + indexed.findInt("field07", -1)
+                    + indexed.findInt("field11", -1)
+                    + indexed.findInt("field15", -1)
+                    + indexed.findInt("field19", -1)
+                    + indexed.findInt("field23", -1)
+                    + indexed.findInt("field27", -1)
+                    + indexed.findInt("field31", -1);
+            });
+        }
+
+        measure("copy/revalidate 32 response headers (control)", () -> {
+            Response response = Response.text("ok");
+            for (String name : headerNames) {
+                response = response.withHeaders(
+                    ResponseHeaders.builder()
+                        .addAll(response.headers())
+                        .add(name, "value")
+                        .build());
+            }
+            return consumeHeaders(response);
+        });
+        measure("chain 32 response headers", () -> {
+            Response response = Response.text("ok");
+            for (String name : headerNames) {
+                response = response.withHeader(name, "value");
+            }
+            return consumeHeaders(response);
+        });
+    }
+
+    private static long consumeHeaders(Response response) {
+        long size = response.headers().byteSize();
+        for (int index = 0; index < response.headers().size(); index++) {
+            size += response.headers().name(index).length();
+            size += response.headers().value(index).length();
+        }
+        return size;
+    }
+
+    private static String integerArray(int elements) {
+        StringBuilder json = new StringBuilder(elements * 4);
+        json.append('[');
+        for (int index = 0; index < elements; index++) {
+            if (index != 0) {
+                json.append(',');
+            }
+            json.append(index);
+        }
+        return json.append(']').toString();
+    }
+
+    private static Router syntheticRouter(int routeCount) {
+        Router router = new Router();
+        RouteScaleController controller = new RouteScaleController();
+        PrintStream originalOut = System.out;
+        try (PrintStream sink = new PrintStream(OutputStream.nullOutputStream())) {
+            Method register = Router.class.getDeclaredMethod(
+                "registerRoute",
+                String.class,
+                String.class,
+                Method.class,
+                Object.class);
+            Method route = RouteScaleController.class.getDeclaredMethod("route");
+            register.setAccessible(true);
+            System.setOut(sink);
+            for (int i = 0; i < routeCount; i++) {
+                register.invoke(
+                    router,
+                    "GET",
+                    "/catalog/candidate%04d/detail".formatted(i),
+                    route,
+                    controller);
+            }
+            return router;
+        } catch (ReflectiveOperationException failure) {
+            throw new IllegalStateException(
+                "Could not construct routing benchmark fixture", failure);
+        } finally {
+            System.setOut(originalOut);
+        }
     }
 
     private static void runRoutingBenchmarks() {
@@ -339,11 +666,29 @@ public final class BenchmarkSuite {
     }
 
     private static void measure(String label, Operation operation) {
+        Measurement measurement = measure(operation, BATCH_SIZE);
+        printMeasurement(label, measurement);
+    }
+
+    private static void measureQuietly(
+            String label, int batchSize, Operation operation) {
+        PrintStream originalOut = System.out;
+        Measurement measurement;
+        try (PrintStream sink = new PrintStream(OutputStream.nullOutputStream())) {
+            System.setOut(sink);
+            measurement = measure(operation, batchSize);
+        } finally {
+            System.setOut(originalOut);
+        }
+        printMeasurement(label, measurement);
+    }
+
+    private static Measurement measure(Operation operation, int batchSize) {
         long checksum = 0;
         long warmupDeadline =
             System.nanoTime() + WARMUP_SECONDS * 1_000_000_000L;
         do {
-            for (int i = 0; i < BATCH_SIZE; i++) {
+            for (int i = 0; i < batchSize; i++) {
                 checksum += operation.run();
             }
         } while (System.nanoTime() < warmupDeadline);
@@ -354,17 +699,24 @@ public final class BenchmarkSuite {
         long start = System.nanoTime();
         long deadline = start + RUN_SECONDS * 1_000_000_000L;
         do {
-            for (int i = 0; i < BATCH_SIZE; i++) {
+            for (int i = 0; i < batchSize; i++) {
                 checksum += operation.run();
             }
-            operations += BATCH_SIZE;
+            operations += batchSize;
         } while (System.nanoTime() < deadline);
         long elapsed = System.nanoTime() - start;
         blackhole = checksum;
+        return new Measurement(operations, elapsed);
+    }
+
+    private static void printMeasurement(
+            String label, Measurement measurement) {
         System.out.printf(
             "  %-54s %,14.2f ops/s  %9.2f ns/op%n",
-            label + ":", operations / (elapsed / 1_000_000_000.0),
-            (double) elapsed / operations);
+            label + ":",
+            measurement.operations()
+                / (measurement.elapsedNanos() / 1_000_000_000.0),
+            (double) measurement.elapsedNanos() / measurement.operations());
     }
 
     private static MemorySegment copyToArena(Arena arena, byte[] bytes) {
@@ -409,5 +761,8 @@ public final class BenchmarkSuite {
     @FunctionalInterface
     private interface Operation {
         long run();
+    }
+
+    private record Measurement(long operations, long elapsedNanos) {
     }
 }

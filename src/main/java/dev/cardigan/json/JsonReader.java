@@ -10,6 +10,9 @@ import dev.cardigan.simdjson.util.FastNumberParser;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 
 public class JsonReader {
 
@@ -241,6 +244,201 @@ public class JsonReader {
         }
 
         return -1;
+    }
+
+    public static IndexedObject indexObject(
+            MemorySegment segment, long startOffset, long length) {
+        if (length <= 0) {
+            return new IndexedObject(
+                segment, MemorySegment.NULL, startOffset, 0,
+                new int[0]);
+        }
+        MemorySegment slice = startOffset == 0
+                && length == segment.byteSize()
+            ? segment : segment.asSlice(startOffset, length);
+        Stage1Indexer indexer = THREAD_LOCAL_INDEXER.get();
+        StructuralIndexes indexes = THREAD_LOCAL_INDEXES.get();
+        indexer.index(slice, indexes);
+        return new IndexedObject(
+            segment, slice, startOffset, Math.toIntExact(length),
+            Arrays.copyOf(indexes.indexes(), indexes.size()));
+    }
+
+    public static final class IndexedObject {
+        private final MemorySegment segment;
+        private final MemorySegment slice;
+        private final long startOffset;
+        private final int length;
+        private final int[] indexes;
+        private final byte[] heapBytes;
+        private final Map<String, Long> fields;
+
+        private IndexedObject(
+                MemorySegment segment, MemorySegment slice,
+                long startOffset, int length, int[] indexes) {
+            this.segment = segment;
+            this.slice = slice;
+            this.startOffset = startOffset;
+            this.length = length;
+            this.indexes = indexes;
+            this.heapBytes = slice == MemorySegment.NULL
+                ? null
+                : slice.heapBase().map(base -> (byte[]) base).orElse(null);
+            this.fields = indexFields();
+        }
+
+        public long findValue(String key) {
+            return fields.getOrDefault(key, -1L);
+        }
+
+        private Map<String, Long> indexFields() {
+            Map<String, Long> indexedFields = new HashMap<>();
+            int count = indexes.length;
+            if (count < 2) {
+                return indexedFields;
+            }
+            int previous = indexes[0];
+            for (int index = 1; index < count; index++) {
+                int punctuationOffset = indexes[index];
+                byte punctuation = getByte(
+                    slice, heapBytes, punctuationOffset);
+                if (punctuation == ':') {
+                    int quoteStart = (int) skipWhitespace(
+                        slice, previous + 1, punctuationOffset);
+                    if (quoteStart < punctuationOffset
+                            && getByte(slice, heapBytes, quoteStart) == '"') {
+                        int quoteEnd = (int) skipWhitespaceBack(
+                            slice, quoteStart + 1, punctuationOffset - 1);
+                        if (quoteEnd > quoteStart
+                                && getByte(slice, heapBytes, quoteEnd) == '"') {
+                            int keyStart = quoteStart + 1;
+                            int keyLength = quoteEnd - keyStart;
+                            String key = new String(
+                                slice.asSlice(keyStart, keyLength)
+                                    .toArray(ValueLayout.JAVA_BYTE),
+                                StandardCharsets.UTF_8);
+                            int valueStart = (int) skipWhitespace(
+                                slice, punctuationOffset + 1, length);
+                            int valueEnd = findValueEnd(index, count);
+                            long absoluteStart = startOffset + valueStart;
+                            long packed = (absoluteStart << 32)
+                                | ((valueEnd - valueStart) & 0xffff_ffffL);
+                            indexedFields.putIfAbsent(key, packed);
+                        }
+                    }
+                }
+                previous = punctuationOffset;
+            }
+            return indexedFields;
+        }
+
+        public Utf8Slice findString(String key) {
+            long packed = findValue(key);
+            if (packed == -1) {
+                return null;
+            }
+            long offset = packed >>> 32;
+            long valueLength = packed & 0xffff_ffffL;
+            if (valueLength >= 2
+                    && segment.get(ValueLayout.JAVA_BYTE, offset) == '"'
+                    && segment.get(
+                        ValueLayout.JAVA_BYTE,
+                        offset + valueLength - 1) == '"') {
+                return new Utf8Slice(
+                    segment, offset + 1, valueLength - 2);
+            }
+            return null;
+        }
+
+        public int findInt(String key, int defaultValue) {
+            long packed = findValue(key);
+            if (packed == -1) {
+                return defaultValue;
+            }
+            long offset = packed >>> 32;
+            long valueLength = packed & 0xffff_ffffL;
+            return (int) FastNumberParser.parseLong(
+                segment, null, offset, offset + valueLength);
+        }
+
+        public long findLong(String key, long defaultValue) {
+            long packed = findValue(key);
+            if (packed == -1) {
+                return defaultValue;
+            }
+            long offset = packed >>> 32;
+            long valueLength = packed & 0xffff_ffffL;
+            return FastNumberParser.parseLong(
+                segment, null, offset, offset + valueLength);
+        }
+
+        public double findDouble(String key, double defaultValue) {
+            long packed = findValue(key);
+            if (packed == -1) {
+                return defaultValue;
+            }
+            long offset = packed >>> 32;
+            long valueLength = packed & 0xffff_ffffL;
+            return FastNumberParser.parseDouble(
+                segment, null, (int) offset,
+                (int) (offset + valueLength));
+        }
+
+        public boolean findBoolean(String key, boolean defaultValue) {
+            long packed = findValue(key);
+            if (packed == -1) {
+                return defaultValue;
+            }
+            long offset = packed >>> 32;
+            long valueLength = packed & 0xffff_ffffL;
+            if (equalsString(
+                    segment, null, offset, valueLength, "true")) {
+                return true;
+            }
+            if (equalsString(
+                    segment, null, offset, valueLength, "false")) {
+                return false;
+            }
+            return defaultValue;
+        }
+
+        private int findValueEnd(int colonIndex, int totalIndexes) {
+            if (colonIndex + 1 >= totalIndexes) {
+                return length;
+            }
+            int nextPosition = indexes[colonIndex + 1];
+            int valueStart = (int) skipWhitespace(
+                slice, indexes[colonIndex] + 1, nextPosition);
+            byte first = getByte(slice, heapBytes, valueStart);
+            if (first == '{' || first == '[') {
+                int depth = 0;
+                int endIndex = colonIndex + 1;
+                while (endIndex < totalIndexes) {
+                    int endPosition = indexes[endIndex];
+                    byte current = getByte(
+                        slice, heapBytes, endPosition);
+                    if (current == '{' || current == '[') {
+                        depth++;
+                    } else if (current == '}' || current == ']') {
+                        depth--;
+                    }
+                    endIndex++;
+                    if (depth == 0) {
+                        break;
+                    }
+                }
+                return indexes[endIndex - 1] + 1;
+            }
+            if (first == '"') {
+                return nextPosition > 0
+                        && getByte(
+                            slice, heapBytes, nextPosition - 1) == '"'
+                    ? nextPosition
+                    : (int) skipWhitespaceBack(
+                        slice, valueStart, nextPosition - 1) + 1;
+            }
+            return nextPosition;
+        }
     }
 
     private static int findValEnd(MemorySegment slice, byte[] heapBytes, StructuralIndexes indexes, int colonIdx, int totalIndexes, int maxLen) {

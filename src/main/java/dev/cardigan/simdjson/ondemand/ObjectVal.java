@@ -23,9 +23,11 @@ import dev.cardigan.simdjson.StructuralIndexes;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
- * On-Demand zero-allocation Object view.
+ * On-demand object view that indexes fields after repeated access.
  */
 public final class ObjectVal {
 
@@ -34,6 +36,8 @@ public final class ObjectVal {
     private final int heapOffset;
     private final StructuralIndexes indexes;
     private final int startIndexIdx;
+    private Map<String, Value> indexedFields;
+    private int lookups;
 
     public ObjectVal(MemorySegment segment, byte[] heapBytes, StructuralIndexes indexes, int startIndexIdx) {
         this.segment = segment;
@@ -45,6 +49,29 @@ public final class ObjectVal {
     }
 
     public Value get(String targetKey) {
+        Value value = getOrNull(targetKey);
+        if (value != null) {
+            return value;
+        }
+        throw new SimdJsonException(
+            SimdJsonError.NO_SUCH_FIELD,
+            "Key not found: " + targetKey);
+    }
+
+    public Value getOrNull(String targetKey) {
+        Map<String, Value> fields = indexedFields;
+        if (fields != null) {
+            return fields.get(targetKey);
+        }
+        if (++lookups >= 2) {
+            fields = indexFields();
+            indexedFields = fields;
+            return fields.get(targetKey);
+        }
+        return scanForField(targetKey);
+    }
+
+    private Value scanForField(String targetKey) {
         int numIndexes = indexes.size();
         int idx = startIndexIdx + 1;
         int depth = 1;
@@ -74,20 +101,39 @@ public final class ObjectVal {
             }
             idx++;
         }
+        return null;
+    }
 
-        throw new SimdJsonException(SimdJsonError.NO_SUCH_FIELD, "Key not found: " + targetKey);
+    private Map<String, Value> indexFields() {
+        Map<String, Value> fields = new HashMap<>();
+        int numIndexes = indexes.size();
+        int idx = startIndexIdx + 1;
+        int depth = 1;
+        while (idx < numIndexes && depth > 0) {
+            int offset = indexes.get(idx);
+            byte current = getByte(offset);
+            if (current == '{' || current == '[') {
+                depth++;
+            } else if (current == '}' || current == ']') {
+                depth--;
+            } else if (current == ':' && depth == 1) {
+                int keyIndex = idx - 1;
+                int valueIndex = idx + 1;
+                Value key = new Value(
+                    segment, heapBytes, indexes, keyIndex,
+                    indexes.get(keyIndex));
+                Value value = new Value(
+                    segment, heapBytes, indexes, valueIndex,
+                    indexes.get(valueIndex));
+                fields.putIfAbsent(key.getString(), value);
+            }
+            idx++;
+        }
+        return fields;
     }
 
     public boolean containsKey(String key) {
-        try {
-            get(key);
-            return true;
-        } catch (SimdJsonException e) {
-            if (e.getError() == SimdJsonError.NO_SUCH_FIELD) {
-                return false;
-            }
-            throw e;
-        }
+        return getOrNull(key) != null;
     }
 
     private byte getByte(int pos) {

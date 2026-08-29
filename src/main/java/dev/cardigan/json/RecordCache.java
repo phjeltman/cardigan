@@ -2,7 +2,6 @@
 
 package dev.cardigan.json;
 
-import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodType;
@@ -43,9 +42,7 @@ public class RecordCache {
         public final java.lang.invoke.MethodHandle constructorSpreader;
         public final String[] componentNames;
         public final Class<?>[] componentTypes;
-        final Method[] accessors;
         final java.lang.invoke.MethodHandle[] accessorHandles;
-        final MemorySegment[] preEncodedKeySegments;
         public final byte[][] preEncodedKeyBytes;
         public final FieldWriter[] fieldWriters;
         public final int[] componentLengths;
@@ -83,9 +80,7 @@ public class RecordCache {
                 this.componentTypes = new Class<?>[n];
                 this.componentTypeCodes = new byte[n];
                 this.defaultArgs = new Object[n];
-                this.accessors = new Method[n];
                 this.accessorHandles = new java.lang.invoke.MethodHandle[n];
-                this.preEncodedKeySegments = new MemorySegment[n];
                 this.preEncodedKeyBytes = new byte[n][];
                 this.fieldWriters = new FieldWriter[n];
                 this.componentLengths = new int[n];
@@ -136,16 +131,12 @@ public class RecordCache {
                     } catch (Exception e) {
                         // unreflect() below determines whether access is sufficient.
                     }
-                    this.accessors[i] = accessor;
                     this.accessorHandles[i] = lookup.unreflect(accessor);
 
                     // Pre-encode key segment: {"name": for first, ,"id": for subsequent
                     String keyStr = (i == 0 ? "{\"" : ",\"") + name + "\":";
                     byte[] keyBytes = keyStr.getBytes(StandardCharsets.UTF_8);
                     this.preEncodedKeyBytes[i] = keyBytes;
-                    MemorySegment keySeg = Arena.global().allocate(keyBytes.length);
-                    MemorySegment.copy(MemorySegment.ofArray(keyBytes), 0, keySeg, 0, keyBytes.length);
-                    this.preEncodedKeySegments[i] = keySeg;
 
                     this.fieldWriters[i] = compileFieldWriter(lookup, accessor, comp.getType());
                 }

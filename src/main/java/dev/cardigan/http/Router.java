@@ -7,7 +7,9 @@ import java.lang.foreign.MemorySegment;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import dev.cardigan.ffi.RawSegment;
 
 public class Router {
@@ -37,8 +39,155 @@ public class Router {
         }
     }
 
-    private final List<Route> routeList = new ArrayList<>();
-    private volatile Route[][] routesBySegCount = new Route[16][0];
+    private static final class MutableRouteNode {
+        private final Map<String, MutableRouteNode> staticChildren =
+            new HashMap<>();
+        private MutableRouteNode parameterChild;
+        private Route getRoute;
+        private Route postRoute;
+
+        private void add(Route route, int segmentIndex) {
+            if (segmentIndex == route.segmentCount) {
+                if (route.methodCode == 1) {
+                    if (getRoute == null) {
+                        getRoute = route;
+                    }
+                } else if (route.methodCode == 2 && postRoute == null) {
+                    postRoute = route;
+                }
+                return;
+            }
+
+            MutableRouteNode child;
+            if (route.isParam[segmentIndex]) {
+                child = parameterChild;
+                if (child == null) {
+                    child = new MutableRouteNode();
+                    parameterChild = child;
+                }
+            } else {
+                child = staticChildren.computeIfAbsent(
+                    route.segments[segmentIndex],
+                    ignored -> new MutableRouteNode());
+            }
+            child.add(route, segmentIndex + 1);
+        }
+    }
+
+    private static final class StaticRouteEdge {
+        private final byte[] segment;
+        private final int hash;
+        private final CompiledRouteNode child;
+
+        private StaticRouteEdge(
+                String segment, CompiledRouteNode child) {
+            this.segment = segment.getBytes(StandardCharsets.UTF_8);
+            this.hash = hashBytes(this.segment);
+            this.child = child;
+        }
+
+        private boolean matches(long baseAddress, long offset, int length) {
+            return segment.length == length
+                && matchSegmentBytes(
+                    baseAddress, offset, length, segment);
+        }
+    }
+
+    private static final class CompiledRouteNode {
+        private final StaticRouteEdge[] staticChildren;
+        private final int staticMask;
+        private final CompiledRouteNode parameterChild;
+        private final Route getRoute;
+        private final Route postRoute;
+
+        private CompiledRouteNode(MutableRouteNode source) {
+            int childCount = source.staticChildren.size();
+            if (childCount == 0) {
+                staticChildren = new StaticRouteEdge[0];
+                staticMask = 0;
+            } else {
+                int capacity = 2;
+                while (capacity < childCount * 2) {
+                    capacity <<= 1;
+                }
+                staticChildren = new StaticRouteEdge[capacity];
+                staticMask = capacity - 1;
+                for (Map.Entry<String, MutableRouteNode> entry
+                        : source.staticChildren.entrySet()) {
+                    StaticRouteEdge edge = new StaticRouteEdge(
+                        entry.getKey(),
+                        new CompiledRouteNode(entry.getValue()));
+                    int slot = spread(edge.hash) & staticMask;
+                    while (staticChildren[slot] != null) {
+                        slot = (slot + 1) & staticMask;
+                    }
+                    staticChildren[slot] = edge;
+                }
+            }
+            parameterChild = source.parameterChild == null
+                ? null : new CompiledRouteNode(source.parameterChild);
+            getRoute = source.getRoute;
+            postRoute = source.postRoute;
+        }
+
+        private Route find(
+                long baseAddress, long[] segments, int segmentCount,
+                int methodCode) {
+            return findFrom(
+                baseAddress, segments, segmentCount, methodCode, 0);
+        }
+
+        private Route findFrom(
+                long baseAddress, long[] segments, int segmentCount,
+                int methodCode, int segmentIndex) {
+            if (segmentIndex == segmentCount) {
+                return methodCode == 1
+                    ? getRoute
+                    : methodCode == 2 ? postRoute : null;
+            }
+
+            long packed = segments[segmentIndex];
+            long offset = packed >>> 32;
+            int length = (int) packed;
+            CompiledRouteNode staticChild = findStaticChild(
+                baseAddress, offset, length);
+            if (staticChild != null) {
+                Route route = staticChild.findFrom(
+                    baseAddress, segments, segmentCount,
+                    methodCode, segmentIndex + 1);
+                if (route != null) {
+                    return route;
+                }
+            }
+            return parameterChild == null
+                ? null
+                : parameterChild.findFrom(
+                    baseAddress, segments, segmentCount,
+                    methodCode, segmentIndex + 1);
+        }
+
+        private CompiledRouteNode findStaticChild(
+                long baseAddress, long offset, int length) {
+            if (staticChildren.length == 0) {
+                return null;
+            }
+            int hash = hashSegment(baseAddress, offset, length);
+            int slot = spread(hash) & staticMask;
+            StaticRouteEdge edge;
+            while ((edge = staticChildren[slot]) != null) {
+                if (edge.hash == hash
+                        && edge.matches(baseAddress, offset, length)) {
+                    return edge.child;
+                }
+                slot = (slot + 1) & staticMask;
+            }
+            return null;
+        }
+    }
+
+    private final MutableRouteNode mutableRouteRoot = new MutableRouteNode();
+    private volatile CompiledRouteNode compiledRouteRoot;
+    private volatile boolean routeTreeDirty = true;
     private volatile FastPrefixRoute[] fastPrefixRoutes = new FastPrefixRoute[0];
 
     public synchronized void registerController(Object controller) {
@@ -53,7 +202,7 @@ public class Router {
         }
     }
 
-    private void registerRoute(String httpMethod, String pattern, Method method, Object controller) {
+    private synchronized void registerRoute(String httpMethod, String pattern, Method method, Object controller) {
         String[] parts = pattern.split("/");
         List<String> list = new ArrayList<>();
         for (String p : parts) {
@@ -122,7 +271,8 @@ public class Router {
                 "@DecodedBody requires an unsafe route without path "
                     + "parameters: " + method);
         }
-        routeList.add(newRoute);
+        mutableRouteRoot.add(newRoute, 0);
+        routeTreeDirty = true;
 
         if (paramCount == 1 && isParam[segments.length - 1]) {
             int braceIdx = pattern.indexOf('{');
@@ -136,23 +286,43 @@ public class Router {
             }
         }
 
-        // Rebuild segCount table
-        int maxSeg = 0;
-        for (Route r : routeList) {
-            if (r.segmentCount > maxSeg) maxSeg = r.segmentCount;
-        }
-        Route[][] newTable = new Route[maxSeg + 1][];
-        for (int sc = 0; sc <= maxSeg; sc++) {
-            List<Route> matched = new ArrayList<>();
-            for (Route r : routeList) {
-                if (r.segmentCount == sc) {
-                    matched.add(r);
-                }
-            }
-            newTable[sc] = matched.toArray(new Route[0]);
-        }
-        this.routesBySegCount = newTable;
         System.out.println("Registered Route: [" + httpMethod + "] " + pattern + " -> " + method.getDeclaringClass().getSimpleName() + "." + method.getName());
+    }
+
+    private CompiledRouteNode compiledRoutes() {
+        CompiledRouteNode routes = compiledRouteRoot;
+        if (!routeTreeDirty && routes != null) {
+            return routes;
+        }
+        synchronized (this) {
+            if (routeTreeDirty || compiledRouteRoot == null) {
+                compiledRouteRoot = new CompiledRouteNode(mutableRouteRoot);
+                routeTreeDirty = false;
+            }
+            return compiledRouteRoot;
+        }
+    }
+
+    private static int hashBytes(byte[] bytes) {
+        int hash = 0x811c9dc5;
+        for (byte value : bytes) {
+            hash = (hash ^ (value & 0xff)) * 0x01000193;
+        }
+        return hash;
+    }
+
+    private static int hashSegment(
+            long baseAddress, long offset, int length) {
+        int hash = 0x811c9dc5;
+        for (int index = 0; index < length; index++) {
+            hash = (hash ^ (RawSegment.getByte(
+                baseAddress, offset + index) & 0xff)) * 0x01000193;
+        }
+        return hash;
+    }
+
+    private static int spread(int hash) {
+        return hash ^ (hash >>> 16);
     }
 
     private RouteHandler compileLambda(Method method, Object controller) {
@@ -312,57 +482,9 @@ public class Router {
 
         long[] segPacked = request.segPacked();
         int segCount = splitPath(baseAddr, pathOffset, pathLen, segPacked);
-
-        Route[][] table = this.routesBySegCount;
-        if (segCount >= table.length) {
-            return request.cacheRoute(null, segCount);
-        }
-        Route[] rList = table[segCount];
-        if (rList == null) {
-            return request.cacheRoute(null, segCount);
-        }
-        int rCount = rList.length;
-
-        for (int r = 0; r < rCount; r++) {
-            Route route = rList[r];
-            if (route.methodCode != reqMethodCode) {
-                if (reqMethodCode != 0 || methodOffset < 0
-                    || !request.method()
-                        .equalsIgnoreCaseString(route.httpMethod)) {
-                    continue;
-                }
-            }
-
-            boolean match = true;
-            for (int i = 0; i < segCount; i++) {
-                if (route.isParam[i]) continue;
-                long seg = segPacked[i];
-                long len = seg & 0xFFFFFFFFL;
-                if (len != route.segmentLengths[i]) {
-                    match = false;
-                    break;
-                }
-                long offset = seg >>> 32;
-                if (len <= 8) {
-                    long inputWord = RawSegment.getLong(baseAddr, offset) & route.segmentMasks[i];
-                    if (inputWord != route.segmentLongs[i]) {
-                        match = false;
-                        break;
-                    }
-                } else {
-                    if (!matchSegmentBytes(baseAddr, offset, len, route.segmentBytes[i])) {
-                        match = false;
-                        break;
-                    }
-                }
-            }
-
-            if (match) {
-                return request.cacheRoute(route, segCount);
-            }
-        }
-
-        return request.cacheRoute(null, segCount);
+        Route route = compiledRoutes().find(
+            baseAddr, segPacked, segCount, reqMethodCode);
+        return request.cacheRoute(route, segCount);
     }
 
     public boolean isIsolatedRoute(HttpRequest request) {
@@ -643,58 +765,12 @@ public class Router {
 
         long[] segPacked = request.segPacked();
         int segCount = splitPath(baseAddr, pathOffset, pathLen, segPacked);
-
-        Route[][] table = this.routesBySegCount;
-        if (segCount >= table.length) {
-            return Response.notFound();
-        }
-        Route[] rList = table[segCount];
-        if (rList == null) {
-            return Response.notFound();
-        }
-        int rCount = rList.length;
-
-        for (int r = 0; r < rCount; r++) {
-            Route route = rList[r];
-            if (route.methodCode != reqMethodCode) {
-                if (reqMethodCode != 0 || methodOffset < 0
-                    || !request.method()
-                        .equalsIgnoreCaseString(route.httpMethod)) {
-                    continue;
-                }
-            }
-
-            boolean match = true;
-            for (int i = 0; i < segCount; i++) {
-                if (route.isParam[i]) continue;
-                long seg = segPacked[i];
-                long len = seg & 0xFFFFFFFFL;
-                if (len != route.segmentLengths[i]) {
-                    match = false;
-                    break;
-                }
-                long offset = seg >>> 32;
-                if (len <= 8) {
-                    long inputWord = RawSegment.getLong(baseAddr, offset) & route.segmentMasks[i];
-                    if (inputWord != route.segmentLongs[i]) {
-                        match = false;
-                        break;
-                    }
-                } else {
-                    if (!matchSegmentBytes(baseAddr, offset, len, route.segmentBytes[i])) {
-                        match = false;
-                        break;
-                    }
-                }
-            }
-
-            if (match) {
-                return invokeMatchedRoute(
-                    route, request, segment, baseAddr, segCount);
-            }
-        }
-
-        return Response.notFound();
+        Route route = compiledRoutes().find(
+            baseAddr, segPacked, segCount, reqMethodCode);
+        return route == null
+            ? Response.notFound()
+            : invokeMatchedRoute(
+                route, request, segment, baseAddr, segCount);
     }
 
     private Response invokeMatchedRoute(

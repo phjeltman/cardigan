@@ -13,6 +13,10 @@ REQUEST_PARSERS_ONLY=false
 HPACK_HUFFMAN_ONLY=false
 HTTP2_RESPONSE_ONLY=false
 HTTP1_CHUNKED_ONLY=false
+OPTIMIZATION_ROUTING_ONLY=false
+OPTIMIZATION_JSON_FIELDS_ONLY=false
+OPTIMIZATION_JSON_WRITER_ONLY=false
+OPTIMIZATION_QUADRATIC_ONLY=false
 CHUNKED_UPLOAD=false
 CHUNK_SIZES="64,1024,16384"
 CHUNK_SIZE=""
@@ -127,6 +131,12 @@ Options:
   --hpack-huffman            Benchmark production HPACK Huffman paths only
   --http2-response           Benchmark small HTTP/2 response framing only
   --http1-chunked            Benchmark Pico HTTP/1 chunk decoding only
+  --optimization-routing     Benchmark route-table lookup scaling only
+  --optimization-json-fields
+                             Benchmark repeated on-demand JSON field access
+  --optimization-json-writer
+                             Benchmark record JSON writing and materialization
+  --optimization-quadratic  Benchmark collection and helper API scaling
   --jvmti                    Build with debug symbols and load perf-jvmti
   -h, --help                 Show this help
 
@@ -151,6 +161,10 @@ Examples:
   ./dev/benchmarks/benchmark.sh --hpack-huffman
   ./dev/benchmarks/benchmark.sh --http2-response
   ./dev/benchmarks/benchmark.sh --http1-chunked
+  ./dev/benchmarks/benchmark.sh --optimization-routing
+  ./dev/benchmarks/benchmark.sh --optimization-json-fields
+  ./dev/benchmarks/benchmark.sh --optimization-json-writer
+  ./dev/benchmarks/benchmark.sh --optimization-quadratic
 EOF
 }
 
@@ -201,6 +215,30 @@ while [ "$#" -gt 0 ]; do
             RUN_MICROBENCHMARKS=true
             MICRO_ONLY=true
             HTTP1_CHUNKED_ONLY=true
+            shift
+            ;;
+        --optimization-routing)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_ROUTING_ONLY=true
+            shift
+            ;;
+        --optimization-json-fields)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_JSON_FIELDS_ONLY=true
+            shift
+            ;;
+        --optimization-json-writer)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_JSON_WRITER_ONLY=true
+            shift
+            ;;
+        --optimization-quadratic)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_QUADRATIC_ONLY=true
             shift
             ;;
         --scheduler-stats)
@@ -980,6 +1018,14 @@ if [ "$RUN_MICROBENCHMARKS" = true ]; then
     MICROBENCHMARK_ARGS=()
     if [ "$REQUEST_PARSERS_ONLY" = true ]; then
         MICROBENCHMARK_ARGS+=(--request-parsers)
+    elif [ "$OPTIMIZATION_ROUTING_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-routing)
+    elif [ "$OPTIMIZATION_JSON_FIELDS_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-json-fields)
+    elif [ "$OPTIMIZATION_JSON_WRITER_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-json-writer)
+    elif [ "$OPTIMIZATION_QUADRATIC_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-quadratic)
     elif [ "$HPACK_HUFFMAN_ONLY" = true ]; then
         MICROBENCHMARK_ARGS+=(--hpack-huffman)
     elif [ "$HTTP2_RESPONSE_ONLY" = true ]; then

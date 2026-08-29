@@ -48,6 +48,25 @@ class ResponseHeadersTest {
     }
 
     @Test
+    void chainedHeadersMaterializeOnceInInsertionOrder() {
+        Response original = Response.text("hello");
+        Response response = original;
+        for (int index = 0; index < 32; index++) {
+            response = response.withHeader(
+                "X-Sequence-" + index, Integer.toString(index));
+        }
+
+        assertTrue(original.headers().isEmpty());
+        assertEquals(32, response.headers().size());
+        for (int index = 0; index < 32; index++) {
+            assertEquals("x-sequence-" + index,
+                response.headers().name(index));
+            assertEquals(Integer.toString(index),
+                response.headers().value(index));
+        }
+    }
+
+    @Test
     void rejectsInjectionAndProtocolOwnedFields() {
         assertThrows(
             IllegalArgumentException.class,

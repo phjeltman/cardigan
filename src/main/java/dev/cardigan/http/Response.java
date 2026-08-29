@@ -87,11 +87,9 @@ public final class Response {
     }
 
     public Response withHeader(String name, String value) {
-        return withHeaders(
-            ResponseHeaders.builder()
-                .addAll(headers())
-                .add(name, value)
-                .build());
+        ResponseHeaders next = headers().append(name, value);
+        validateApplicationField(next.lastName(), false);
+        return withMetadata(next, trailers());
     }
 
     public Response withHeaders(ResponseHeaders headers) {
@@ -101,11 +99,9 @@ public final class Response {
     }
 
     public Response withTrailer(String name, String value) {
-        return withTrailers(
-            ResponseHeaders.builder()
-                .addAll(trailers())
-                .add(name, value)
-                .build());
+        ResponseHeaders next = trailers().append(name, value);
+        validateApplicationField(next.lastName(), true);
+        return withMetadata(headers(), next);
     }
 
     public Response withTrailers(ResponseHeaders trailers) {
@@ -139,15 +135,19 @@ public final class Response {
             ResponseHeaders fields,
             boolean trailers) {
         for (int index = 0; index < fields.size(); index++) {
-            String name = fields.name(index);
-            if (isProtocolOwned(name)
-                || trailers && (name.equals("host")
-                    || name.equals("content-encoding")
-                    || name.equals("content-range"))) {
-                throw new IllegalArgumentException(
-                    "Response " + (trailers ? "trailer" : "header")
-                        + " is managed by the protocol: " + name);
-            }
+            validateApplicationField(fields.name(index), trailers);
+        }
+    }
+
+    private static void validateApplicationField(
+            String name, boolean trailers) {
+        if (isProtocolOwned(name)
+            || trailers && (name.equals("host")
+                || name.equals("content-encoding")
+                || name.equals("content-range"))) {
+            throw new IllegalArgumentException(
+                "Response " + (trailers ? "trailer" : "header")
+                    + " is managed by the protocol: " + name);
         }
     }
 

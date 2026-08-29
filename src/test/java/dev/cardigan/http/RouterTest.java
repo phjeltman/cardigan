@@ -41,6 +41,28 @@ public class RouterTest {
         }
     }
 
+    public static class TrieController {
+        @Get("/catalog/known/detail")
+        public Response known() {
+            return Response.text("known");
+        }
+
+        @Post("/catalog/known/detail")
+        public Response knownPost() {
+            return Response.text("post");
+        }
+
+        @Get("/catalog/static/other")
+        public Response staticBranch() {
+            return Response.text("static");
+        }
+
+        @Get("/catalog/{name}/fallback")
+        public Response parameterFallback() {
+            return Response.text("fallback");
+        }
+    }
+
     public static class InvalidStreamingController {
         @Get("/streaming-get")
         public Response streamingGet(RequestBody body) {
@@ -179,6 +201,36 @@ public class RouterTest {
                 () -> materializations[0]++);
             assertEquals(1, materializations[0]);
             assertEquals("present", invocation.invoke().body());
+        }
+    }
+
+    @Test
+    void compiledRouteTreeMatchesStaticMethodsAndParameterFallbacks() {
+        Router router = new Router();
+        router.registerController(new TrieController());
+
+        assertEquals("known", dispatch(router,
+            "GET /catalog/known/detail HTTP/1.1\r\n\r\n").body());
+        assertEquals("post", dispatch(router,
+            "POST /catalog/known/detail HTTP/1.1\r\n"
+                + "Content-Length: 0\r\n\r\n").body());
+        assertEquals("fallback", dispatch(router,
+            "GET /catalog/static/fallback HTTP/1.1\r\n\r\n").body());
+        assertEquals(404, dispatch(router,
+            "GET /catalog/absent/detail HTTP/1.1\r\n\r\n").statusCode());
+    }
+
+    private static Response dispatch(Router router, String encoded) {
+        byte[] bytes = encoded.getBytes(
+            java.nio.charset.StandardCharsets.US_ASCII);
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment segment = arena.allocate(bytes.length);
+            MemorySegment.copy(
+                bytes, 0, segment, ValueLayout.JAVA_BYTE, 0, bytes.length);
+            HttpRequest request = new HttpRequest();
+            assertTrue(HttpRequestParser.parse(
+                segment, bytes.length, request));
+            return router.dispatch(request);
         }
     }
 

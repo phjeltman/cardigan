@@ -22,9 +22,8 @@ import dev.cardigan.simdjson.SimdJsonException;
 import dev.cardigan.simdjson.Tape;
 
 import java.lang.foreign.MemorySegment;
-import java.util.ArrayList;
 import java.util.Iterator;
-import java.util.List;
+import java.util.NoSuchElementException;
 
 /**
  * DOM Array view.
@@ -35,49 +34,63 @@ public final class JsonArray implements Iterable<JsonValue> {
     private final Tape tape;
     private final int startTapeIndex;
     private final int endTapeIndex;
+    private final int[] elementTapeIndexes;
 
     public JsonArray(MemorySegment segment, Tape tape, int startTapeIndex) {
         this.segment = segment;
         this.tape = tape;
         this.startTapeIndex = startTapeIndex;
         this.endTapeIndex = (int) tape.getPayload(startTapeIndex);
+        int size = 0;
+        int current = startTapeIndex + 1;
+        while (current < endTapeIndex) {
+            size++;
+            current = skipValue(current);
+        }
+        this.elementTapeIndexes = new int[size];
+        current = startTapeIndex + 1;
+        for (int index = 0; index < size; index++) {
+            elementTapeIndexes[index] = current;
+            current = skipValue(current);
+        }
     }
 
     public JsonValue get(int index) {
         if (index < 0) {
             throw new SimdJsonException(SimdJsonError.INDEX_OUT_OF_BOUNDS, "Negative index: " + index);
         }
-        int current = startTapeIndex + 1;
-        int count = 0;
-        while (current < endTapeIndex) {
-            if (count == index) {
-                return new JsonValue(segment, tape, current);
-            }
-            count++;
-            current = skipValue(current);
+        if (index >= elementTapeIndexes.length) {
+            throw new SimdJsonException(
+                SimdJsonError.INDEX_OUT_OF_BOUNDS,
+                "Index " + index + " out of bounds, size: "
+                    + elementTapeIndexes.length);
         }
-        throw new SimdJsonException(SimdJsonError.INDEX_OUT_OF_BOUNDS, "Index " + index + " out of bounds, size: " + count);
+        return new JsonValue(segment, tape, elementTapeIndexes[index]);
     }
 
     public int size() {
-        int count = 0;
-        int current = startTapeIndex + 1;
-        while (current < endTapeIndex) {
-            count++;
-            current = skipValue(current);
-        }
-        return count;
+        return elementTapeIndexes.length;
     }
 
     @Override
     public Iterator<JsonValue> iterator() {
-        List<JsonValue> list = new ArrayList<>();
-        int current = startTapeIndex + 1;
-        while (current < endTapeIndex) {
-            list.add(new JsonValue(segment, tape, current));
-            current = skipValue(current);
-        }
-        return list.iterator();
+        return new Iterator<>() {
+            private int index;
+
+            @Override
+            public boolean hasNext() {
+                return index < elementTapeIndexes.length;
+            }
+
+            @Override
+            public JsonValue next() {
+                if (!hasNext()) {
+                    throw new NoSuchElementException();
+                }
+                return new JsonValue(
+                    segment, tape, elementTapeIndexes[index++]);
+            }
+        };
     }
 
     private int skipValue(int tapeIndex) {
