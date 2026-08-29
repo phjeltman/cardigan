@@ -39,6 +39,11 @@ import jdk.incubator.vector.VectorSpecies;
 public class PicoHTTPParser {
     public static final int ERROR_PARSE = -1;
     public static final int ERROR_PARTIAL = -2;
+    public static final int ERROR_CHUNKED_PAYLOAD_LIMIT = -3;
+    public static final int ERROR_CHUNKED_METADATA_LIMIT = -4;
+    public static final int CHUNKED_SPAN_DATA = 0;
+    public static final int CHUNKED_OUTPUT_FULL = 0;
+    public static final int CHUNKED_COMPLETE = 1;
 
     private static final ValueLayout.OfInt JAVA_INT_UNALIGNED_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
     private static final ValueLayout.OfLong JAVA_LONG_UNALIGNED_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
@@ -765,18 +770,120 @@ public class PicoHTTPParser {
             & ~value & 0x8080808080808080L;
     }
 
-    public static long decodeChunked(ChunkedDecoder decoder, MemorySegment ms, long offset, long[] bufsz) {
+    public static long decodeChunked(
+        ChunkedDecoder decoder,
+        MemorySegment ms,
+        long offset,
+        long[] bufsz
+    ) {
+        return decodeChunkedInternal(
+            decoder, ms, offset, bufsz[0], bufsz, null,
+            null, 0, 0, 0, 0);
+    }
+
+    /**
+     * Advances chunk framing without compacting payload bytes. {@code span[0]}
+     * receives the number of input bytes consumed and {@code span[1]} the
+     * trailing payload bytes within that consumed prefix. A data result always
+     * ends at the consumed offset, so its payload begins at
+     * {@code offset + span[0] - span[1]}.
+     * Returns {@link #CHUNKED_SPAN_DATA}, {@link #CHUNKED_COMPLETE},
+     * {@link #ERROR_PARTIAL}, or {@link #ERROR_PARSE}.
+     */
+    public static int decodeChunkedSpan(
+        ChunkedDecoder decoder,
+        MemorySegment ms,
+        long offset,
+        long inputLength,
+        long[] span
+    ) {
+        if (span.length < 2) {
+            throw new IllegalArgumentException(
+                "Chunked span output requires two elements");
+        }
+        return (int) decodeChunkedInternal(
+            decoder, ms, offset, inputLength, null, span,
+            null, 0, 0, 0, 0);
+    }
+
+    /**
+     * Decodes payload directly from the framed input into {@code destination}.
+     * {@code progress[0]} receives consumed input bytes and
+     * {@code progress[1]} produced payload bytes. The decoder stops when the
+     * input or destination is exhausted, the message completes, or a limit is
+     * exceeded. Returns {@link #CHUNKED_OUTPUT_FULL},
+     * {@link #CHUNKED_COMPLETE}, {@link #ERROR_PARTIAL}, or one of the
+     * chunked error constants.
+     */
+    public static int decodeChunkedTo(
+        ChunkedDecoder decoder,
+        MemorySegment ms,
+        long offset,
+        long inputLength,
+        MemorySegment destination,
+        long destinationOffset,
+        long destinationLength,
+        long maximumPayloadLength,
+        long maximumMetadataLength,
+        long[] progress
+    ) {
+        if (progress.length < 2) {
+            throw new IllegalArgumentException(
+                "Chunked progress output requires two elements");
+        }
+        if (destination == null) {
+            throw new IllegalArgumentException(
+                "Chunked decode destination is required");
+        }
+        if (inputLength < 0 || destinationLength < 0
+                || maximumPayloadLength < 0
+                || maximumMetadataLength < 0) {
+            throw new IllegalArgumentException(
+                "Chunked decode lengths must not be negative");
+        }
+        return (int) decodeChunkedInternal(
+            decoder, ms, offset, inputLength, null, progress,
+            destination, destinationOffset, destinationLength,
+            maximumPayloadLength, maximumMetadataLength);
+    }
+
+    private static long decodeChunkedInternal(
+        ChunkedDecoder decoder,
+        MemorySegment ms,
+        long offset,
+        long inputLength,
+        long[] compactedSize,
+        long[] progress,
+        MemorySegment destination,
+        long destinationOffset,
+        long destinationLength,
+        long maximumPayloadLength,
+        long maximumMetadataLength
+    ) {
         long src = 0;
         long dst = 0;
-        long limit = bufsz[0];
+        long limit = inputLength;
         long ret = -2;
         long base = offset;
+        boolean directMode = destination != null;
+        boolean spanMode = progress != null && !directMode;
+        boolean progressiveMode = progress != null;
+        long destinationBase = destinationOffset;
         if (ms.isNative()) {
             base += ms.address();
             ms = RawSegment.ADDRESS_SPACE;
         }
+        if (directMode && destination.isNative()) {
+            destinationBase += destination.address();
+            destination = RawSegment.ADDRESS_SPACE;
+        }
 
-        decoder.totalRead += limit;
+        if (progressiveMode) {
+            progress[0] = 0;
+            progress[1] = 0;
+        } else {
+            decoder.totalRead += limit;
+        }
 
         while (true) {
             switch (decoder.state) {
@@ -848,31 +955,97 @@ public class PicoHTTPParser {
                             decoder.state = CHUNKED_IN_TRAILERS_LINE_HEAD;
                             break;
                         } else {
-                            ret = limit - src;
+                            ret = progressiveMode
+                                ? CHUNKED_COMPLETE : limit - src;
                             break;
                         }
                     }
                     decoder.state = CHUNKED_IN_CHUNK_DATA;
+                    if (directMode
+                            && src - dst > maximumMetadataLength) {
+                        ret = ERROR_CHUNKED_METADATA_LIMIT;
+                        break;
+                    }
                     // fallthru
                 case CHUNKED_IN_CHUNK_DATA: {
                     long avail = limit - src;
-                    if (Long.compareUnsigned(avail, decoder.bytesLeftInChunk) < 0) {
-                        if (dst != src) {
-                            MemorySegment.copy(ms, base + src, ms, base + dst, avail);
+                    if (directMode) {
+                        if (Long.compareUnsigned(
+                                decoder.bytesLeftInChunk,
+                                maximumPayloadLength - dst) > 0) {
+                            ret = ERROR_CHUNKED_PAYLOAD_LIMIT;
+                            break;
                         }
-                        src += avail;
-                        dst += avail;
-                        decoder.bytesLeftInChunk -= avail;
+                        long count = Math.min(
+                            Math.min(avail, decoder.bytesLeftInChunk),
+                            destinationLength - dst
+                        );
+                        if (count != 0) {
+                            MemorySegment.copy(
+                                ms, base + src,
+                                destination, destinationBase + dst,
+                                count
+                            );
+                            src += count;
+                            dst += count;
+                            decoder.bytesLeftInChunk -= count;
+                            if (decoder.bytesLeftInChunk == 0) {
+                                decoder.state =
+                                    CHUNKED_IN_CHUNK_DATA_EXPECT_CR;
+                            }
+                        }
+                        if (dst == destinationLength) {
+                            ret = CHUNKED_OUTPUT_FULL;
+                            break;
+                        }
+                        if (src == limit) {
+                            break;
+                        }
+                        // A non-full destination and remaining input imply
+                        // that this chunk ended, so consume its delimiter.
+                    } else if (spanMode) {
+                        if (avail == 0) {
+                            break;
+                        }
+                        long count;
+                        if (Long.compareUnsigned(
+                                avail, decoder.bytesLeftInChunk) < 0) {
+                            count = avail;
+                            decoder.bytesLeftInChunk -= count;
+                        } else {
+                            count = decoder.bytesLeftInChunk;
+                            decoder.bytesLeftInChunk = 0;
+                            decoder.state =
+                                CHUNKED_IN_CHUNK_DATA_EXPECT_CR;
+                        }
+                        src += count;
+                        progress[0] = src;
+                        progress[1] = count;
+                        ret = CHUNKED_SPAN_DATA;
                         break;
-                    }
+                    } else {
+                        if (Long.compareUnsigned(
+                                avail, decoder.bytesLeftInChunk) < 0) {
+                            if (dst != src) {
+                                MemorySegment.copy(
+                                    ms, base + src, ms, base + dst, avail);
+                            }
+                            src += avail;
+                            dst += avail;
+                            decoder.bytesLeftInChunk -= avail;
+                            break;
+                        }
 
-                    if (dst != src) {
-                        MemorySegment.copy(ms, base + src, ms, base + dst, decoder.bytesLeftInChunk);
+                        if (dst != src) {
+                            MemorySegment.copy(
+                                ms, base + src, ms, base + dst,
+                                decoder.bytesLeftInChunk);
+                        }
+                        src += decoder.bytesLeftInChunk;
+                        dst += decoder.bytesLeftInChunk;
+                        decoder.bytesLeftInChunk = 0;
+                        decoder.state = CHUNKED_IN_CHUNK_DATA_EXPECT_CR;
                     }
-                    src += decoder.bytesLeftInChunk;
-                    dst += decoder.bytesLeftInChunk;
-                    decoder.bytesLeftInChunk = 0;
-                    decoder.state = CHUNKED_IN_CHUNK_DATA_EXPECT_CR;
                 }
                 case CHUNKED_IN_CHUNK_DATA_EXPECT_CR:
                     if (src == limit) {
@@ -910,7 +1083,8 @@ public class PicoHTTPParser {
                     }
                     if (ms.get(ValueLayout.JAVA_BYTE, base + src) == (byte) '\n') {
                         src++;
-                        ret = limit - src;
+                        ret = progressiveMode
+                            ? CHUNKED_COMPLETE : limit - src;
                         break;
                     }
                     src++;
@@ -939,15 +1113,35 @@ public class PicoHTTPParser {
                     throw new IllegalStateException("decoder is corrupt");
             }
 
-            if (ret >= 0 || ret == -1 || src == limit) {
+            if (ret != ERROR_PARTIAL || src == limit) {
                 break;
             }
+        }
+
+        if (directMode && ret != ERROR_PARSE
+                && src - dst > maximumMetadataLength) {
+            ret = ERROR_CHUNKED_METADATA_LIMIT;
+        }
+
+        if (progressiveMode) {
+            long produced = directMode ? dst : progress[1];
+            progress[0] = src;
+            progress[1] = produced;
+            decoder.totalRead += src;
+            decoder.totalOverhead += src - produced;
+            if ((ret == ERROR_PARTIAL || ret == CHUNKED_OUTPUT_FULL)
+                    && decoder.totalOverhead >= 100 * 1024
+                    && decoder.totalRead - decoder.totalOverhead
+                        < decoder.totalRead / 4) {
+                ret = ERROR_PARSE;
+            }
+            return ret;
         }
 
         if (dst != src) {
             MemorySegment.copy(ms, base + src, ms, base + dst, limit - src);
         }
-        bufsz[0] = dst;
+        compactedSize[0] = dst;
 
         if (ret == -2) {
             decoder.totalOverhead += limit - dst;
