@@ -507,6 +507,7 @@ public class HttpRequest {
         target.queryLen = source.queryLen;
         target.minorVersion = source.minorVersion;
         target.numHeaders = source.numHeaders;
+        target.framingHeaders = source.framingHeaders;
         for (int i = 0; i < source.numHeaders; i++) {
             target.headers[i].nameOffset = source.headers[i].nameOffset;
             target.headers[i].nameLen = source.headers[i].nameLen;

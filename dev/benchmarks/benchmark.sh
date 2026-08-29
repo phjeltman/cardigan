@@ -21,6 +21,9 @@ OPTIMIZATION_SCHEDULER_ONLY=false
 OPTIMIZATION_REQUEST_STORAGE_ONLY=false
 OPTIMIZATION_HEADERS_ONLY=false
 OPTIMIZATION_ROUTE_BINDING_ONLY=false
+OPTIMIZATION_HTTP1_PARSE_ONLY=false
+OPTIMIZATION_JSON_RECORD_ONLY=false
+OPTIMIZATION_HTTP1_SEQUENCER_ONLY=false
 CHUNKED_UPLOAD=false
 CHUNK_SIZES="64,1024,16384"
 CHUNK_SIZE=""
@@ -147,6 +150,12 @@ Options:
   --optimization-headers    Benchmark request-header lookup and metadata access
   --optimization-route-binding
                              Benchmark generic route argument binding
+  --optimization-http1-parse
+                             Benchmark HTTP/1 parsing and framing validation
+  --optimization-json-record
+                             Benchmark validated positional record decoding
+  --optimization-http1-sequencer
+                             Benchmark ordered HTTP/1 exchange lifecycle
   --jvmti                    Build with debug symbols and load perf-jvmti
   -h, --help                 Show this help
 
@@ -179,6 +188,9 @@ Examples:
   ./dev/benchmarks/benchmark.sh --optimization-request-storage
   ./dev/benchmarks/benchmark.sh --optimization-headers
   ./dev/benchmarks/benchmark.sh --optimization-route-binding
+  ./dev/benchmarks/benchmark.sh --optimization-http1-parse
+  ./dev/benchmarks/benchmark.sh --optimization-json-record
+  ./dev/benchmarks/benchmark.sh --optimization-http1-sequencer
 EOF
 }
 
@@ -277,6 +289,24 @@ while [ "$#" -gt 0 ]; do
             RUN_MICROBENCHMARKS=true
             MICRO_ONLY=true
             OPTIMIZATION_ROUTE_BINDING_ONLY=true
+            shift
+            ;;
+        --optimization-http1-parse)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_HTTP1_PARSE_ONLY=true
+            shift
+            ;;
+        --optimization-json-record)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_JSON_RECORD_ONLY=true
+            shift
+            ;;
+        --optimization-http1-sequencer)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_HTTP1_SEQUENCER_ONLY=true
             shift
             ;;
         --scheduler-stats)
@@ -1072,6 +1102,12 @@ if [ "$RUN_MICROBENCHMARKS" = true ]; then
         MICROBENCHMARK_ARGS+=(--optimization-headers)
     elif [ "$OPTIMIZATION_ROUTE_BINDING_ONLY" = true ]; then
         MICROBENCHMARK_ARGS+=(--optimization-route-binding)
+    elif [ "$OPTIMIZATION_HTTP1_PARSE_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-http1-parse)
+    elif [ "$OPTIMIZATION_JSON_RECORD_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-json-record)
+    elif [ "$OPTIMIZATION_HTTP1_SEQUENCER_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-http1-sequencer)
     elif [ "$HPACK_HUFFMAN_ONLY" = true ]; then
         MICROBENCHMARK_ARGS+=(--hpack-huffman)
     elif [ "$HTTP2_RESPONSE_ONLY" = true ]; then

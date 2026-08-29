@@ -35,7 +35,12 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
         boolean send(Response response, boolean keepAlive);
     }
 
-    private final ExchangeExecutor executor;
+    @FunctionalInterface
+    interface TaskExecutor {
+        boolean submit(Runnable task);
+    }
+
+    private final TaskExecutor executor;
     private final ResponseSender responseSender;
     private final int maxInFlight;
     private final int mask;
@@ -56,6 +61,11 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
     private volatile StreamingBody activeResponseBody;
 
     Http1ExchangeSequencer(ExchangeExecutor executor, int requestedMaxInFlight,
+                           ResponseSender responseSender) {
+        this(executor::submit, requestedMaxInFlight, responseSender);
+    }
+
+    Http1ExchangeSequencer(TaskExecutor executor, int requestedMaxInFlight,
                            ResponseSender responseSender) {
         this.executor = executor;
         this.responseSender = responseSender;

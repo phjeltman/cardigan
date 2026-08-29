@@ -55,6 +55,83 @@ public final class Stage2Validator {
             : validateScalarStarts(jsonSegment, indexes);
     }
 
+    /**
+     * Validates a flat object whose fields will be consumed positionally and
+     * records trimmed key/value bounds for the deserializer.
+     */
+    public SimdJsonError validatePositionalRecord(
+            MemorySegment jsonSegment, StructuralIndexes indexes,
+            int fieldCount, int[] bounds) {
+        int expectedIndexes = fieldCount * 2 + 1;
+        if (fieldCount == 0 || fieldCount > 8
+                || !indexes.operatorsOnly()
+                || indexes.size() != expectedIndexes
+                || bounds.length < fieldCount * 4) {
+            return SimdJsonError.TAPE_ERROR;
+        }
+
+        int jsonLength = Math.toIntExact(jsonSegment.byteSize());
+        byte[] heapBytes = jsonSegment.heapBase()
+            .map(o -> (byte[]) o).orElse(null);
+        long sourceAddress = jsonSegment.address();
+        boolean mayContainBackslash = indexes.backslashCount() != 0;
+
+        int open = indexes.getUnchecked(0);
+        if (Stage2Parser.getByte(heapBytes, sourceAddress, open) != '{'
+                || !Stage2Parser.isWhitespaceOnly(
+                    heapBytes, sourceAddress, 0, open)) {
+            return SimdJsonError.TAPE_ERROR;
+        }
+
+        int previous = open;
+        for (int field = 0; field < fieldCount; field++) {
+            int colon = indexes.getUnchecked(field * 2 + 1);
+            int separator = indexes.getUnchecked(field * 2 + 2);
+            byte expectedSeparator =
+                field + 1 == fieldCount ? (byte) '}' : (byte) ',';
+            if (Stage2Parser.getByte(
+                    heapBytes, sourceAddress, colon) != ':'
+                    || Stage2Parser.getByte(
+                        heapBytes, sourceAddress, separator)
+                        != expectedSeparator) {
+                return SimdJsonError.TAPE_ERROR;
+            }
+
+            int keyStart = Stage2Parser.skipWhitespace(
+                heapBytes, sourceAddress, previous + 1, colon);
+            int keyEnd = Stage2Parser.trimWhitespace(
+                heapBytes, sourceAddress, keyStart, colon);
+            SimdJsonError error = Stage2Parser.validateKeyToken(
+                heapBytes, sourceAddress, keyStart, keyEnd,
+                mayContainBackslash);
+            if (error != SimdJsonError.SUCCESS) {
+                return error;
+            }
+
+            int valueStart = Stage2Parser.skipWhitespace(
+                heapBytes, sourceAddress, colon + 1, separator);
+            int valueEnd = Stage2Parser.trimWhitespace(
+                heapBytes, sourceAddress, valueStart, separator);
+            error = Stage2Parser.validateScalarToken(
+                heapBytes, sourceAddress, valueStart, valueEnd,
+                mayContainBackslash);
+            if (error != SimdJsonError.SUCCESS) {
+                return error;
+            }
+
+            int bound = field * 4;
+            bounds[bound] = keyStart + 1;
+            bounds[bound + 1] = keyEnd - keyStart - 2;
+            bounds[bound + 2] = valueStart;
+            bounds[bound + 3] = valueEnd;
+            previous = separator;
+        }
+
+        return Stage2Parser.isWhitespaceOnly(
+            heapBytes, sourceAddress, previous + 1, jsonLength)
+                ? SimdJsonError.SUCCESS : SimdJsonError.TAPE_ERROR;
+    }
+
     private SimdJsonError validateScalarStarts(
             MemorySegment jsonSegment, StructuralIndexes indexes) {
         int depth = 0;

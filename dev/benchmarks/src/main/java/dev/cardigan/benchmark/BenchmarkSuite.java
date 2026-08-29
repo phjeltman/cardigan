@@ -3,6 +3,8 @@
 package dev.cardigan.benchmark;
 
 import dev.cardigan.core.Http2ResponseBenchmark;
+import dev.cardigan.core.Http1ParsingBenchmark;
+import dev.cardigan.core.Http1ExchangeSequencerBenchmark;
 import dev.cardigan.core.MpscArrayQueueBenchmark;
 import dev.cardigan.http.Get;
 import dev.cardigan.http.HttpRequest;
@@ -191,6 +193,12 @@ public final class BenchmarkSuite {
                     HeaderAccessBenchmark.run();
                 case "--optimization-route-binding" ->
                     RouteBindingBenchmark.run();
+                case "--optimization-http1-parse" ->
+                    Http1ParsingBenchmark.run();
+                case "--optimization-json-record" ->
+                    runJsonRecordOptimizationBenchmarks();
+                case "--optimization-http1-sequencer" ->
+                    Http1ExchangeSequencerBenchmark.run();
                 case "--request-parsers" -> runRequestParserBenchmarks();
                 case "--hpack-huffman" -> HpackHuffmanBenchmark.run();
                 case "--http2-response" -> Http2ResponseBenchmark.run();
@@ -223,6 +231,9 @@ public final class BenchmarkSuite {
                 + "|--optimization-request-storage"
                 + "|--optimization-headers"
                 + "|--optimization-route-binding"
+                + "|--optimization-http1-parse"
+                + "|--optimization-json-record"
+                + "|--optimization-http1-sequencer"
                 + "|--request-parsers"
                 + "|--hpack-huffman|--http2-response"
                 + "|--http1-chunked]");
@@ -792,6 +803,43 @@ public final class BenchmarkSuite {
             });
             measure("JSON record serialization",
                 () -> JsonWriter.writeRecord(output, 0, user));
+        }
+    }
+
+    private static void runJsonRecordOptimizationBenchmarks() {
+        System.out.println("\n--- Validated positional JSON records ---");
+        String userJson =
+            "{\"name\":\"Alice Smith\",\"id\":427,\"active\":true}";
+        String wideJson =
+            "{\"field03\":3,\"field07\":7,\"field11\":11,"
+                + "\"field15\":15,\"field19\":19,\"field23\":23,"
+                + "\"field27\":27,\"field31\":31}";
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment userInput = arena.allocateFrom(userJson);
+            MemorySegment wideInput = arena.allocateFrom(wideJson);
+            int userLength = (int) userInput.byteSize() - 1;
+            int wideLength = (int) wideInput.byteSize() - 1;
+
+            User user = Serdes.fromJson(
+                userInput, 0, userLength, User.class);
+            WideJsonRecord wide = Serdes.fromJson(
+                wideInput, 0, wideLength, WideJsonRecord.class);
+            if (user.id() != 427 || !user.active()
+                    || wide.field31() != 31) {
+                throw new IllegalStateException(
+                    "invalid positional-record fixture");
+            }
+
+            measure("three-field endpoint record", () -> {
+                User decoded = Serdes.fromJson(
+                    userInput, 0, userLength, User.class);
+                return decoded.id() + (decoded.active() ? 1 : 0);
+            });
+            measure("eight-field primitive record", () -> {
+                WideJsonRecord decoded = Serdes.fromJson(
+                    wideInput, 0, wideLength, WideJsonRecord.class);
+                return decoded.field03() + decoded.field31();
+            });
         }
     }
 

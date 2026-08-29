@@ -47,6 +47,7 @@ public class PicoHTTPParser {
 
     private static final ValueLayout.OfInt JAVA_INT_UNALIGNED_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
     private static final ValueLayout.OfLong JAVA_LONG_UNALIGNED_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfShort JAVA_SHORT_UNALIGNED_LE = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
     private static final VectorSpecies<Byte> RANGE_SPECIES =
         ByteVector.SPECIES_256;
@@ -364,19 +365,19 @@ public class PicoHTTPParser {
         int numHeaders = 0;
         while (true) {
             if (i == limit) {
-                if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                return -2;
+                return finishHeaders(
+                    req, res, outNumHeaders, numHeaders, -2);
             }
             byte currentByte = ms.get(ValueLayout.JAVA_BYTE, base + i);
             if (currentByte == (byte) '\r') {
                 i++;
                 if (i == limit) {
-                    if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                    return -2;
+                    return finishHeaders(
+                        req, res, outNumHeaders, numHeaders, -2);
                 }
                 if (ms.get(ValueLayout.JAVA_BYTE, base + i) != (byte) '\n') {
-                    if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                    return -1;
+                    return finishHeaders(
+                        req, res, outNumHeaders, numHeaders, -1);
                 }
                 i++;
                 break;
@@ -385,29 +386,29 @@ public class PicoHTTPParser {
                 break;
             }
             if (numHeaders == maxHeaders) {
-                if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                return -1;
+                return finishHeaders(
+                    req, res, outNumHeaders, numHeaders, -1);
             }
             Header h = headers[numHeaders];
             byte headByte = ms.get(ValueLayout.JAVA_BYTE, base + i);
             if (!(numHeaders != 0 && (headByte == (byte) ' ' || headByte == (byte) '\t'))) {
                 long colonIndex = parseToken(ms, base, i, limit, (byte) ':');
                 if (colonIndex < 0) {
-                    if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                    return colonIndex;
+                    return finishHeaders(
+                        req, res, outNumHeaders, numHeaders, colonIndex);
                 }
                 long nameLen = colonIndex - i;
                 if (nameLen == 0) {
-                    if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                    return -1;
+                    return finishHeaders(
+                        req, res, outNumHeaders, numHeaders, -1);
                 }
                 h.nameOffset = i;
                 h.nameLen = nameLen;
                 i = colonIndex + 1; // skip ':'
                 while (true) {
                     if (i == limit) {
-                        if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                        return -2;
+                        return finishHeaders(
+                            req, res, outNumHeaders, numHeaders, -2);
                     }
                     byte b = ms.get(ValueLayout.JAVA_BYTE, base + i);
                     if (b != (byte) ' ' && b != (byte) '\t') {
@@ -422,8 +423,8 @@ public class PicoHTTPParser {
 
             long valRes = getTokenToEol(ms, base, i, limit);
             if (valRes < 0) {
-                if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                return valRes;
+                return finishHeaders(
+                    req, res, outNumHeaders, numHeaders, valRes);
             }
             long valLen = valRes >>> 32;
             long nextOffset = valRes & 0xFFFFFFFFL;
@@ -440,19 +441,127 @@ public class PicoHTTPParser {
             h.valueOffset = i;
             h.valueLen = valEnd - i;
 
+            if (req != null && h.nameOffset >= 0) {
+                classifyFramingHeader(
+                    ms, base, h.nameOffset, h.nameLen,
+                    numHeaders, req);
+            }
+
             i = nextOffset;
             numHeaders++;
-            if (req != null) {
-                req.numHeaders = numHeaders;
+        }
+        return finishHeaders(
+            req, res, outNumHeaders, numHeaders, i);
+    }
+
+    private static long finishHeaders(
+            Request req, Response res, int[] outNumHeaders,
+            int numHeaders, long result) {
+        if (req != null) {
+            req.numHeaders = numHeaders;
+        } else if (res != null) {
+            res.numHeaders = numHeaders;
+        } else {
+            outNumHeaders[0] = numHeaders;
+        }
+        return result;
+    }
+
+    private static void classifyFramingHeader(
+            MemorySegment ms, long base, long offset, long length,
+            int headerIndex, Request req) {
+        switch ((int) length) {
+            case 6 -> {
+                if (equalsLowercaseAscii6(
+                        ms, base + offset,
+                        0x65707865, 0x7463)) { // "expect"
+                    recordFramingHeader(
+                        req, Request.FRAMING_EXPECT_SHIFT,
+                        headerIndex, true);
+                }
             }
-            if (res != null) {
-                res.numHeaders = numHeaders;
+            case 10 -> {
+                if (equalsLowercaseAscii10(
+                        ms, base + offset,
+                        0x697463656e6e6f63L, 0x6e6f)) { // "connection"
+                    recordFramingHeader(
+                        req, Request.FRAMING_CONNECTION_SHIFT,
+                        headerIndex, false);
+                }
             }
-            if (outNumHeaders != null) {
-                outNumHeaders[0] = numHeaders;
+            case 14 -> {
+                if (equalsLowercaseAscii14(
+                        ms, base + offset,
+                        0x2d746e65746e6f63L,
+                        0x676e656c, 0x6874)) { // "content-length"
+                    recordFramingHeader(
+                        req, Request.FRAMING_CONTENT_LENGTH_SHIFT,
+                        headerIndex, true);
+                }
+            }
+            case 17 -> {
+                if (equalsLowercaseAscii17(
+                        ms, base + offset,
+                        0x726566736e617274L,
+                        0x6e69646f636e652dL, 0x67)) { // "transfer-encoding"
+                    recordFramingHeader(
+                        req, Request.FRAMING_TRANSFER_ENCODING_SHIFT,
+                        headerIndex, true);
+                }
+            }
+            default -> {
             }
         }
-        return i;
+    }
+
+    private static void recordFramingHeader(
+            Request req, int shift, int headerIndex,
+            boolean recordDuplicate) {
+        long lane = (req.framingHeaders >>> shift) & 0xffffL;
+        if ((lane & Request.FRAMING_INDEX_MASK) == 0) {
+            req.framingHeaders |= (long) (headerIndex + 1) << shift;
+        } else if (recordDuplicate) {
+            req.framingHeaders |=
+                Request.FRAMING_DUPLICATE_MASK << shift;
+        }
+    }
+
+    private static boolean equalsLowercaseAscii6(
+            MemorySegment ms, long offset, int first, int second) {
+        return (ms.get(JAVA_INT_UNALIGNED_LE, offset)
+                    | 0x20202020) == first
+            && ((ms.get(JAVA_SHORT_UNALIGNED_LE, offset + 4) & 0xffff)
+                    | 0x2020) == second;
+    }
+
+    private static boolean equalsLowercaseAscii10(
+            MemorySegment ms, long offset, long first, int second) {
+        return (ms.get(JAVA_LONG_UNALIGNED_LE, offset)
+                    | 0x2020202020202020L) == first
+            && ((ms.get(JAVA_SHORT_UNALIGNED_LE, offset + 8) & 0xffff)
+                    | 0x2020) == second;
+    }
+
+    private static boolean equalsLowercaseAscii14(
+            MemorySegment ms, long offset,
+            long first, int second, int third) {
+        return (ms.get(JAVA_LONG_UNALIGNED_LE, offset)
+                    | 0x2020202020202020L) == first
+            && (ms.get(JAVA_INT_UNALIGNED_LE, offset + 8)
+                    | 0x20202020) == second
+            && ((ms.get(JAVA_SHORT_UNALIGNED_LE, offset + 12) & 0xffff)
+                    | 0x2020) == third;
+    }
+
+    private static boolean equalsLowercaseAscii17(
+            MemorySegment ms, long offset,
+            long first, long second, int third) {
+        return (ms.get(JAVA_LONG_UNALIGNED_LE, offset)
+                    | 0x2020202020202020L) == first
+            && (ms.get(JAVA_LONG_UNALIGNED_LE, offset + 8)
+                    | 0x2020202020202020L) == second
+            && ((ms.get(ValueLayout.JAVA_BYTE, offset + 16) & 0xff)
+                    | 0x20) == third;
     }
 
     public static long parseRequest(MemorySegment ms, long offset, long limit, Request req, long lastLen) {

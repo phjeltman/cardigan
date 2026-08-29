@@ -44,7 +44,7 @@ public class HttpRequestParserTest {
         String body = "{\"name\":\"Alice\",\"age\":30}";
         String raw = "POST /api/users HTTP/1.1\r\n" +
                      "Content-Type: application/json\r\n" +
-                     "Content-Length: " + body.length() + "\r\n\r\n" +
+                     "cOnTeNt-LeNgTh: " + body.length() + "\r\n\r\n" +
                      body;
 
         try (Arena arena = Arena.ofConfined()) {
@@ -86,7 +86,7 @@ public class HttpRequestParserTest {
         }
         raw.append("X-Duplicate: first\r\n")
             .append("x-duplicate: second\r\n")
-            .append("Connection: keep-alive\r\n\r\n");
+            .append("cOnNeCtIoN: keep-alive\r\n\r\n");
 
         try (Arena arena = Arena.ofConfined()) {
             HttpRequest request = new HttpRequest();

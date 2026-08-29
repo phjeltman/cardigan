@@ -13,6 +13,7 @@ import java.util.Objects;
 import dev.cardigan.http.HttpRequest;
 import dev.cardigan.pico.PicoHTTPParser;
 import dev.cardigan.pico.Header;
+import dev.cardigan.pico.Request;
 import dev.cardigan.http.Router;
 import dev.cardigan.http.Response;
 import dev.cardigan.http.ResponseHeaders;
@@ -1540,64 +1541,72 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
      * rejects ambiguous framing before a body can desynchronise a keep-alive
      * connection.
      */
-    private static long parseHttp1Framing(HttpRequest request) {
-        boolean contentLengthSeen = false;
-        boolean transferEncodingSeen = false;
-        boolean expectationSeen = false;
+    static long parseHttp1Framing(HttpRequest request) {
         long contentLength = 0;
         long flags = 0;
-        int connectionHeaderIndex = -1;
         MemorySegment segment = request.segment();
-        Header[] headers = request.picoRequest().headers;
-        int headerCount = request.picoRequest().numHeaders;
+        Request parsed = request.picoRequest();
+        long framingHeaders = parsed.framingHeaders;
+        if (framingHeaders == 0) {
+            request.cacheConnectionHeader(-1);
+            return 0;
+        }
+        Header[] headers = parsed.headers;
+        long contentLengthLane = framingHeaders & 0xffffL;
+        long transferEncodingLane =
+            (framingHeaders >>> 16) & 0xffffL;
+        long expectLane = (framingHeaders >>> 32) & 0xffffL;
+        int connectionHeaderIndex = (int) ((framingHeaders >>> 48)
+            & Request.FRAMING_INDEX_MASK) - 1;
 
-        for (int index = 0; index < headerCount; index++) {
-            Header header = headers[index];
-            if (header.nameLen == 14
-                && asciiEqualsIgnoreCase(
-                    segment, header.nameOffset, 14, "content-length")) {
-                if (contentLengthSeen) {
-                    return HTTP1_FRAMING_INVALID;
-                }
-                contentLengthSeen = true;
-                contentLength = parseContentLength(
-                    segment, header.valueOffset, header.valueLen);
-                if (contentLength < 0) {
-                    return contentLength;
-                }
-            } else if (header.nameLen == 17
-                && asciiEqualsIgnoreCase(
-                    segment, header.nameOffset, 17, "transfer-encoding")) {
-                if (transferEncodingSeen
-                    || !isChunkedTransferEncoding(
+        if ((contentLengthLane
+                & Request.FRAMING_DUPLICATE_MASK) != 0
+            || (transferEncodingLane
+                & Request.FRAMING_DUPLICATE_MASK) != 0) {
+            return HTTP1_FRAMING_INVALID;
+        }
+
+        int contentLengthIndex = (int) (contentLengthLane
+            & Request.FRAMING_INDEX_MASK) - 1;
+        if (contentLengthIndex >= 0) {
+            Header header = headers[contentLengthIndex];
+            contentLength = parseContentLength(
+                segment, header.valueOffset, header.valueLen);
+            if (contentLength < 0) {
+                return contentLength;
+            }
+        }
+
+        int transferEncodingIndex = (int) (transferEncodingLane
+            & Request.FRAMING_INDEX_MASK) - 1;
+        if (transferEncodingIndex >= 0) {
+            Header header = headers[transferEncodingIndex];
+            if (!isChunkedTransferEncoding(
+                    segment, header.valueOffset, header.valueLen)) {
+                return HTTP1_FRAMING_INVALID;
+            }
+        }
+
+        int expectIndex = (int) (expectLane
+            & Request.FRAMING_INDEX_MASK) - 1;
+        if (expectIndex >= 0) {
+            Header header = headers[expectIndex];
+            if ((expectLane
+                    & Request.FRAMING_DUPLICATE_MASK) != 0
+                    || !isContinueExpectation(
                         segment, header.valueOffset, header.valueLen)) {
-                    return HTTP1_FRAMING_INVALID;
-                }
-                transferEncodingSeen = true;
-            } else if (header.nameLen == 6
-                && asciiEqualsIgnoreCase(
-                    segment, header.nameOffset, 6, "expect")) {
-                if (expectationSeen || !isContinueExpectation(
-                        segment, header.valueOffset, header.valueLen)) {
-                    flags |= HTTP1_EXPECT_UNSUPPORTED;
-                } else {
-                    flags |= HTTP1_EXPECT_CONTINUE;
-                }
-                expectationSeen = true;
-            } else if (connectionHeaderIndex < 0
-                && header.nameLen == 10
-                && asciiEqualsIgnoreCase(
-                    segment, header.nameOffset, 10, "connection")) {
-                connectionHeaderIndex = index;
+                flags |= HTTP1_EXPECT_UNSUPPORTED;
+            } else {
+                flags |= HTTP1_EXPECT_CONTINUE;
             }
         }
 
         request.cacheConnectionHeader(connectionHeaderIndex);
 
-        if (transferEncodingSeen) {
+        if (transferEncodingIndex >= 0) {
             // Cardigan supports only HTTP/1.1's terminal chunked coding;
             // Content-Length plus Transfer-Encoding is ambiguous framing.
-            if (contentLengthSeen || request.version() != 1) {
+            if (contentLengthIndex >= 0 || request.version() != 1) {
                 return HTTP1_FRAMING_INVALID;
             }
             return flags | HTTP1_FRAMING_CHUNKED;

@@ -126,14 +126,19 @@ public final class Serdes {
             }
 
             indexOrThrow(state.indexer, slice, indexes);
-            validateOrThrow(state.validator, slice, indexes);
             de.reset(
                 slice, 0, length, indexes,
                 state.indexer.hasBackslash());
 
             if (Record.class.isAssignableFrom(clazz)) {
-                return (T) de.readRecord((Class<? extends Record>) clazz);
+                dev.cardigan.json.RecordCache.RecordMetadata metadata =
+                    dev.cardigan.json.RecordCache.getMetadata(clazz);
+                validateRecordOrThrow(
+                    state.validator, slice, indexes, metadata, de);
+                return (T) de.readRecord(metadata);
             }
+
+            validateOrThrow(state.validator, slice, indexes);
 
             Deserializer<T> custom = (Deserializer<T>) REGISTRATION_DESERIALIZERS.get(clazz);
             if (custom != null) {
@@ -175,10 +180,11 @@ public final class Serdes {
             }
 
             indexOrThrow(state.indexer, slice, indexes);
-            validateOrThrow(state.validator, slice, indexes);
             de.reset(
                 slice, 0, length, indexes,
                 state.indexer.hasBackslash());
+            validateRecordOrThrow(
+                state.validator, slice, indexes, metadata, de);
             return (T) de.readRecord(metadata);
         } finally {
             state.depth--;
@@ -315,6 +321,26 @@ public final class Serdes {
         if (error != SimdJsonError.SUCCESS) {
             throw new SimdJsonException(error);
         }
+    }
+
+    private static void validateRecordOrThrow(
+            Stage2Validator validator, MemorySegment segment,
+            StructuralIndexes indexes,
+            dev.cardigan.json.RecordCache.RecordMetadata metadata,
+            SimdJsonDeserializer deserializer) {
+        int fieldCount = metadata.componentNames.length;
+        if (fieldCount > 0 && fieldCount <= 8
+                && indexes.size() == fieldCount * 2 + 1) {
+            SimdJsonError error = validator.validatePositionalRecord(
+                segment, indexes, fieldCount,
+                deserializer.positionalBounds());
+            if (error != SimdJsonError.SUCCESS) {
+                throw new SimdJsonException(error);
+            }
+            deserializer.useValidatedPositionalBounds();
+            return;
+        }
+        validateOrThrow(validator, segment, indexes);
     }
 
     // =========================================================================
