@@ -173,6 +173,8 @@ public final class BenchmarkSuite {
                     MpscArrayQueueBenchmark.run();
                 case "--optimization-request-storage" ->
                     RequestStorageBenchmark.run();
+                case "--optimization-headers" ->
+                    HeaderAccessBenchmark.run();
                 case "--request-parsers" -> runRequestParserBenchmarks();
                 case "--hpack-huffman" -> HpackHuffmanBenchmark.run();
                 case "--http2-response" -> Http2ResponseBenchmark.run();
@@ -203,6 +205,7 @@ public final class BenchmarkSuite {
                 + "|--optimization-quadratic"
                 + "|--optimization-scheduler"
                 + "|--optimization-request-storage"
+                + "|--optimization-headers"
                 + "|--request-parsers"
                 + "|--hpack-huffman|--http2-response"
                 + "|--http1-chunked]");

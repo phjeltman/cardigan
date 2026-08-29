@@ -9,6 +9,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class Http2RequestParserTest {
@@ -45,6 +46,10 @@ class Http2RequestParserTest {
             assertEquals("curl/7.81.0", request.headerValue(0).toString());
             assertEquals("accept", request.headerName(1).toString());
             assertEquals("*/*", request.headerValue(1).toString());
+            assertEquals("curl/7.81.0",
+                request.getHeader("User-Agent").toString());
+            assertEquals("*/*", request.getHeader("ACCEPT").toString());
+            assertNull(request.getHeader("x-absent"));
         }
     }
 

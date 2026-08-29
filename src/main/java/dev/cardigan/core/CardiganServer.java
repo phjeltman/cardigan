@@ -1546,6 +1546,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         boolean expectationSeen = false;
         long contentLength = 0;
         long flags = 0;
+        int connectionHeaderIndex = -1;
         MemorySegment segment = request.segment();
         Header[] headers = request.picoRequest().headers;
         int headerCount = request.picoRequest().numHeaders;
@@ -1583,8 +1584,15 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     flags |= HTTP1_EXPECT_CONTINUE;
                 }
                 expectationSeen = true;
+            } else if (connectionHeaderIndex < 0
+                && header.nameLen == 10
+                && asciiEqualsIgnoreCase(
+                    segment, header.nameOffset, 10, "connection")) {
+                connectionHeaderIndex = index;
             }
         }
+
+        request.cacheConnectionHeader(connectionHeaderIndex);
 
         if (transferEncodingSeen) {
             // Cardigan supports only HTTP/1.1's terminal chunked coding;
