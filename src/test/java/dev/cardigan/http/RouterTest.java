@@ -174,6 +174,57 @@ public class RouterTest {
         }
     }
 
+    public static class FastPrefixController {
+        @Get("/solo/{id}")
+        public Response solo(long id) {
+            return Response.text("solo=" + id);
+        }
+
+        @Post("/solo/{id}")
+        public Response soloPost(long id) {
+            return Response.text("post=" + id);
+        }
+
+        @Get("/fast/{id}")
+        public Response parameter(long id) {
+            return Response.text("parameter=" + id);
+        }
+
+        @Get("/fast/me")
+        public Response staticRoute() {
+            return Response.text("static");
+        }
+
+        @Get("/fast/{id}/detail")
+        public Response detail(long id) {
+            return Response.text("detail=" + id);
+        }
+
+        @Get("/api/{id}")
+        public Response broad(long id) {
+            return Response.text("broad=" + id);
+        }
+
+        @Get("/api/v/{id}")
+        public Response specific(long id) {
+            return Response.text("specific=" + id);
+        }
+    }
+
+    public static class LateParameterController {
+        @Get("/late/{id}")
+        public Response parameter(long id) {
+            return Response.text("late=" + id);
+        }
+    }
+
+    public static class LateStaticController {
+        @Get("/late/me")
+        public Response staticRoute() {
+            return Response.text("late-static");
+        }
+    }
+
     @Test
     public void testRouterGet() {
         Router router = new Router();
@@ -329,6 +380,39 @@ public class RouterTest {
             "GET /box/item/427 HTTP/1.1\r\n\r\n").body());
         assertEquals("dot=427", dispatch(router,
             "GET /box/./427 HTTP/1.1\r\n\r\n").body());
+    }
+
+    @Test
+    void fastPrefixesPreserveFullRouteSemantics() {
+        Router router = new Router();
+        router.registerController(new FastPrefixController());
+
+        assertEquals("solo=42", dispatch(router,
+            "GET /solo/42 HTTP/1.1\r\n\r\n").body());
+        assertEquals("post=42", dispatch(router,
+            "POST /solo/42 HTTP/1.1\r\n"
+                + "Content-Length: 0\r\n\r\n").body());
+        assertEquals("static", dispatch(router,
+            "GET /fast/me HTTP/1.1\r\n\r\n").body());
+        assertEquals("parameter=42", dispatch(router,
+            "GET /fast/42 HTTP/1.1\r\n\r\n").body());
+        assertEquals("detail=42", dispatch(router,
+            "GET /fast/42/detail HTTP/1.1\r\n\r\n").body());
+        assertEquals("broad=42", dispatch(router,
+            "GET /api/42 HTTP/1.1\r\n\r\n").body());
+        assertEquals("specific=42", dispatch(router,
+            "GET /api/v/42 HTTP/1.1\r\n\r\n").body());
+        assertEquals(404, dispatch(router,
+            "GET /solo/42/extra HTTP/1.1\r\n\r\n").statusCode());
+
+        Router dynamicallyUpdated = new Router();
+        dynamicallyUpdated.registerController(
+            new LateParameterController());
+        assertEquals("late=1", dispatch(dynamicallyUpdated,
+            "GET /late/1 HTTP/1.1\r\n\r\n").body());
+        dynamicallyUpdated.registerController(new LateStaticController());
+        assertEquals("late-static", dispatch(dynamicallyUpdated,
+            "GET /late/me HTTP/1.1\r\n\r\n").body());
     }
 
     @Test

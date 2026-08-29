@@ -72,10 +72,6 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
         this.allTasks = new ExchangeTask[capacity];
     }
 
-    boolean submit(Router router, HttpRequest request, boolean requestKeepAlive) {
-        return submit(router, request, requestKeepAlive, null);
-    }
-
     boolean submit(
             Router router,
             HttpRequest request,
@@ -89,16 +85,11 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
         long id = nextSubmission++;
         setInFlight(inFlight() + 1);
         ExchangeTask task = acquireTask();
-        try {
-            router.prepare(
-                request,
-                task.exchange.invocation(),
-                null,
-                requestStorage);
-        } finally {
-            // Router either retained the storage or closed it before return.
-            requestStorage = null;
-        }
+        router.prepare(
+            request,
+            task.exchange.invocation(),
+            null,
+            requestStorage);
         task.exchange.prepare(id, requestKeepAlive);
         task.setActive(true);
         if (!executor.submit(task)) {

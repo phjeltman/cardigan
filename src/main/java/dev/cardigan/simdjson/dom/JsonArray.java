@@ -32,14 +32,12 @@ public final class JsonArray implements Iterable<JsonValue> {
 
     private final MemorySegment segment;
     private final Tape tape;
-    private final int startTapeIndex;
     private final int endTapeIndex;
     private final int[] elementTapeIndexes;
 
     public JsonArray(MemorySegment segment, Tape tape, int startTapeIndex) {
         this.segment = segment;
         this.tape = tape;
-        this.startTapeIndex = startTapeIndex;
         this.endTapeIndex = (int) tape.getPayload(startTapeIndex);
         int size = 0;
         int current = startTapeIndex + 1;

@@ -58,6 +58,7 @@ final class RouteBindingHttpIntegrationTest {
                 + request("/bind/name/cardigan", true)
                 + request("/bind/pair/41/386", true)
                 + request("/bind/query/cardigan?limit=19", true)
+                + request("/wire/427", true)
                 + request("/bind/mixed/cardigan", false);
             String responses;
             try (Socket socket = new Socket("127.0.0.1", port)) {
@@ -71,13 +72,14 @@ final class RouteBindingHttpIntegrationTest {
             }
 
             assertEquals(
-                5,
+                6,
                 occurrences(responses, "HTTP/1.1 200 OK"),
                 responses);
             assertTrue(responses.contains("name=cardigan"));
             assertTrue(responses.contains("boxed=427"));
             assertTrue(responses.contains("pair=427"));
             assertTrue(responses.contains("query=cardigan:19"));
+            assertTrue(responses.contains("fast=427"));
             assertTrue(responses.contains("mixed=cardigan:wire"));
         });
     }
@@ -92,7 +94,8 @@ final class RouteBindingHttpIntegrationTest {
                     "/bind/boxed/427",
                     "/bind/name/cardigan",
                     "/bind/pair/41/386",
-                    "/bind/mixed/cardigan"
+                    "/bind/mixed/cardigan",
+                    "/wire/427"
                 };
                 for (int index = 0; index < paths.length; index++) {
                     output.write(frame(
@@ -123,6 +126,7 @@ final class RouteBindingHttpIntegrationTest {
                 assertEquals("name=cardigan", body(bodies, 3));
                 assertEquals("pair=427", body(bodies, 5));
                 assertEquals("mixed=cardigan:wire", body(bodies, 7));
+                assertEquals("fast=427", body(bodies, 9));
             }
         });
     }
@@ -228,6 +232,11 @@ final class RouteBindingHttpIntegrationTest {
         public Response mixed(String name, HttpRequest request) {
             return Response.text(
                 "mixed=" + name + ':' + request.getHeader("x-test"));
+        }
+
+        @Get("/wire/{id}")
+        public Response fast(long id) {
+            return Response.text("fast=" + id);
         }
     }
 }

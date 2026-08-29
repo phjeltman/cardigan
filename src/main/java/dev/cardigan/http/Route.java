@@ -4,7 +4,6 @@ package dev.cardigan.http;
 
 import java.lang.invoke.MethodHandle;
 import java.lang.reflect.Method;
-import java.nio.charset.StandardCharsets;
 
 public final class Route {
     static final int ARGUMENT_NONE = 0;
@@ -24,7 +23,6 @@ public final class Route {
     public final String[] segments;
     public final int segmentCount;
     public final boolean[] isParam;
-    public final String[] paramNames;
     public final Method method;
     public final MethodHandle methodHandle;
     public final RouteHandler handler;
@@ -36,7 +34,6 @@ public final class Route {
     public final LongBodyDecoder longBodyDecoder;
     public final boolean isBodyRecord;
     public final boolean isStreamingBody;
-    public final Class<? extends Record> bodyRecordClass;
     public final dev.cardigan.json.RecordCache.RecordMetadata bodyRecordMetadata;
     public final boolean isIsolated;
     public final String[] queryParameterNames;
@@ -45,25 +42,17 @@ public final class Route {
     final int[] argumentBindings;
     final int[] argumentPathSegments;
 
-    public final int[] segmentLengths;
-    public final byte[][] segmentBytes;
-    public final long[] segmentLongs;
-    public final long[] segmentMasks;
-
     public Route(
         String httpMethod,
         String pattern,
         String[] segments,
         boolean[] isParam,
-        String[] paramNames,
         Method method,
         MethodHandle methodHandle,
         RouteHandler handler,
         Object controller,
         Class<?>[] parameterTypes,
-        int[] paramIndexMap,
-        boolean isBodyRecord,
-        Class<? extends Record> bodyRecordClass
+        int[] paramIndexMap
     ) {
         this.httpMethod = httpMethod;
         if ("GET".equalsIgnoreCase(httpMethod)) {
@@ -77,7 +66,6 @@ public final class Route {
         this.segments = segments;
         this.segmentCount = segments.length;
         this.isParam = isParam;
-        this.paramNames = paramNames;
         this.method = method;
         this.methodHandle = methodHandle;
         this.handler = handler;
@@ -91,33 +79,27 @@ public final class Route {
         this.longBodyDecoder = createLongBodyDecoder(
             method, parameterTypes, annotations);
         boolean storesRequest = false;
-        for (Class<?> parameterType : parameterTypes) {
-            if (parameterType == HttpRequest.class
-                || parameterType == dev.cardigan.simdjson.ondemand.Value.class) {
-                storesRequest = true;
-                break;
-            }
-        }
-        this.requiresRequestStorage = storesRequest;
-        this.isBodyRecord = isBodyRecord;
         boolean streamsBody = false;
-        for (Class<?> parameterType : parameterTypes) {
-            if (parameterType == RequestBody.class) {
-                streamsBody = true;
-                break;
-            }
-        }
-        this.isStreamingBody = streamsBody;
-        this.bodyRecordClass = bodyRecordClass;
-        this.bodyRecordMetadata = isBodyRecord ? dev.cardigan.json.RecordCache.getMetadata(bodyRecordClass) : null;
-        this.isIsolated =
-            method != null && method.isAnnotationPresent(Isolated.class);
+        Class<? extends Record> recordClass = null;
         this.queryParameterNames = new String[parameterTypes.length];
         this.queryParameterDefaults = new int[parameterTypes.length];
         int integerArguments = 0;
         boolean hasQueryParameter = false;
         for (int i = 0; i < parameterTypes.length; i++) {
-            if (parameterTypes[i] == int.class) {
+            Class<?> parameterType = parameterTypes[i];
+            if (parameterType == HttpRequest.class
+                    || parameterType
+                        == dev.cardigan.simdjson.ondemand.Value.class) {
+                storesRequest = true;
+            } else if (parameterType == RequestBody.class) {
+                streamsBody = true;
+            } else if (Record.class.isAssignableFrom(parameterType)) {
+                @SuppressWarnings("unchecked")
+                Class<? extends Record> candidate =
+                    (Class<? extends Record>) parameterType;
+                recordClass = candidate;
+            }
+            if (parameterType == int.class) {
                 integerArguments++;
             }
             for (java.lang.annotation.Annotation annotation : annotations[i]) {
@@ -128,32 +110,17 @@ public final class Route {
                 }
             }
         }
+        this.requiresRequestStorage = storesRequest;
+        this.isStreamingBody = streamsBody;
+        this.isBodyRecord = recordClass != null;
+        this.bodyRecordMetadata = recordClass == null
+            ? null : dev.cardigan.json.RecordCache.getMetadata(recordClass);
+        this.isIsolated = method.isAnnotationPresent(Isolated.class);
         this.packsTwoIntArguments =
             hasQueryParameter && integerArguments == 2;
         this.argumentBindings = new int[parameterTypes.length];
         this.argumentPathSegments = new int[parameterTypes.length];
         compileArgumentBindings();
-
-        this.segmentLengths = new int[segments.length];
-        this.segmentBytes = new byte[segments.length][];
-        this.segmentLongs = new long[segments.length];
-        this.segmentMasks = new long[segments.length];
-
-        for (int i = 0; i < segments.length; i++) {
-            if (!isParam[i]) {
-                byte[] b = segments[i].getBytes(StandardCharsets.UTF_8);
-                this.segmentBytes[i] = b;
-                this.segmentLengths[i] = b.length;
-                if (b.length <= 8) {
-                    long word = 0;
-                    for (int k = 0; k < b.length; k++) {
-                        word |= ((long) (b[k] & 0xFF)) << (k * 8);
-                    }
-                    this.segmentLongs[i] = word;
-                    this.segmentMasks[i] = b.length == 8 ? -1L : (1L << (b.length * 8)) - 1L;
-                }
-            }
-        }
     }
 
     private void compileArgumentBindings() {

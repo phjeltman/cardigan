@@ -159,6 +159,10 @@ public final class BenchmarkSuite {
         public Response route() {
             return Response.text("ok");
         }
+
+        public Response parameter(long id) {
+            return Response.text("ok");
+        }
     }
 
     private BenchmarkSuite() {
@@ -229,6 +233,10 @@ public final class BenchmarkSuite {
         Router parameterized = registeredRouter(new TestController());
         Router small = syntheticRouter(8);
         Router large = syntheticRouter(256);
+        Router prefix1 = syntheticFastPrefixRouter(1);
+        Router prefix8 = syntheticFastPrefixRouter(8);
+        Router prefix64 = syntheticFastPrefixRouter(64);
+        Router prefix256 = syntheticFastPrefixRouter(256);
         measureQuietly(
             "register 64 same-depth routes",
             1,
@@ -237,6 +245,16 @@ public final class BenchmarkSuite {
             "register 256 same-depth routes",
             1,
             () -> System.identityHashCode(syntheticRouter(256)));
+        measureQuietly(
+            "register 64 fast-prefix routes",
+            1,
+            () -> System.identityHashCode(
+                syntheticFastPrefixRouter(64)));
+        measureQuietly(
+            "register 256 fast-prefix routes",
+            1,
+            () -> System.identityHashCode(
+                syntheticFastPrefixRouter(256)));
         runRoutingBenchmark(
             "single parameterized-route hit",
             "GET /users/427 HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -249,6 +267,30 @@ public final class BenchmarkSuite {
             "short path with separator after first word",
             "GET /box/item/427 HTTP/1.1\r\nHost: localhost\r\n\r\n",
             parameterized);
+        runRoutingLookupBenchmark(
+            "late fast-prefix hit among 1 route",
+            "GET /p00000/427 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            prefix1);
+        runRoutingLookupBenchmark(
+            "late fast-prefix hit among 8 routes",
+            "GET /p00007/427 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            prefix8);
+        runRoutingLookupBenchmark(
+            "late fast-prefix hit among 64 routes",
+            "GET /p0003f/427 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            prefix64);
+        runRoutingLookupBenchmark(
+            "early fast-prefix hit among 256 routes",
+            "GET /p00000/427 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            prefix256);
+        runRoutingLookupBenchmark(
+            "late fast-prefix hit among 256 routes",
+            "GET /p000ff/427 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            prefix256);
+        runRoutingLookupBenchmark(
+            "fast-prefix miss among 256 routes",
+            "GET /pfffff/427 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            prefix256);
         runRoutingBenchmark(
             "uncached miss among 8 same-depth routes",
             "GET /catalog/candidate9999/detail HTTP/1.1\r\n"
@@ -496,6 +538,40 @@ public final class BenchmarkSuite {
         } catch (ReflectiveOperationException failure) {
             throw new IllegalStateException(
                 "Could not construct routing benchmark fixture", failure);
+        } finally {
+            System.setOut(originalOut);
+        }
+    }
+
+    private static Router syntheticFastPrefixRouter(int routeCount) {
+        Router router = new Router();
+        RouteScaleController controller = new RouteScaleController();
+        PrintStream originalOut = System.out;
+        try (PrintStream sink = new PrintStream(
+                OutputStream.nullOutputStream())) {
+            Method register = Router.class.getDeclaredMethod(
+                "registerRoute",
+                String.class,
+                String.class,
+                Method.class,
+                Object.class);
+            Method route = RouteScaleController.class.getDeclaredMethod(
+                "parameter", long.class);
+            register.setAccessible(true);
+            System.setOut(sink);
+            for (int index = 0; index < routeCount; index++) {
+                register.invoke(
+                    router,
+                    "GET",
+                    "/p%05x/{id}".formatted(index),
+                    route,
+                    controller);
+            }
+            return router;
+        } catch (ReflectiveOperationException failure) {
+            throw new IllegalStateException(
+                "Could not construct fast-prefix benchmark fixture",
+                failure);
         } finally {
             System.setOut(originalOut);
         }

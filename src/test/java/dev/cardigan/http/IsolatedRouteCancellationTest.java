@@ -155,7 +155,7 @@ class IsolatedRouteCancellationTest {
             MethodType.methodType(Response.class)
         );
         IsolatedRouteHandler handler = new IsolatedRouteHandler(
-            controller, method, IsolatedRouteHandler.TYPE_NO_ARG);
+            controller, method, FastRouteHandler.TYPE_NO_ARG);
         return invocation.setHandler(
             handler, null, 0, null, true);
     }
