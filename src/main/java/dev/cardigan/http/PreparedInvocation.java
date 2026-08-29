@@ -5,6 +5,7 @@ package dev.cardigan.http;
 import dev.cardigan.util.SimpleWaiter;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.util.Arrays;
 
 /**
  * Route matching and request-bound argument extraction separated from the
@@ -19,6 +20,7 @@ public final class PreparedInvocation {
     private Response immediateResponse;
     private HttpRequest reusableStoredRequest;
     private MemorySegment reusableDetachedStorage;
+    private Object[] reusableArguments;
     private AutoCloseable requestStorage;
     private boolean safe;
     private volatile boolean cancelled;
@@ -30,6 +32,18 @@ public final class PreparedInvocation {
 
     void beginPreparation() {
         releaseRequestStorage();
+        clearReusableArguments();
+    }
+
+    Object[] arguments(int count, boolean isolated) {
+        if (isolated) {
+            return new Object[count];
+        }
+        if (reusableArguments == null
+                || reusableArguments.length != count) {
+            reusableArguments = new Object[count];
+        }
+        return reusableArguments;
     }
 
     HttpRequest storeRequest(
@@ -63,6 +77,7 @@ public final class PreparedInvocation {
 
     public void discard() {
         releaseRequestStorage();
+        clearReusableArguments();
     }
 
     PreparedInvocation setHandler(RouteHandler handler, HttpRequest request, long pathParamLong,
@@ -108,10 +123,12 @@ public final class PreparedInvocation {
         AutoCloseable storage = takeRequestStorage();
         if (cancelled) {
             closeStorage(storage);
+            clearReusableArguments();
             return null;
         }
         if (immediateResponse != null) {
             closeStorage(storage);
+            clearReusableArguments();
             return immediateResponse;
         }
         try {
@@ -129,6 +146,7 @@ public final class PreparedInvocation {
             return Response.error("Internal Server Error: " + t.getMessage());
         } finally {
             closeStorage(storage);
+            clearReusableArguments();
         }
     }
 
@@ -232,6 +250,12 @@ public final class PreparedInvocation {
 
     private void releaseRequestStorage() {
         closeStorage(takeRequestStorage());
+    }
+
+    private void clearReusableArguments() {
+        if (reusableArguments != null) {
+            Arrays.fill(reusableArguments, null);
+        }
     }
 
     private static void closeStorage(AutoCloseable storage) {

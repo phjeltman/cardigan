@@ -175,6 +175,8 @@ public final class BenchmarkSuite {
                     RequestStorageBenchmark.run();
                 case "--optimization-headers" ->
                     HeaderAccessBenchmark.run();
+                case "--optimization-route-binding" ->
+                    RouteBindingBenchmark.run();
                 case "--request-parsers" -> runRequestParserBenchmarks();
                 case "--hpack-huffman" -> HpackHuffmanBenchmark.run();
                 case "--http2-response" -> Http2ResponseBenchmark.run();
@@ -206,6 +208,7 @@ public final class BenchmarkSuite {
                 + "|--optimization-scheduler"
                 + "|--optimization-request-storage"
                 + "|--optimization-headers"
+                + "|--optimization-route-binding"
                 + "|--request-parsers"
                 + "|--hpack-huffman|--http2-response"
                 + "|--http1-chunked]");

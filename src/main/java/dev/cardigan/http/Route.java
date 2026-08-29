@@ -7,6 +7,17 @@ import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 
 public final class Route {
+    static final int ARGUMENT_NONE = 0;
+    static final int ARGUMENT_PATH_LONG = 1;
+    static final int ARGUMENT_PATH_INT = 2;
+    static final int ARGUMENT_PATH_STRING = 3;
+    static final int ARGUMENT_REQUEST = 4;
+    static final int ARGUMENT_VALUE = 5;
+    static final int ARGUMENT_BODY_STREAM = 6;
+    static final int ARGUMENT_BODY_RECORD = 7;
+    static final int ARGUMENT_QUERY_INT = 8;
+    static final int ARGUMENT_DECODED_LONG = 9;
+
     public final String httpMethod;
     public final int methodCode; // 1 = GET, 2 = POST, 0 = OTHER
     public final String pattern;
@@ -17,6 +28,7 @@ public final class Route {
     public final Method method;
     public final MethodHandle methodHandle;
     public final RouteHandler handler;
+    public final boolean bindsArguments;
     public final Object controller;
     public final Class<?>[] parameterTypes;
     public final int[] paramIndexMap;
@@ -30,6 +42,8 @@ public final class Route {
     public final String[] queryParameterNames;
     public final int[] queryParameterDefaults;
     public final boolean packsTwoIntArguments;
+    final int[] argumentBindings;
+    final int[] argumentPathSegments;
 
     public final int[] segmentLengths;
     public final byte[][] segmentBytes;
@@ -67,6 +81,8 @@ public final class Route {
         this.method = method;
         this.methodHandle = methodHandle;
         this.handler = handler;
+        this.bindsArguments = handler != null
+            && handler.usesBoundArguments();
         this.controller = controller;
         this.parameterTypes = parameterTypes;
         this.paramIndexMap = paramIndexMap;
@@ -114,6 +130,9 @@ public final class Route {
         }
         this.packsTwoIntArguments =
             hasQueryParameter && integerArguments == 2;
+        this.argumentBindings = new int[parameterTypes.length];
+        this.argumentPathSegments = new int[parameterTypes.length];
+        compileArgumentBindings();
 
         this.segmentLengths = new int[segments.length];
         this.segmentBytes = new byte[segments.length][];
@@ -134,6 +153,46 @@ public final class Route {
                     this.segmentMasks[i] = b.length == 8 ? -1L : (1L << (b.length * 8)) - 1L;
                 }
             }
+        }
+    }
+
+    private void compileArgumentBindings() {
+        int pathArgument = 0;
+        for (int argument = 0;
+                argument < parameterTypes.length; argument++) {
+            Class<?> type = parameterTypes[argument];
+            int binding;
+            if (longBodyDecoder != null && argument == 0) {
+                binding = ARGUMENT_DECODED_LONG;
+            } else if (type == HttpRequest.class) {
+                binding = ARGUMENT_REQUEST;
+            } else if (type
+                    == dev.cardigan.simdjson.ondemand.Value.class) {
+                binding = ARGUMENT_VALUE;
+            } else if (type == RequestBody.class) {
+                binding = ARGUMENT_BODY_STREAM;
+            } else if (Record.class.isAssignableFrom(type)) {
+                binding = ARGUMENT_BODY_RECORD;
+            } else if (queryParameterNames[argument] != null
+                    && (type == int.class || type == Integer.class)) {
+                binding = ARGUMENT_QUERY_INT;
+            } else {
+                int segmentIndex = pathArgument < paramIndexMap.length
+                    ? paramIndexMap[pathArgument]
+                    : -1;
+                pathArgument++;
+                argumentPathSegments[argument] = segmentIndex;
+                if (type == long.class || type == Long.class) {
+                    binding = ARGUMENT_PATH_LONG;
+                } else if (type == int.class || type == Integer.class) {
+                    binding = ARGUMENT_PATH_INT;
+                } else if (type == String.class) {
+                    binding = ARGUMENT_PATH_STRING;
+                } else {
+                    binding = ARGUMENT_NONE;
+                }
+            }
+            argumentBindings[argument] = binding;
         }
     }
 

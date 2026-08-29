@@ -17,13 +17,22 @@ public final class FastRouteHandler implements RouteHandler {
     public static final int TYPE_INT_REQUEST_PARAM = 10;
     public static final int TYPE_TWO_INT_PARAMS = 11;
     public static final int TYPE_TWO_INT_STREAMING_BODY_PARAMS = 12;
+    public static final int TYPE_BOUND_ARGUMENTS = 13;
 
     private final MethodHandle mhBound;
     private final int handlerType;
 
     public FastRouteHandler(Object controller, MethodHandle mh, int handlerType) {
-        this.mhBound = mh.bindTo(controller);
+        MethodHandle bound = mh.bindTo(controller);
+        this.mhBound = handlerType == TYPE_BOUND_ARGUMENTS
+            ? bound.asSpreader(Object[].class, bound.type().parameterCount())
+            : bound;
         this.handlerType = handlerType;
+    }
+
+    @Override
+    public boolean usesBoundArguments() {
+        return handlerType == TYPE_BOUND_ARGUMENTS;
     }
 
     @Override
@@ -52,6 +61,8 @@ public final class FastRouteHandler implements RouteHandler {
                     (int) pathParamLong,
                     (int) (pathParamLong >>> 32),
                     (RequestBody) bodyRecord);
+            case TYPE_BOUND_ARGUMENTS ->
+                (Response) mhBound.invokeExact((Object[]) bodyRecord);
             default -> Response.error("Unsupported handler type");
         };
     }

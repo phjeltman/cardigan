@@ -120,6 +120,43 @@ public class RouterTest {
         }
     }
 
+    public static class GenericBindingController {
+        @Get("/binding/name/{name}")
+        public Response name(String name) {
+            return Response.text("name=" + name);
+        }
+
+        @Get("/binding/boxed/{id}")
+        public Response boxed(Long id) {
+            return Response.text("boxed=" + id);
+        }
+
+        @Get("/binding/pair/{left}/{right}")
+        public Response pair(long left, long right) {
+            return Response.text("pair=" + (left + right));
+        }
+
+        @Get("/binding/mixed/{name}")
+        public Response mixed(String name, HttpRequest request) {
+            return Response.text(
+                "mixed=" + name + ':' + request.getHeader("X-Test"));
+        }
+
+        @Get("/binding/query/{name}")
+        public Response query(
+                String name,
+                @QueryParam(value = "limit", defaultValue = 7)
+                Integer limit) {
+            return Response.text("query=" + name + ':' + limit);
+        }
+
+        @Get("/binding/isolated/{name}")
+        @Isolated
+        public Response isolated(String name) {
+            return Response.text("isolated=" + name);
+        }
+    }
+
     @Test
     public void testRouterGet() {
         Router router = new Router();
@@ -264,6 +301,58 @@ public class RouterTest {
             "GET /catalog/absent/detail HTTP/1.1\r\n\r\n").statusCode());
     }
 
+    @Test
+    void bindsGenericSignaturesForDirectDispatch() {
+        Router router = new Router();
+        router.registerController(new GenericBindingController());
+
+        assertEquals("name=cardigan", dispatch(router,
+            "GET /binding/name/cardigan HTTP/1.1\r\n\r\n").body());
+        assertEquals("boxed=427", dispatch(router,
+            "GET /binding/boxed/427 HTTP/1.1\r\n\r\n").body());
+        assertEquals("pair=427", dispatch(router,
+            "GET /binding/pair/41/386 HTTP/1.1\r\n\r\n").body());
+        assertEquals("mixed=cardigan:present", dispatch(router,
+            "GET /binding/mixed/cardigan HTTP/1.1\r\n"
+                + "X-Test: present\r\n\r\n").body());
+        assertEquals("query=cardigan:19", dispatch(router,
+            "GET /binding/query/cardigan?limit=19 HTTP/1.1\r\n\r\n")
+                .body());
+    }
+
+    @Test
+    void preparedGenericSignaturesReuseBindingStorageSafely() {
+        Router router = new Router();
+        router.registerController(new GenericBindingController());
+        PreparedInvocation target = new PreparedInvocation();
+        int[] materializations = {0};
+
+        assertEquals("name=first", prepare(
+            router,
+            target,
+            "GET /binding/name/first HTTP/1.1\r\n\r\n",
+            materializations).invoke().body());
+        assertEquals("pair=9", prepare(
+            router,
+            target,
+            "GET /binding/pair/4/5 HTTP/1.1\r\n\r\n",
+            materializations).invoke().body());
+        assertEquals("isolated=worker", prepare(
+            router,
+            target,
+            "GET /binding/isolated/worker HTTP/1.1\r\n\r\n",
+            materializations).invoke().body());
+        assertEquals(0, materializations[0]);
+
+        assertEquals("mixed=stored:retained", prepare(
+            router,
+            target,
+            "GET /binding/mixed/stored HTTP/1.1\r\n"
+                + "X-Test: retained\r\n\r\n",
+            materializations).invoke().body());
+        assertEquals(1, materializations[0]);
+    }
+
     private static Response dispatch(Router router, String encoded) {
         byte[] bytes = encoded.getBytes(
             java.nio.charset.StandardCharsets.US_ASCII);
@@ -276,6 +365,22 @@ public class RouterTest {
                 segment, bytes.length, request));
             return router.dispatch(request);
         }
+    }
+
+    private static PreparedInvocation prepare(
+            Router router,
+            PreparedInvocation target,
+            String encoded,
+            int[] materializations) {
+        byte[] bytes = encoded.getBytes(
+            java.nio.charset.StandardCharsets.US_ASCII);
+        MemorySegment segment = Arena.global().allocate(bytes.length);
+        MemorySegment.copy(
+            bytes, 0, segment, ValueLayout.JAVA_BYTE, 0, bytes.length);
+        HttpRequest request = new HttpRequest();
+        assertTrue(HttpRequestParser.parse(segment, bytes.length, request));
+        return router.prepare(
+            request, target, () -> materializations[0]++);
     }
 
     @Test

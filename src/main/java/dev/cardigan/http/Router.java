@@ -274,7 +274,8 @@ public class Router {
         mutableRouteRoot.add(newRoute, 0);
         routeTreeDirty = true;
 
-        if (paramCount == 1 && isParam[segments.length - 1]) {
+        if (paramCount == 1 && isParam[segments.length - 1]
+                && !newRoute.bindsArguments) {
             int braceIdx = pattern.indexOf('{');
             if (braceIdx > 0 && braceIdx <= 8) {
                 String prefix = pattern.substring(0, braceIdx);
@@ -375,6 +376,10 @@ public class Router {
                 int type = FastRouteHandler.TYPE_NO_ARG;
                 return isIsolated ? new IsolatedRouteHandler(controller, mh, type) : new FastRouteHandler(controller, mh, type);
             }
+            int type = FastRouteHandler.TYPE_BOUND_ARGUMENTS;
+            return isIsolated
+                ? new IsolatedRouteHandler(controller, mh, type)
+                : new FastRouteHandler(controller, mh, type);
         } catch (Throwable t) {
             return (req, pathLong, bodyObj) -> {
                 method.setAccessible(true);
@@ -423,7 +428,6 @@ public class Router {
                 return Response.error("Unsupported endpoint signature");
             };
         }
-        return null;
     }
 
     private static boolean hasQueryParameter(Method method) {
@@ -716,6 +720,12 @@ public class Router {
                 handlerRequest = target.storeRequest(
                     request, requestStorage, route.isIsolated);
             }
+            if (route.bindsArguments) {
+                HttpRequest bindingRequest = handlerRequest == null
+                    ? request : handlerRequest;
+                bodyRecord = bindRouteArguments(
+                    route, bindingRequest, pathLong, bodyRecord, target);
+            }
             return target.setHandler(route.handler, handlerRequest, pathLong, bodyRecord, safe);
         } catch (Throwable t) {
             return target.setImmediate(
@@ -859,6 +869,10 @@ public class Router {
                             route.bodyRecordMetadata);
                     }
                 }
+                if (route.bindsArguments) {
+                    bodyRecord = bindRouteArguments(
+                        route, request, pathLong, bodyRecord, null);
+                }
                 return route.handler.handle(
                     request, pathLong, bodyRecord);
             }
@@ -902,6 +916,79 @@ public class Router {
         }
         return (first & 0xffff_ffffL)
             | ((long) second << 32);
+    }
+
+    private static Object[] bindRouteArguments(
+            Route route,
+            HttpRequest request,
+            long decodedLong,
+            Object decodedBody,
+            PreparedInvocation target) {
+        int argumentCount = route.parameterTypes.length;
+        Object[] arguments = target == null
+            ? new Object[argumentCount]
+            : target.arguments(argumentCount, route.isIsolated);
+        long baseAddress = request.address();
+        long[] segments = request.segPacked();
+
+        for (int argument = 0; argument < argumentCount; argument++) {
+            int binding = route.argumentBindings[argument];
+            if (binding >= Route.ARGUMENT_PATH_LONG
+                    && binding <= Route.ARGUMENT_PATH_STRING
+                    && route.argumentPathSegments[argument] < 0) {
+                arguments[argument] = null;
+                continue;
+            }
+            switch (binding) {
+                case Route.ARGUMENT_PATH_LONG -> {
+                    long packed = pathSegment(
+                        route, segments, argument);
+                    arguments[argument] = parseLongFast(
+                        baseAddress,
+                        packed >>> 32,
+                        packed & 0xffff_ffffL);
+                }
+                case Route.ARGUMENT_PATH_INT -> {
+                    long packed = pathSegment(
+                        route, segments, argument);
+                    arguments[argument] = (int) parseLongFast(
+                        baseAddress,
+                        packed >>> 32,
+                        packed & 0xffff_ffffL);
+                }
+                case Route.ARGUMENT_PATH_STRING -> {
+                    long packed = pathSegment(
+                        route, segments, argument);
+                    byte[] bytes = request.segment().asSlice(
+                        packed >>> 32,
+                        packed & 0xffff_ffffL
+                    ).toArray(java.lang.foreign.ValueLayout.JAVA_BYTE);
+                    arguments[argument] = new String(
+                        bytes, StandardCharsets.UTF_8);
+                }
+                case Route.ARGUMENT_REQUEST ->
+                    arguments[argument] = request;
+                case Route.ARGUMENT_VALUE ->
+                    arguments[argument] = request.bodyJson();
+                case Route.ARGUMENT_BODY_STREAM,
+                     Route.ARGUMENT_BODY_RECORD ->
+                    arguments[argument] = decodedBody;
+                case Route.ARGUMENT_QUERY_INT ->
+                    arguments[argument] = request.queryInt(
+                        route.queryParameterNames[argument],
+                        route.queryParameterDefaults[argument]);
+                case Route.ARGUMENT_DECODED_LONG ->
+                    arguments[argument] = decodedLong;
+                default -> arguments[argument] = null;
+            }
+        }
+        return arguments;
+    }
+
+    private static long pathSegment(
+            Route route, long[] segments, int argument) {
+        int segmentIndex = route.argumentPathSegments[argument];
+        return segmentIndex < 0 ? 0 : segments[segmentIndex];
     }
 
     public Response dispatch(String httpMethod, HttpRequest request) {

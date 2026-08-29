@@ -20,6 +20,7 @@ OPTIMIZATION_QUADRATIC_ONLY=false
 OPTIMIZATION_SCHEDULER_ONLY=false
 OPTIMIZATION_REQUEST_STORAGE_ONLY=false
 OPTIMIZATION_HEADERS_ONLY=false
+OPTIMIZATION_ROUTE_BINDING_ONLY=false
 CHUNKED_UPLOAD=false
 CHUNK_SIZES="64,1024,16384"
 CHUNK_SIZE=""
@@ -144,6 +145,8 @@ Options:
   --optimization-request-storage
                              Benchmark request-aware handler storage
   --optimization-headers    Benchmark request-header lookup and metadata access
+  --optimization-route-binding
+                             Benchmark generic route argument binding
   --jvmti                    Build with debug symbols and load perf-jvmti
   -h, --help                 Show this help
 
@@ -175,6 +178,7 @@ Examples:
   ./dev/benchmarks/benchmark.sh --optimization-scheduler
   ./dev/benchmarks/benchmark.sh --optimization-request-storage
   ./dev/benchmarks/benchmark.sh --optimization-headers
+  ./dev/benchmarks/benchmark.sh --optimization-route-binding
 EOF
 }
 
@@ -267,6 +271,12 @@ while [ "$#" -gt 0 ]; do
             RUN_MICROBENCHMARKS=true
             MICRO_ONLY=true
             OPTIMIZATION_HEADERS_ONLY=true
+            shift
+            ;;
+        --optimization-route-binding)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_ROUTE_BINDING_ONLY=true
             shift
             ;;
         --scheduler-stats)
@@ -1060,6 +1070,8 @@ if [ "$RUN_MICROBENCHMARKS" = true ]; then
         MICROBENCHMARK_ARGS+=(--optimization-request-storage)
     elif [ "$OPTIMIZATION_HEADERS_ONLY" = true ]; then
         MICROBENCHMARK_ARGS+=(--optimization-headers)
+    elif [ "$OPTIMIZATION_ROUTE_BINDING_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-route-binding)
     elif [ "$HPACK_HUFFMAN_ONLY" = true ]; then
         MICROBENCHMARK_ARGS+=(--hpack-huffman)
     elif [ "$HTTP2_RESPONSE_ONLY" = true ]; then
