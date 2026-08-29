@@ -157,6 +157,23 @@ public class RouterTest {
         }
     }
 
+    public static class ShortPathController {
+        @Get("/a/b/{id}")
+        public Response firstWordSeparators(Long id) {
+            return Response.text("control=" + id);
+        }
+
+        @Get("/box/item/{id}")
+        public Response laterSeparator(long id) {
+            return Response.text("later=" + id);
+        }
+
+        @Get("/box/./{id}")
+        public Response delimiterMaskCarry(String id) {
+            return Response.text("dot=" + id);
+        }
+    }
+
     @Test
     public void testRouterGet() {
         Router router = new Router();
@@ -299,6 +316,19 @@ public class RouterTest {
             "GET /catalog/static/fallback HTTP/1.1\r\n\r\n").body());
         assertEquals(404, dispatch(router,
             "GET /catalog/absent/detail HTTP/1.1\r\n\r\n").statusCode());
+    }
+
+    @Test
+    void splitsEverySegmentOfShortPaths() {
+        Router router = new Router();
+        router.registerController(new ShortPathController());
+
+        assertEquals("control=427", dispatch(router,
+            "GET /a/b/427 HTTP/1.1\r\n\r\n").body());
+        assertEquals("later=427", dispatch(router,
+            "GET /box/item/427 HTTP/1.1\r\n\r\n").body());
+        assertEquals("dot=427", dispatch(router,
+            "GET /box/./427 HTTP/1.1\r\n\r\n").body());
     }
 
     @Test

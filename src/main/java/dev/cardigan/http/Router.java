@@ -1057,38 +1057,6 @@ public class Router {
     }
 
     private static int splitPath(long baseAddr, long offset, long length, long[] segPacked) {
-        if (length <= 16) {
-            long idx = offset;
-            long end = offset + length;
-            if (idx < end && RawSegment.getByte(baseAddr, idx) == '/') idx++;
-            long segStart = idx;
-
-            long word0 = RawSegment.getLong(baseAddr, idx);
-            long diff0 = word0 ^ 0x2f2f2f2f2f2f2f2fL;
-            long mask0 = (diff0 - 0x0101010101010101L) & ~diff0 & 0x8080808080808080L;
-
-            int count = 0;
-            while (mask0 != 0) {
-                int pos = Long.numberOfTrailingZeros(mask0) >>> 3;
-                long segEnd = idx + pos;
-                if (segEnd >= end) break;
-                long segLen = segEnd - segStart;
-                if (segLen > 0) {
-                    segPacked[count++] = (segStart << 32) | segLen;
-                }
-                segStart = segEnd + 1;
-                mask0 &= (mask0 - 1);
-            }
-
-            if (end > segStart) {
-                long segLen = end - segStart;
-                if (segLen > 0) {
-                    segPacked[count++] = (segStart << 32) | segLen;
-                }
-            }
-            return count;
-        }
-
         long idx = offset;
         long end = offset + length;
         if (idx < end && RawSegment.getByte(baseAddr, idx) == '/') idx++;
@@ -1100,19 +1068,19 @@ public class Router {
             long word = RawSegment.getLong(baseAddr, idx);
             long diff = word ^ 0x2f2f2f2f2f2f2f2fL;
             long matchMask = (diff - 0x0101010101010101L) & ~diff & 0x8080808080808080L;
-            if (matchMask != 0) {
-                while (matchMask != 0) {
-                    int slashByteOffset = Long.numberOfTrailingZeros(matchMask) >>> 3;
-                    long segEnd = idx + slashByteOffset;
+            while (matchMask != 0) {
+                int slashByteOffset =
+                    Long.numberOfTrailingZeros(matchMask) >>> 3;
+                long segEnd = idx + slashByteOffset;
+                if (RawSegment.getByte(baseAddr, segEnd) == '/') {
                     long segLen = segEnd - segStart;
                     if (segLen > 0) {
-                        segPacked[count++] = (segStart << 32) | segLen;
+                        segPacked[count++] =
+                            (segStart << 32) | segLen;
                     }
                     segStart = segEnd + 1;
-                    matchMask &= (matchMask - 1);
                 }
-                idx = segStart;
-                continue;
+                matchMask &= (matchMask - 1);
             }
             idx += 8;
         }

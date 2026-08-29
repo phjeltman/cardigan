@@ -54,7 +54,7 @@ final class RouteBindingHttpIntegrationTest {
     @Test
     void pipelinedHttp1RequestsInvokeGenericSignatures() {
         assertTimeoutPreemptively(Duration.ofSeconds(8), () -> {
-            String requests = request("/bind/wrapped/427", true)
+            String requests = request("/bind/boxed/427", true)
                 + request("/bind/name/cardigan", true)
                 + request("/bind/pair/41/386", true)
                 + request("/bind/query/cardigan?limit=19", true)
@@ -89,7 +89,7 @@ final class RouteBindingHttpIntegrationTest {
                 InputStream input = socket.getInputStream();
                 OutputStream output = socket.getOutputStream();
                 String[] paths = {
-                    "/bind/wrapped/427",
+                    "/bind/boxed/427",
                     "/bind/name/cardigan",
                     "/bind/pair/41/386",
                     "/bind/mixed/cardigan"
@@ -208,7 +208,7 @@ final class RouteBindingHttpIntegrationTest {
             return Response.text("name=" + name);
         }
 
-        @Get("/bind/wrapped/{id}")
+        @Get("/bind/boxed/{id}")
         public Response boxed(Long id) {
             return Response.text("boxed=" + id);
         }

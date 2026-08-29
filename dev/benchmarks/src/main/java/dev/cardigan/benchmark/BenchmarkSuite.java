@@ -143,6 +143,16 @@ public final class BenchmarkSuite {
         public Response getSessionTelemetry(long id) {
             return Response.text("Telemetry: " + id);
         }
+
+        @Get("/a/b/{id}")
+        public Response getShortControl(Long id) {
+            return Response.text("Short: " + id);
+        }
+
+        @Get("/box/item/{id}")
+        public Response getShortMultiword(long id) {
+            return Response.text("Short multiword: " + id);
+        }
     }
 
     public static final class RouteScaleController {
@@ -230,6 +240,14 @@ public final class BenchmarkSuite {
         runRoutingBenchmark(
             "single parameterized-route hit",
             "GET /users/427 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            parameterized);
+        runRoutingLookupBenchmark(
+            "short path with separators in first word",
+            "GET /a/b/427 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            parameterized);
+        runRoutingLookupBenchmark(
+            "short path with separator after first word",
+            "GET /box/item/427 HTTP/1.1\r\nHost: localhost\r\n\r\n",
             parameterized);
         runRoutingBenchmark(
             "uncached miss among 8 same-depth routes",
@@ -515,6 +533,29 @@ public final class BenchmarkSuite {
                 router.prepare(request, invocation);
                 return invocation.isSafe()
                     ? request.picoRequest().pathLen : -1;
+            });
+        }
+    }
+
+    private static void runRoutingLookupBenchmark(
+            String label, String encoded, Router router) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment input = arena.allocateFrom(encoded);
+            int length = (int) input.byteSize() - 1;
+            HttpRequest request = new HttpRequest();
+            if (!HttpRequestParser.parse(input, length, request)) {
+                throw new IllegalStateException(
+                    "Invalid routing benchmark request");
+            }
+            boolean hit = router.findRoute(request) != null;
+            System.out.println("  " + label + " result: "
+                + (hit ? "hit" : "MISS"));
+
+            measure("HTTP/1 parse + lookup, " + label, () -> {
+                if (!HttpRequestParser.parse(input, length, request)) {
+                    return -1;
+                }
+                return router.findRoute(request) == null ? 0 : 1;
             });
         }
     }
