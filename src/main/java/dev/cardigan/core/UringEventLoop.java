@@ -223,27 +223,21 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             return sequence != h + 1;
         }
 
+        /** Captures the producer boundary for one consumer snapshot. */
+        long snapshotTail() {
+            return tail.get();
+        }
+
         /**
-         * Captures the contiguous published prefix visible to the sole
-         * consumer. Positions claimed after the tail snapshot, and positions
-         * hidden behind a claimed-but-unpublished slot, belong to a later
-         * scheduler epoch.
+         * Polls within a captured producer boundary. A claimed but
+         * unpublished head slot stops the snapshot without spinning; claims
+         * beyond the boundary are left for a later scheduler epoch.
          */
-        int publishedSnapshotSize() {
-            long position = head;
-            long snapshotTail = tail.get();
-            int count = 0;
-            while (position != snapshotTail && count < buffer.length) {
-                int index = (int) (position & mask);
-                long sequence = (long) SEQUENCE_HANDLE.getAcquire(
-                    sequences, index);
-                if (sequence != position + 1) {
-                    break;
-                }
-                position++;
-                count++;
+        T pollSnapshot(long snapshotTail) {
+            if (head == snapshotTail) {
+                return null;
             }
-            return count;
+            return poll();
         }
     }
     
@@ -863,8 +857,9 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         int reaped = reapCompletionEpochSnapshot(cqHead, cqTail);
         schedulerCqes += reaped;
 
-        int externalSnapshotSize = readyTasks.publishedSnapshotSize();
-        schedulerExternalTasks += drainExternalTasks(externalSnapshotSize);
+        long externalSnapshotTail = readyTasks.snapshotTail();
+        schedulerExternalTasks += drainExternalTaskSnapshot(
+            externalSnapshotTail);
 
         // Handler submissions beyond the previous handler cutoff form the
         // first causal range of this epoch. Seal that range before completion
@@ -962,20 +957,34 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             || exchangeExecutor.hasDeferredEpochWork();
     }
 
-    private int drainExternalTasks(int snapshotSize) {
+    private int drainExternalTasks(int taskLimit) {
         int count = 0;
         Runnable task;
-        while (count < snapshotSize && (task = readyTasks.poll()) != null) {
-            if (task instanceof HandlerContinuation) {
-                handlerReadyTasks.addLast(task);
-            } else if (task instanceof EgressTask) {
-                egressReadyTasks.addLast(task);
-            } else {
-                protocolReadyTasks.addLast(task);
-            }
+        while (count < taskLimit && (task = readyTasks.poll()) != null) {
+            enqueueExternalTask(task);
             count++;
         }
         return count;
+    }
+
+    private int drainExternalTaskSnapshot(long snapshotTail) {
+        int count = 0;
+        Runnable task;
+        while ((task = readyTasks.pollSnapshot(snapshotTail)) != null) {
+            enqueueExternalTask(task);
+            count++;
+        }
+        return count;
+    }
+
+    private void enqueueExternalTask(Runnable task) {
+        if (task instanceof HandlerContinuation) {
+            handlerReadyTasks.addLast(task);
+        } else if (task instanceof EgressTask) {
+            egressReadyTasks.addLast(task);
+        } else {
+            protocolReadyTasks.addLast(task);
+        }
     }
 
     private void runReadyTask(Runnable task) {

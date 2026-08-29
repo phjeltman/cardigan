@@ -33,13 +33,15 @@ class MpscArrayQueueTest {
         assertTrue(queue.offer(2));
         assertTrue(queue.offer(3));
         assertFalse(queue.offer(4));
-        assertEquals(4, queue.publishedSnapshotSize());
+        long snapshotTail = queue.snapshotTail();
 
-        assertEquals(0, queue.poll());
+        assertEquals(0, queue.pollSnapshot(snapshotTail));
         assertTrue(queue.offer(4));
-        assertEquals(1, queue.poll());
-        assertEquals(2, queue.poll());
-        assertEquals(3, queue.poll());
+        assertEquals(1, queue.pollSnapshot(snapshotTail));
+        assertEquals(2, queue.pollSnapshot(snapshotTail));
+        assertEquals(3, queue.pollSnapshot(snapshotTail));
+        assertNull(queue.pollSnapshot(snapshotTail),
+            "a claim after the snapshot boundary must be deferred");
         assertEquals(4, queue.poll());
         assertNull(queue.poll());
         assertTrue(queue.isEmpty());
@@ -57,12 +59,11 @@ class MpscArrayQueueTest {
         // publishing it. A later producer can publish its own position.
         assertTrue(tail.compareAndSet(0, 1));
         assertTrue(queue.offer("second"));
-        assertEquals(0, queue.publishedSnapshotSize(),
-            "a later publication must remain behind the unpublished head");
+        long snapshotTail = queue.snapshotTail();
 
         AtomicReference<String> result = new AtomicReference<>("not-run");
         Thread consumer = Thread.ofPlatform().daemon(true).start(
-            () -> result.set(queue.poll()));
+            () -> result.set(queue.pollSnapshot(snapshotTail)));
         consumer.join(1_000);
         boolean returnedWithoutPublication = !consumer.isAlive();
 
@@ -70,7 +71,6 @@ class MpscArrayQueueTest {
         // to finish so the test does not leave a spinning thread behind.
         buffer[0] = "first";
         LONG_ARRAY_HANDLE.setRelease(sequences, 0, 1L);
-        assertEquals(2, queue.publishedSnapshotSize());
         if (!returnedWithoutPublication) {
             consumer.join(1_000);
         }
@@ -78,8 +78,10 @@ class MpscArrayQueueTest {
         assertTrue(returnedWithoutPublication,
             "poll spun behind a producer that had only reserved the head slot");
         assertNull(result.get());
-        assertEquals("first", queue.poll());
-        assertEquals("second", queue.poll());
+        long nextSnapshotTail = queue.snapshotTail();
+        assertEquals("first", queue.pollSnapshot(nextSnapshotTail));
+        assertEquals("second", queue.pollSnapshot(nextSnapshotTail));
+        assertNull(queue.pollSnapshot(nextSnapshotTail));
         assertTrue(queue.isEmpty());
     }
 
@@ -89,12 +91,11 @@ class MpscArrayQueueTest {
             new UringEventLoop.MpscArrayQueue<>(4);
 
         assertTrue(queue.offer(1));
-        int snapshotSize = queue.publishedSnapshotSize();
+        long snapshotTail = queue.snapshotTail();
         assertTrue(queue.offer(2));
 
-        for (int i = 0; i < snapshotSize; i++) {
-            assertEquals(1, queue.poll());
-        }
+        assertEquals(1, queue.pollSnapshot(snapshotTail));
+        assertNull(queue.pollSnapshot(snapshotTail));
         assertEquals(2, queue.poll(),
             "work published after capture belongs to the next snapshot");
     }
@@ -139,15 +140,18 @@ class MpscArrayQueueTest {
             if (failure != null) {
                 fail("Producer failed", failure);
             }
-            Integer value = queue.poll();
-            if (value == null) {
-                Thread.onSpinWait();
-                continue;
+            int beforeSnapshot = received;
+            long snapshotTail = queue.snapshotTail();
+            Integer value;
+            while ((value = queue.pollSnapshot(snapshotTail)) != null) {
+                assertTrue(value >= 0 && value < totalElements);
+                assertFalse(seen[value], "duplicate value " + value);
+                seen[value] = true;
+                received++;
             }
-            assertTrue(value >= 0 && value < totalElements);
-            assertFalse(seen[value], "duplicate value " + value);
-            seen[value] = true;
-            received++;
+            if (received == beforeSnapshot) {
+                Thread.onSpinWait();
+            }
         }
 
         for (Thread producer : producers) {

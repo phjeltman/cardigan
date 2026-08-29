@@ -3,6 +3,7 @@
 package dev.cardigan.benchmark;
 
 import dev.cardigan.core.Http2ResponseBenchmark;
+import dev.cardigan.core.MpscArrayQueueBenchmark;
 import dev.cardigan.http.Get;
 import dev.cardigan.http.HttpRequest;
 import dev.cardigan.http.HttpRequestParser;
@@ -168,6 +169,8 @@ public final class BenchmarkSuite {
                     runJsonWriterOptimizationBenchmarks();
                 case "--optimization-quadratic" ->
                     runQuadraticBehaviorBenchmarks();
+                case "--optimization-scheduler" ->
+                    MpscArrayQueueBenchmark.run();
                 case "--request-parsers" -> runRequestParserBenchmarks();
                 case "--hpack-huffman" -> HpackHuffmanBenchmark.run();
                 case "--http2-response" -> Http2ResponseBenchmark.run();
@@ -196,6 +199,7 @@ public final class BenchmarkSuite {
                 + "[--optimization-routing|--optimization-json-fields"
                 + "|--optimization-json-writer"
                 + "|--optimization-quadratic"
+                + "|--optimization-scheduler"
                 + "|--request-parsers"
                 + "|--hpack-huffman|--http2-response"
                 + "|--http1-chunked]");
