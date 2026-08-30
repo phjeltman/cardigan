@@ -32,7 +32,10 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
 
     @FunctionalInterface
     interface ResponseSender {
-        boolean send(Response response, boolean keepAlive);
+        boolean send(
+            Response response,
+            boolean keepAlive,
+            boolean keepAliveHeader);
     }
 
     @FunctionalInterface
@@ -46,6 +49,7 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
     private final int mask;
     private final Response[] completedResponses;
     private final boolean[] keepAlive;
+    private final boolean[] keepAliveHeader;
     private final ExchangeTask[] freeTasks;
     private final ExchangeTask[] allTasks;
 
@@ -78,6 +82,7 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
         this.mask = capacity - 1;
         this.completedResponses = new Response[capacity];
         this.keepAlive = new boolean[capacity];
+        this.keepAliveHeader = new boolean[capacity];
         this.freeTasks = new ExchangeTask[capacity];
         this.allTasks = new ExchangeTask[capacity];
     }
@@ -86,6 +91,7 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
             Router router,
             HttpRequest request,
             boolean requestKeepAlive,
+            boolean requestKeepAliveHeader,
             AutoCloseable requestStorage) {
         if (!awaitCapacity()) {
             closeRequestStorage(requestStorage);
@@ -100,7 +106,8 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
             task.exchange.invocation(),
             null,
             requestStorage);
-        task.exchange.prepare(id, requestKeepAlive);
+        task.exchange.prepare(
+            id, requestKeepAlive, requestKeepAliveHeader);
         task.setActive(true);
         if (!executor.submit(task)) {
             task.setActive(false);
@@ -192,7 +199,8 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
                 nextResponse++;
                 if (sendCompleted(
                         response,
-                        responseKeepAlive(exchange.keepAlive()))) {
+                        responseKeepAlive(exchange.keepAlive()),
+                        exchange.keepAliveHeader())) {
                     drainCompletedResponses();
                 }
             } finally {
@@ -204,6 +212,7 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
         int index = (int) exchange.id() & mask;
         completedResponses[index] = response;
         keepAlive[index] = exchange.keepAlive();
+        keepAliveHeader[index] = exchange.keepAliveHeader();
     }
 
     private boolean awaitCapacity() {
@@ -259,10 +268,14 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
             }
 
             boolean responseKeepAlive = keepAlive[index];
+            boolean responseKeepAliveHeader = keepAliveHeader[index];
             completedResponses[index] = null;
             nextResponse++;
 
-            if (!sendCompleted(response, responseKeepAlive(responseKeepAlive))) {
+            if (!sendCompleted(
+                    response,
+                    responseKeepAlive(responseKeepAlive),
+                    responseKeepAliveHeader)) {
                 break;
             }
         }
@@ -273,17 +286,25 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
             && !(draining && nextResponse == nextSubmission);
     }
 
-    private boolean sendCompleted(Response response, boolean responseKeepAlive) {
-        StreamingBody streamingBody = response.body()
-            instanceof StreamingBody body ? body : null;
+    private boolean sendCompleted(
+            Response response,
+            boolean responseKeepAlive,
+            boolean responseKeepAliveHeader) {
+        StreamingBody streamingBody = response.streamingBody();
         boolean sent;
         if (streamingBody == null) {
             // Only streaming bodies need cancellation publication.
-            sent = responseSender.send(response, responseKeepAlive);
+            sent = responseSender.send(
+                response,
+                responseKeepAlive,
+                responseKeepAlive && responseKeepAliveHeader);
         } else {
             activeResponseBody = streamingBody;
             try {
-                sent = responseSender.send(response, responseKeepAlive);
+                sent = responseSender.send(
+                    response,
+                    responseKeepAlive,
+                    responseKeepAlive && responseKeepAliveHeader);
             } finally {
                 activeResponseBody = null;
             }
@@ -328,8 +349,9 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
     }
 
     private static void closeResponseBody(Response response) {
-        if (response != null
-            && response.body() instanceof StreamingBody streamingBody) {
+        StreamingBody streamingBody = response == null
+            ? null : response.streamingBody();
+        if (streamingBody != null) {
             try {
                 streamingBody.close();
             } catch (Throwable ignored) {

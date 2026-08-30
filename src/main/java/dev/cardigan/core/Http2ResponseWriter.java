@@ -79,6 +79,10 @@ final class Http2ResponseWriter {
             return sendMetadataResponse(
                 streamId, response, flowControl);
         }
+        if (response.hasAsciiLongBody()) {
+            return sendAsciiLongBody(
+                streamId, response, flowControl);
+        }
         Object body = response.body();
         if (body == null) {
             return sendFrames(
@@ -123,7 +127,8 @@ final class Http2ResponseWriter {
             int streamId,
             Response response,
             FlowControl flowControl) {
-        Object body = response.body();
+        boolean asciiLongBody = response.hasAsciiLongBody();
+        Object body = asciiLongBody ? null : response.body();
         if (body instanceof StreamingBody streamingBody) {
             return sendMetadataStreamingResponse(
                 streamId, response, streamingBody, flowControl);
@@ -132,7 +137,11 @@ final class Http2ResponseWriter {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment bytes;
             int length;
-            if (body == null) {
+            if (asciiLongBody) {
+                length = response.asciiLongBodyLength();
+                bytes = arena.allocate(length);
+                response.writeAsciiLongBody(bytes);
+            } else if (body == null) {
                 bytes = MemorySegment.NULL;
                 length = 0;
             } else if (body instanceof StaticBody staticBody) {
@@ -1172,6 +1181,87 @@ final class Http2ResponseWriter {
             return writer.writeFully(
                 output,
                 Http2Frames.HEADER_SIZE + chunkLength) > 0;
+        }
+    }
+
+    private boolean sendAsciiLongBody(
+            int streamId,
+            Response response,
+            FlowControl flowControl) {
+        int bodyLength = response.asciiLongBodyLength();
+        UringEventLoop loop = writer.eventLoop();
+        int egressId = response.contentType().length()
+                <= MAX_INLINE_CONTENT_TYPE_LENGTH
+            ? loop.acquireEgressBuffer()
+            : -1;
+        if (egressId < 0) {
+            return sendAsciiLongFallback(
+                streamId, response, flowControl);
+        }
+
+        MemorySegment output = loop.getEgressBufferSegment(egressId);
+        int headerBlockLength = HpackEncoder.writeResponseHeaders(
+            output,
+            Http2Frames.HEADER_SIZE,
+            response.statusCode(),
+            response.contentType(),
+            bodyLength
+        );
+        int outputLength = Http2Frames.HEADER_SIZE + headerBlockLength;
+        int available = UringEventLoop.EGRESS_FRAME_SIZE
+            - outputLength - Http2Frames.HEADER_SIZE;
+        if (bodyLength > peerMaxFrameSize || bodyLength > available) {
+            loop.releaseEgressBuffer(egressId);
+            return sendAsciiLongFallback(
+                streamId, response, flowControl);
+        }
+
+        int reserved = flowControl.reserve(bodyLength);
+        if (reserved != bodyLength) {
+            if (reserved > 0) {
+                flowControl.refund(reserved);
+            }
+            loop.releaseEgressBuffer(egressId);
+            return reserved <= 0 && flowControl.cancelled()
+                ? false
+                : sendAsciiLongFallback(
+                    streamId, response, flowControl);
+        }
+
+        int dataOffset = outputLength + Http2Frames.HEADER_SIZE;
+        try {
+            response.writeAsciiLongBody(
+                output.asSlice(dataOffset, bodyLength));
+        } catch (Throwable failure) {
+            flowControl.refund(bodyLength);
+            loop.releaseEgressBuffer(egressId);
+            return sendSerializationError(streamId, flowControl);
+        }
+        Http2Frames.writeHeader(
+            output, 0, headerBlockLength, Http2Frames.HEADERS,
+            Http2Frames.FLAG_END_HEADERS, streamId);
+        Http2Frames.writeHeader(
+            output, outputLength, bodyLength, Http2Frames.DATA,
+            Http2Frames.FLAG_END_STREAM, streamId);
+        if (!writer.enqueue(egressId, dataOffset + bodyLength)) {
+            flowControl.refund(bodyLength);
+            return false;
+        }
+        return true;
+    }
+
+    private boolean sendAsciiLongFallback(
+            int streamId,
+            Response response,
+            FlowControl flowControl) {
+        int length = response.asciiLongBodyLength();
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment encoded = arena.allocate(length);
+            response.writeAsciiLongBody(encoded);
+            return sendFrames(
+                streamId, response, encoded, length, flowControl);
+        } catch (Throwable failure) {
+            return sendSerializationError(streamId, flowControl);
         }
     }
 

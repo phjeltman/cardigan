@@ -66,7 +66,7 @@ public final class Http1ExchangeSequencerBenchmark {
             Http1ExchangeSequencer sequencer =
                 new Http1ExchangeSequencer(
                     executor, depth,
-                    (response, keepAlive) -> {
+                    (response, keepAlive, keepAliveHeader) -> {
                         responses[0] += response.statusCode();
                         return true;
                     });
@@ -112,7 +112,8 @@ public final class Http1ExchangeSequencerBenchmark {
             HttpRequest request,
             int depth) {
         for (int index = 0; index < depth; index++) {
-            if (!sequencer.submit(router, request, true, null)) {
+            if (!sequencer.submit(
+                    router, request, true, false, null)) {
                 throw new IllegalStateException(
                     "sequencer benchmark submission failed");
             }

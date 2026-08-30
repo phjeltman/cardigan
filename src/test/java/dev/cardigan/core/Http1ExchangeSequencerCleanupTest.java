@@ -41,14 +41,16 @@ final class Http1ExchangeSequencerCleanupTest {
                 Http1ExchangeSequencer sequencer =
                     new Http1ExchangeSequencer(
                         loop.exchangeExecutor(), 2,
-                        (response, keepAlive) -> true);
+                        (response, keepAlive, keepAliveHeader) -> true);
 
                 AtomicReference<Throwable> submitFailure =
                     runOnLoop(loop, () -> {
                         assertTrue(sequencer.submit(
-                            router, request("/throw-slow"), true, null));
+                            router, request("/throw-slow"),
+                            true, false, null));
                         assertTrue(sequencer.submit(
-                            router, request("/throw-fast"), true, null));
+                            router, request("/throw-fast"),
+                            true, false, null));
                     });
                 assertNull(submitFailure.get());
                 assertTrue(controller.slowStarted.await(

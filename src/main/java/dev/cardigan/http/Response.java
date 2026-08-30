@@ -2,6 +2,8 @@
 
 package dev.cardigan.http;
 
+import dev.cardigan.json.JsonWriter;
+import java.lang.foreign.MemorySegment;
 import java.util.Objects;
 
 public final class Response {
@@ -11,6 +13,8 @@ public final class Response {
     public static final int CT_JSON = 2;
     private static final int MAX_METADATA_FIELDS = 64;
     private static final int MAX_METADATA_BYTES = 8 * 1024;
+    private static final int BODY_OBJECT = 0;
+    private static final int BODY_ASCII_LONG = 1;
     private static final Response SERVICE_UNAVAILABLE =
         new Response(503, "text/plain", CT_TEXT, "Service Unavailable");
 
@@ -19,13 +23,18 @@ public final class Response {
     private final int contentTypeCode;
     private final Object body;
     private final Metadata metadata;
+    private final int bodyKind;
+    private final long asciiLong;
+    private final int asciiLongLength;
 
     public Response(
             int statusCode,
             String contentType,
             int contentTypeCode,
             Object body) {
-        this(statusCode, contentType, contentTypeCode, body, null);
+        this(
+            statusCode, contentType, contentTypeCode, body, null,
+            BODY_OBJECT, 0, 0);
     }
 
     public Response(int statusCode, String contentType, Object body) {
@@ -38,7 +47,10 @@ public final class Response {
                     ? CT_JSON
                     : CT_OTHER),
             body,
-            null);
+            null,
+            BODY_OBJECT,
+            0,
+            0);
     }
 
     private Response(
@@ -46,7 +58,10 @@ public final class Response {
             String contentType,
             int contentTypeCode,
             Object body,
-            Metadata metadata) {
+            Metadata metadata,
+            int bodyKind,
+            long asciiLong,
+            int asciiLongLength) {
         if (statusCode < 100 || statusCode > 999) {
             throw new IllegalArgumentException(
                 "Invalid HTTP status code: " + statusCode);
@@ -56,6 +71,9 @@ public final class Response {
         this.contentTypeCode = contentTypeCode;
         this.body = body;
         this.metadata = metadata;
+        this.bodyKind = bodyKind;
+        this.asciiLong = asciiLong;
+        this.asciiLongLength = asciiLongLength;
     }
 
     public int statusCode() {
@@ -71,7 +89,40 @@ public final class Response {
     }
 
     public Object body() {
-        return body;
+        return bodyKind == BODY_ASCII_LONG
+            ? Long.toString(asciiLong) : body;
+    }
+
+    public boolean hasAsciiLongBody() {
+        return bodyKind == BODY_ASCII_LONG;
+    }
+
+    public int asciiLongBodyLength() {
+        if (bodyKind != BODY_ASCII_LONG) {
+            throw new IllegalStateException("Response has no ASCII long body");
+        }
+        return asciiLongLength;
+    }
+
+    public void writeAsciiLongBody(MemorySegment destination) {
+        Objects.requireNonNull(destination, "destination");
+        if (bodyKind != BODY_ASCII_LONG) {
+            throw new IllegalStateException("Response has no ASCII long body");
+        }
+        if (destination.byteSize() != asciiLongLength) {
+            throw new IllegalArgumentException(
+                "ASCII long body requires " + asciiLongLength
+                    + " destination bytes, got " + destination.byteSize());
+        }
+        long written = JsonWriter.writeLong(destination, 0, asciiLong);
+        if (written != asciiLongLength) {
+            throw new IllegalStateException(
+                "ASCII long body length changed during encoding");
+        }
+    }
+
+    public StreamingBody streamingBody() {
+        return body instanceof StreamingBody streaming ? streaming : null;
     }
 
     public ResponseHeaders headers() {
@@ -128,7 +179,8 @@ public final class Response {
             ? null
             : new Metadata(headers, trailers);
         return new Response(
-            statusCode, contentType, contentTypeCode, body, next);
+            statusCode, contentType, contentTypeCode, body, next,
+            bodyKind, asciiLong, asciiLongLength);
     }
 
     private static void validateApplicationFields(
@@ -166,6 +218,13 @@ public final class Response {
 
     public static Response text(String body) {
         return new Response(200, "text/plain", CT_TEXT, body);
+    }
+
+    /** Responds with a decimal long encoded directly into transport memory. */
+    public static Response text(long body) {
+        return new Response(
+            200, "text/plain", CT_TEXT, null, null,
+            BODY_ASCII_LONG, body, decimalLength(body));
     }
 
     public static Response text(StaticBody body) {
@@ -216,6 +275,19 @@ public final class Response {
 
     public static Response serviceUnavailable() {
         return SERVICE_UNAVAILABLE;
+    }
+
+    private static int decimalLength(long value) {
+        if (value == Long.MIN_VALUE) {
+            return 20;
+        }
+        int length = value < 0 ? 1 : 0;
+        long magnitude = value < 0 ? -value : value;
+        do {
+            length++;
+            magnitude /= 10;
+        } while (magnitude != 0);
+        return length;
     }
 
     private record Metadata(

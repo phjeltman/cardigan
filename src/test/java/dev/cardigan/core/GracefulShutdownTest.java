@@ -61,7 +61,7 @@ class GracefulShutdownTest {
                 sendHttp1Get(socket, "/users/1", true);
                 String response = readHttp1Response(socket.getInputStream());
                 assertTrue(response.contains("HTTP/1.1 200 OK"));
-                assertTrue(response.contains("Connection: keep-alive"));
+                assertFalse(response.contains("Connection: keep-alive"));
                 awaitConnectionCount(server, 1);
 
                 Thread closer = Thread.ofPlatform().start(server::close);

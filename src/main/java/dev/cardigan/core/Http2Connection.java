@@ -1115,8 +1115,7 @@ final class Http2Connection {
     private void complete(Http2Task task, Response response) {
         boolean sent = taskCancelled(task);
         if (!sent && !failed) {
-            StreamingBody streamingBody = response.body()
-                instanceof StreamingBody body ? body : null;
+            StreamingBody streamingBody = response.streamingBody();
             setTaskResponseBody(task, streamingBody);
             try {
                 sent = responseWriter.send(task.streamId, response, task);
@@ -1125,9 +1124,11 @@ final class Http2Connection {
             } finally {
                 setTaskResponseBody(task, null);
             }
-        } else if (response != null
-            && response.body() instanceof StreamingBody streamingBody) {
-            streamingBody.close();
+        } else if (response != null) {
+            StreamingBody streamingBody = response.streamingBody();
+            if (streamingBody != null) {
+                streamingBody.close();
+            }
         }
         if (!sent && taskCancelled(task)) {
             sent = true;
