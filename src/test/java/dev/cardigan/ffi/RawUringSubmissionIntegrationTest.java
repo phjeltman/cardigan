@@ -43,7 +43,9 @@ final class RawUringSubmissionIntegrationTest {
                         firstUserData + index);
                 }
 
+                assertEquals(8, ring.unflushedSubmissionCount());
                 assertEquals(8, ring.submitAndWait(8));
+                assertEquals(0, ring.unflushedSubmissionCount());
                 assertFalse(ring.hasPendingSubmissions());
                 reapNops(ring, firstUserData, 8);
             }

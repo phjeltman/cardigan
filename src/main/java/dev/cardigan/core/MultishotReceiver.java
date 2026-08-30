@@ -63,6 +63,7 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
     private Thread receiveWaiter;
     private InboundChunk handoffChunk;
     private volatile Thread closeWaiter;
+    private Runnable availabilityListener;
 
     MultishotReceiver(UringEventLoop loop, int clientFd, int fixedSlot, Observer observer) {
         this.loop = loop;
@@ -94,7 +95,7 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
         while (!closed) {
             InboundChunk chunk = takeHandoff();
             if (chunk == null) {
-                chunk = poll();
+                chunk = pollQueued();
             }
             if (chunk != null) {
                 maybeArm();
@@ -115,6 +116,41 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
             setReceiveWaiter(null);
         }
         return null;
+    }
+
+    @Override
+    public InboundChunk tryReceive() {
+        InboundChunk chunk = takeHandoff();
+        if (chunk == null) {
+            chunk = pollQueued();
+        }
+        if (chunk != null) {
+            maybeArm();
+        }
+        return chunk;
+    }
+
+    @Override
+    public boolean registerAvailabilityListener(Runnable listener) {
+        if (listener == null || availabilityListener != null) {
+            return false;
+        }
+        availabilityListener = listener;
+        return true;
+    }
+
+    @Override
+    public void clearAvailabilityListener(Runnable listener) {
+        if (availabilityListener == listener) {
+            availabilityListener = null;
+        }
+    }
+
+    @Override
+    public boolean inputTerminated() {
+        return (eof || failed || closed)
+            && handoffChunk() == null
+            && queueSize() == 0;
     }
 
     @Override
@@ -149,7 +185,7 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
                 }
                 pause();
             }
-            signalReceiveWaiter();
+            signalAvailability();
             return;
         }
 
@@ -180,7 +216,7 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
             }
         }
 
-        signalReceiveWaiter();
+        signalAvailability();
         signalCloseWaiter();
     }
 
@@ -196,7 +232,7 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
         if (chunk != null) {
             chunk.close();
         }
-        while ((chunk = poll()) != null) {
+        while ((chunk = pollQueued()) != null) {
             chunk.close();
         }
 
@@ -228,7 +264,7 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
         return true;
     }
 
-    private InboundChunk poll() {
+    private InboundChunk pollQueued() {
         int size = queueSize();
         if (size == 0) {
             return null;
@@ -279,7 +315,7 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
             cancelPending = false;
             failed = true;
             active = false;
-            signalReceiveWaiter();
+            signalAvailability();
             signalCloseWaiter();
         }
     }
@@ -294,7 +330,7 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
             // Submission-resource exhaustion rejects this connection while
             // preserving the configured multishot receive model.
             failed = true;
-            signalReceiveWaiter();
+            signalAvailability();
             return;
         }
         receiveToken = token;
@@ -313,6 +349,15 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
             // single waiter while the owner callback is mounted.
             setReceiveWaiter(null);
             LockSupport.unpark(waiter);
+        }
+    }
+
+    private void signalAvailability() {
+        Runnable listener = availabilityListener;
+        if (listener != null) {
+            listener.run();
+        } else {
+            signalReceiveWaiter();
         }
     }
 

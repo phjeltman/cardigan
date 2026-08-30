@@ -55,6 +55,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
     private final FixedFilesMode fixedFilesMode;
     private final boolean directAccept;
     private final EgressBufferPool egressBufferPool;
+    private final Http1CqeDriverStats http1CqeDriverStats =
+        new Http1CqeDriverStats();
     private final List<UringEventLoop> eventLoops = new ArrayList<>();
     private final List<Integer> serverFds = new ArrayList<>();
     private final List<AcceptHandler> acceptHandlers = new ArrayList<>();
@@ -103,6 +105,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
     public static final long MAX_REQUEST_SIZE = Long.getLong("cardigan.max.request.size", 10 * 1024 * 1024L);
     public static final int MAX_HEADER_SIZE = Integer.getInteger("cardigan.max.header.size", 8192);
     public static final int MAX_HTTP1_IN_FLIGHT = Integer.getInteger("cardigan.http1.max.inflight", 128);
+    private static final boolean HTTP1_CQE_DRIVER =
+        Boolean.getBoolean("cardigan.http1.cqeDriver");
 
     private static final long HTTP1_FRAMING_CHUNKED = 1L << 60;
     private static final long HTTP1_EXPECT_CONTINUE = 1L << 61;
@@ -991,6 +995,9 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             control
         );
         try {
+            if (HTTP1_CQE_DRIVER && driveHttp1FromCompletions(session)) {
+                return;
+            }
             while (drainHttp1Session(session)) {
                 InboundChunk next = inbound.nextChunk();
                 if (next == null) {
@@ -1000,6 +1007,135 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             }
         } finally {
             session.close();
+        }
+    }
+
+    private boolean driveHttp1FromCompletions(Http1Session session) {
+        if (Http1CqeDriverStats.ENABLED) {
+            http1CqeDriverStats.connectionAttempted();
+        }
+        Http1CqeDriver driver = new Http1CqeDriver(
+            session, Thread.currentThread());
+        if (!driver.start()) {
+            if (Http1CqeDriverStats.ENABLED) {
+                http1CqeDriverStats.listenerUnavailable();
+            }
+            return false;
+        }
+        return driver.awaitOutcome() == Http1CqeDriver.DONE;
+    }
+
+    /**
+     * Processes the buffered, zero-body GET path without parking. Any request
+     * that needs the general blocking protocol machinery is left untouched and
+     * handed back to the connection owner.
+     */
+    private int drainHttp1CqeBatch(Http1Session session) {
+        boolean keepAlive = session.keepAlive;
+        InboundChunk currentChunk = session.currentChunk;
+        MemorySegment currentBuf = session.currentBuf;
+        int readOffset = session.readOffset;
+        int requestOffset = session.requestOffset;
+        HttpRequest request = session.request;
+        Http1ExchangeSequencer exchangeSequencer = session.exchangeSequencer;
+        try {
+            while (keepAlive) {
+                if (session.control.draining
+                        || (exchangeSequencer != null
+                            && exchangeSequencer.isFailed())) {
+                    return Http1CqeDriver.DONE;
+                }
+                if (currentChunk == null) {
+                    return Http1CqeDriver.NEED_INPUT;
+                }
+
+                request.init(currentBuf, requestOffset);
+                long parseResult = PicoHTTPParser.parseRequest(
+                    currentBuf,
+                    requestOffset,
+                    Math.min(readOffset, requestOffset + MAX_HEADER_SIZE),
+                    request.picoRequest(),
+                    0
+                );
+                if (parseResult < 0) {
+                    if (parseResult == PicoHTTPParser.ERROR_PARTIAL
+                            && readOffset - requestOffset
+                                < MAX_HEADER_SIZE) {
+                        return Http1CqeDriver.FALLBACK_PARTIAL_HEADER;
+                    }
+                    return Http1CqeDriver.FALLBACK_HEADER_REJECTED;
+                }
+
+                request.splitQuery();
+                long framing = parseHttp1Framing(request);
+                if (framing != 0) {
+                    return Http1CqeDriver.FALLBACK_REQUEST_FRAMING;
+                }
+                if (!router.isSafeMethod(request)) {
+                    return Http1CqeDriver.FALLBACK_UNSAFE_METHOD;
+                }
+
+                int headerLength = (int) parseResult;
+                int requestEnd = requestOffset + headerLength;
+                if (requestEnd > readOffset) {
+                    return Http1CqeDriver.FALLBACK_PARTIAL_HEADER;
+                }
+
+                boolean requestKeepAlive = request.isKeepAlive();
+                boolean requestKeepAliveHeader =
+                    requestKeepAlive && request.version() == 0;
+                keepAlive = requestKeepAlive;
+                int leftover = readOffset - requestEnd;
+
+                if (exchangeSequencer == null) {
+                    exchangeSequencer = new Http1ExchangeSequencer(
+                        session.loop.exchangeExecutor(),
+                        MAX_HTTP1_IN_FLIGHT,
+                        (completedResponse, responseKeepAlive,
+                                responseKeepAliveHeader) ->
+                            sendResponse(
+                                session.writer,
+                                completedResponse,
+                                responseKeepAlive,
+                                responseKeepAliveHeader,
+                                true)
+                    );
+                    session.control.http1 = exchangeSequencer;
+                }
+                if (!exchangeSequencer.hasSubmissionCapacity()) {
+                    return Http1CqeDriver.FALLBACK_SEQUENCER_CAPACITY;
+                }
+
+                AutoCloseable requestStorage = null;
+                if (leftover == 0) {
+                    requestStorage = currentChunk;
+                    currentChunk = null;
+                    currentBuf = null;
+                }
+                if (!exchangeSequencer.submit(
+                        router,
+                        request,
+                        requestKeepAlive,
+                        requestKeepAliveHeader,
+                        requestStorage)) {
+                    return Http1CqeDriver.DONE;
+                }
+
+                if (leftover == 0) {
+                    readOffset = 0;
+                    requestOffset = 0;
+                } else {
+                    requestOffset = requestEnd;
+                }
+            }
+            return Http1CqeDriver.DONE;
+        } finally {
+            session.keepAlive = keepAlive;
+            session.currentChunk = currentChunk;
+            session.currentBuf = currentBuf;
+            session.readOffset = readOffset;
+            session.requestOffset = requestOffset;
+            session.exchangeSequencer = exchangeSequencer;
         }
     }
 
@@ -1396,6 +1532,161 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             session.readOffset = readOffset;
             session.requestOffset = requestOffset;
             session.exchangeSequencer = exchangeSequencer;
+        }
+    }
+
+    private final class Http1CqeDriver
+            implements UringEventLoop.ProtocolTask {
+        private static final int RUNNING = 0;
+        private static final int NEED_INPUT = 1;
+        private static final int DONE = 2;
+        private static final int FALLBACK_PARTIAL_HEADER = 3;
+        private static final int FALLBACK_HEADER_REJECTED = 4;
+        private static final int FALLBACK_REQUEST_FRAMING = 5;
+        private static final int FALLBACK_UNSAFE_METHOD = 6;
+        private static final int FALLBACK_SEQUENCER_CAPACITY = 7;
+
+        private final Http1Session session;
+        private final Thread owner;
+        private final Runnable availabilityListener = this::schedule;
+        private volatile int outcome = RUNNING;
+        private boolean scheduled;
+        private long drivenRequests;
+        private long protocolRuns;
+        private long queuedChunksConsumed;
+
+        private Http1CqeDriver(Http1Session session, Thread owner) {
+            this.session = session;
+            this.owner = owner;
+        }
+
+        private boolean start() {
+            if (!session.inbound.registerAvailabilityListener(
+                    availabilityListener)) {
+                return false;
+            }
+            schedule();
+            return true;
+        }
+
+        private int awaitOutcome() {
+            boolean interrupted = false;
+            while (outcome == RUNNING) {
+                LockSupport.park(this);
+                if (outcome == RUNNING && Thread.interrupted()) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            return outcome;
+        }
+
+        private void schedule() {
+            if (outcome != RUNNING || scheduled) {
+                return;
+            }
+            scheduled = true;
+            try {
+                session.loop.execute(this);
+            } catch (Throwable failure) {
+                scheduled = false;
+                finish(
+                    DONE,
+                    Http1CqeDriverStats.STOP_SCHEDULE_FAILURE);
+            }
+        }
+
+        @Override
+        public void run() {
+            scheduled = false;
+            if (Http1CqeDriverStats.ENABLED) {
+                protocolRuns++;
+            }
+            try {
+                while (outcome == RUNNING) {
+                    long previousSubmissions = 0;
+                    if (Http1CqeDriverStats.ENABLED
+                            && session.exchangeSequencer != null) {
+                        previousSubmissions =
+                            session.exchangeSequencer.submissionCount();
+                    }
+                    int result = drainHttp1CqeBatch(session);
+                    if (Http1CqeDriverStats.ENABLED
+                            && session.exchangeSequencer != null) {
+                        drivenRequests +=
+                            session.exchangeSequencer.submissionCount()
+                                - previousSubmissions;
+                    }
+                    int fallbackReason = fallbackStopReason(result);
+                    if (fallbackReason >= 0) {
+                        finish(result, fallbackReason);
+                        return;
+                    }
+                    if (result == DONE) {
+                        finish(
+                            DONE,
+                            Http1CqeDriverStats.STOP_COMPLETED);
+                        return;
+                    }
+
+                    InboundChunk chunk =
+                        session.inbound.nextAvailableChunk();
+                    if (chunk == null) {
+                        if (session.inbound.inputTerminated()) {
+                            finish(
+                                DONE,
+                                Http1CqeDriverStats.STOP_COMPLETED);
+                        }
+                        return;
+                    }
+                    if (Http1CqeDriverStats.ENABLED) {
+                        queuedChunksConsumed++;
+                    }
+                    session.accept(chunk);
+                }
+            } catch (Throwable failure) {
+                if (!session.control.draining) {
+                    failure.printStackTrace();
+                }
+                finish(
+                    DONE,
+                    Http1CqeDriverStats.STOP_DRIVER_EXCEPTION);
+            }
+        }
+
+        private int fallbackStopReason(int result) {
+            return switch (result) {
+                case FALLBACK_PARTIAL_HEADER ->
+                    Http1CqeDriverStats.STOP_PARTIAL_HEADER;
+                case FALLBACK_HEADER_REJECTED ->
+                    Http1CqeDriverStats.STOP_HEADER_REJECTED;
+                case FALLBACK_REQUEST_FRAMING ->
+                    Http1CqeDriverStats.STOP_REQUEST_FRAMING;
+                case FALLBACK_UNSAFE_METHOD ->
+                    Http1CqeDriverStats.STOP_UNSAFE_METHOD;
+                case FALLBACK_SEQUENCER_CAPACITY ->
+                    Http1CqeDriverStats.STOP_SEQUENCER_CAPACITY;
+                default -> -1;
+            };
+        }
+
+        private void finish(int terminalOutcome, int stopReason) {
+            if (outcome != RUNNING) {
+                return;
+            }
+            session.inbound.clearAvailabilityListener(
+                availabilityListener);
+            if (Http1CqeDriverStats.ENABLED) {
+                http1CqeDriverStats.driverStopped(
+                    drivenRequests,
+                    protocolRuns,
+                    queuedChunksConsumed,
+                    stopReason);
+            }
+            outcome = terminalOutcome;
+            LockSupport.unpark(owner);
         }
     }
 
@@ -2708,6 +2999,46 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             System.out.println(
                 "HTTP/2 resource stats: "
                     + Http2ResourceStats.snapshot().summary());
+        }
+        if (Http1CqeDriverStats.ENABLED) {
+            System.out.println(
+                "HTTP/1 CQE driver stats: "
+                    + http1CqeDriverStats.snapshot().summary());
+        }
+        if (UringEventLoop.VIRTUAL_THREAD_STATS_ENABLED) {
+            long coreMounts = 0;
+            long coreUnmounts = 0;
+            long handlerMounts = 0;
+            long handlerUnmounts = 0;
+            for (UringEventLoop loop : eventLoops) {
+                UringEventLoop.VirtualThreadStats stats =
+                    loop.virtualThreadStats();
+                coreMounts += stats.coreMounts();
+                coreUnmounts += stats.coreUnmounts();
+                handlerMounts += stats.handlerMounts();
+                handlerUnmounts += stats.handlerUnmounts();
+            }
+            long mounts = coreMounts + handlerMounts;
+            long unmounts = coreUnmounts + handlerUnmounts;
+            long drivenRequests = Http1CqeDriverStats.ENABLED
+                ? http1CqeDriverStats.snapshot().drivenRequests()
+                : 0;
+            String mountsPerRequest = drivenRequests == 0
+                ? "n/a"
+                : String.format(
+                    Locale.ROOT,
+                    "%.6f",
+                    (double) mounts / drivenRequests);
+            System.out.println(
+                "Virtual-thread mount stats: core=" + coreMounts
+                    + ", core-unmounts=" + coreUnmounts
+                    + ", handlers=" + handlerMounts
+                    + ", handler-unmounts=" + handlerUnmounts
+                    + ", total-mounts=" + mounts
+                    + ", total-unmounts=" + unmounts
+                    + ", driven-requests=" + drivenRequests
+                    + ", mounts-per-driven-request="
+                    + mountsPerRequest);
         }
 
         IllegalStateException loopCloseFailure = null;

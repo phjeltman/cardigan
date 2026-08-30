@@ -40,6 +40,9 @@ TLS_STATS=false
 HTTP2_RESOURCE_STATS=false
 EGRESS_POOL_STATS=false
 SCHEDULER_STATS=false
+HTTP1_CQE_DRIVER=false
+HTTP1_CQE_DRIVER_STATS=false
+VIRTUAL_THREAD_STATS=false
 FIXED_FILE_STATS=false
 FIXED_FILES_MODE="auto"
 FIXED_FILES_CAPACITY=8192
@@ -100,6 +103,9 @@ Options:
   --http2-resource-stats     Print opt-in HTTP/2 resource high-water marks
   --egress-pool-stats        Print shared egress-pool occupancy and batching
   --scheduler-stats          Print per-loop epoch/lane/range counters
+  --http1-cqe-driver         Drive eligible HTTP/1 requests from receive CQEs
+  --http1-cqe-driver-stats   Enable the driver and print fallback counters
+  --virtual-thread-stats     Count virtual-thread mounts and unmounts
   --fixed-file-stats         Print fixed-file capacity and admission counters
   --fixed-files=MODE         auto, legacy, async-explicit, async-alloc, direct
   --fixed-files-capacity=N   Registered socket slots per event loop (default: 8192)
@@ -311,6 +317,19 @@ while [ "$#" -gt 0 ]; do
             ;;
         --scheduler-stats)
             SCHEDULER_STATS=true
+            shift
+            ;;
+        --http1-cqe-driver)
+            HTTP1_CQE_DRIVER=true
+            shift
+            ;;
+        --http1-cqe-driver-stats)
+            HTTP1_CQE_DRIVER=true
+            HTTP1_CQE_DRIVER_STATS=true
+            shift
+            ;;
+        --virtual-thread-stats)
+            VIRTUAL_THREAD_STATS=true
             shift
             ;;
         --egress-pool-stats)
@@ -1409,6 +1428,8 @@ print_runtime_configuration() {
         echo "io_uring task pool: runtime-derived from fixed-file capacity and SQ entries"
     fi
     echo "Scheduler: topological causal epochs, stats=$SCHEDULER_STATS"
+    echo "HTTP/1 CQE driver: enabled=$HTTP1_CQE_DRIVER, stats=$HTTP1_CQE_DRIVER_STATS"
+    echo "Virtual-thread mount stats: $VIRTUAL_THREAD_STATS"
     echo "Egress pool stats: $EGRESS_POOL_STATS"
     echo "Server event-loop CPUs: $SERVER_CPU_LIST"
     if [ "$CLIENT_AFFINITY" = true ]; then
@@ -1609,6 +1630,11 @@ CARDIGAN_FIXED_FILE_ARGS=(
 CARDIGAN_SCHEDULER_ARGS=(
     -Dcardigan.scheduler.stats="$SCHEDULER_STATS"
 )
+CARDIGAN_HTTP1_ARGS=(
+    -Dcardigan.http1.cqeDriver="$HTTP1_CQE_DRIVER"
+    -Dcardigan.http1.cqeDriver.stats="$HTTP1_CQE_DRIVER_STATS"
+    -Dcardigan.virtual.thread.stats="$VIRTUAL_THREAD_STATS"
+)
 if [ -n "$URING_MAX_TASKS" ]; then
     CARDIGAN_FIXED_FILE_ARGS+=(
         -Dcardigan.max.tasks="$URING_MAX_TASKS"
@@ -1640,6 +1666,7 @@ java "${JAVA_ARGS[@]}" \
         "${CARDIGAN_DIAGNOSTIC_ARGS[@]}" \
         "${CARDIGAN_FIXED_FILE_ARGS[@]}" \
         "${CARDIGAN_SCHEDULER_ARGS[@]}" \
+        "${CARDIGAN_HTTP1_ARGS[@]}" \
         -Dcardigan.benchmark.payloadSize="$PAYLOAD_SIZE" \
         -Dcardigan.benchmark.sleepMillis="$SLEEP_MILLIS" \
         -Dcardigan.benchmark.heavyIterations="$HEAVY_ITERATIONS" \

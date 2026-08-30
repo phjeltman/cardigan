@@ -136,6 +136,14 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
         return inFlight() != 0;
     }
 
+    boolean hasSubmissionCapacity() {
+        return inFlight() < maxInFlight || failed;
+    }
+
+    long submissionCount() {
+        return nextSubmission;
+    }
+
     boolean isFailed() {
         return failed;
     }

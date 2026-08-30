@@ -42,6 +42,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         Boolean.getBoolean("cardigan.uring.task.stats");
     private static final boolean SCHEDULER_STATS_ENABLED =
         Boolean.getBoolean("cardigan.scheduler.stats");
+    static final boolean VIRTUAL_THREAD_STATS_ENABLED =
+        Boolean.getBoolean("cardigan.virtual.thread.stats");
     private static final boolean FIXED_FILE_STATS_ENABLED =
         Boolean.getBoolean("cardigan.fixed.files.stats");
     private static final int CQE_TURN_BUDGET = 256;
@@ -90,6 +92,9 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
     /** Stable marker used to retain the egress lane across an external wake. */
     interface EgressTask extends Runnable {}
+
+    /** Stable marker for protocol state machines resumed by transport input. */
+    interface ProtocolTask extends Runnable {}
 
     private final int cpuId;
     private final Arena arena;
@@ -337,6 +342,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private volatile boolean isSleeping = false;
 
     private long schedulerEpochs;
+    private long schedulerSqes;
     private long schedulerCqes;
     private long schedulerCompletionTasks;
     private long schedulerProtocolTasks;
@@ -349,6 +355,10 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private long schedulerSubmits;
     private long schedulerWaits;
     private volatile long schedulerEpoch;
+    private long coreVirtualThreadMounts;
+    private long coreVirtualThreadUnmounts;
+    private long handlerVirtualThreadMounts;
+    private long handlerVirtualThreadUnmounts;
 
     public UringEventLoop(int cpuId, int entries) {
         this(cpuId, entries, Math.max(entries, 512), false);
@@ -492,7 +502,12 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             Class<?> builderClass = Class.forName("java.lang.ThreadBuilders$VirtualThreadBuilder");
             java.lang.reflect.Constructor<?> ctor = builderClass.getDeclaredConstructor(java.util.concurrent.Executor.class);
             ctor.setAccessible(true);
-            Thread.Builder.OfVirtual builder = (Thread.Builder.OfVirtual) ctor.newInstance(this);
+            java.util.concurrent.Executor scheduler =
+                VIRTUAL_THREAD_STATS_ENABLED
+                    ? this::executeCountedCoreContinuation
+                    : this;
+            Thread.Builder.OfVirtual builder =
+                (Thread.Builder.OfVirtual) ctor.newInstance(scheduler);
             factory = builder.name("cardigan-vt-core" + cpuId + "-", 0).factory();
         } catch (Throwable t) {
             arena.close();
@@ -685,6 +700,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                             || ring.hasPendingSubmissions();
                         int ret;
                         try {
+                            recordSqePublications();
                             ret = ring.submitAndWait(1);
                         } finally {
                             sqePending = ring.hasPendingSubmissions();
@@ -725,6 +741,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                         || ring.hasPendingSubmissions();
                     int ret;
                     try {
+                        recordSqePublications();
                         ret = ring.submitAndWait(1);
                     } finally {
                         sqePending = ring.hasPendingSubmissions();
@@ -759,6 +776,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                 || ring.hasPendingSubmissions();
             int result;
             try {
+                recordSqePublications();
                 result = ring.enterGetEvents();
             } finally {
                 sqePending = ring.hasPendingSubmissions();
@@ -840,6 +858,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                 || ring.hasPendingSubmissions();
             int result;
             try {
+                recordSqePublications();
                 result = ring.enterGetEvents();
             } finally {
                 sqePending = ring.hasPendingSubmissions();
@@ -1027,6 +1046,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         if (sqeRaw.equals(MemorySegment.NULL)) {
             int submitResult;
             try {
+                recordSqePublications();
                 submitResult = ring.submit();
             } finally {
                 sqePending = ring.hasPendingSubmissions();
@@ -1201,12 +1221,19 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
     private boolean sqePending = false;
 
+    private void recordSqePublications() {
+        if (SCHEDULER_STATS_ENABLED) {
+            schedulerSqes += ring.unflushedSubmissionCount();
+        }
+    }
+
     void submitPendingOperations() {
         if (!sqePending && !ring.hasPendingSubmissions()) {
             return;
         }
         int result;
         try {
+            recordSqePublications();
             result = ring.submit();
         } finally {
             sqePending = ring.hasPendingSubmissions();
@@ -1221,6 +1248,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private void submitForSqeSpace() {
         int result;
         try {
+            recordSqePublications();
             result = ring.submit();
         } finally {
             sqePending = ring.hasPendingSubmissions();
@@ -2733,6 +2761,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
     record SchedulerStats(
         long epochs,
+        long sqes,
         long cqes,
         long completionTasks,
         long protocolTasks,
@@ -2755,6 +2784,21 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         int admissionWaiters
     ) {}
 
+    record VirtualThreadStats(
+        long coreMounts,
+        long coreUnmounts,
+        long handlerMounts,
+        long handlerUnmounts
+    ) {
+        long mounts() {
+            return coreMounts + handlerMounts;
+        }
+
+        long unmounts() {
+            return coreUnmounts + handlerUnmounts;
+        }
+    }
+
     TaskPoolStats taskPoolStats() {
         return new TaskPoolStats(
             tasks.length,
@@ -2767,6 +2811,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     SchedulerStats schedulerStats() {
         return new SchedulerStats(
             schedulerEpochs,
+            schedulerSqes,
             schedulerCqes,
             schedulerCompletionTasks,
             schedulerProtocolTasks,
@@ -2789,6 +2834,15 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             peakActiveFixedFiles,
             fixedFileCapacityMisses,
             fixedFileWaiters.size()
+        );
+    }
+
+    VirtualThreadStats virtualThreadStats() {
+        return new VirtualThreadStats(
+            coreVirtualThreadMounts,
+            coreVirtualThreadUnmounts,
+            handlerVirtualThreadMounts,
+            handlerVirtualThreadUnmounts
         );
     }
 
@@ -2886,6 +2940,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                 handlerReadyTasks.addLast(command);
             } else if (command instanceof EgressTask) {
                 egressReadyTasks.addLast(command);
+            } else if (command instanceof ProtocolTask) {
+                protocolReadyTasks.addLast(command);
             } else if (dispatchingCompletions) {
                 completionReadyTasks.addLast(command);
             } else {
@@ -2895,6 +2951,37 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         }
 
         enqueueExternal(command);
+    }
+
+    private void executeCountedCoreContinuation(Runnable continuation) {
+        execute(new CountedCoreContinuation(continuation));
+    }
+
+    void runCountedHandlerContinuation(Runnable continuation) {
+        handlerVirtualThreadMounts++;
+        try {
+            continuation.run();
+        } finally {
+            handlerVirtualThreadUnmounts++;
+        }
+    }
+
+    private final class CountedCoreContinuation implements Runnable {
+        private final Runnable continuation;
+
+        private CountedCoreContinuation(Runnable continuation) {
+            this.continuation = continuation;
+        }
+
+        @Override
+        public void run() {
+            coreVirtualThreadMounts++;
+            try {
+                continuation.run();
+            } finally {
+                coreVirtualThreadUnmounts++;
+            }
+        }
     }
 
     void executeHandler(HandlerContinuation command) {
@@ -2980,6 +3067,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             System.out.println(
                 "Uring scheduler CPU " + cpuId
                     + ": epochs=" + stats.epochs()
+                    + ", sqes=" + stats.sqes()
                     + ", cqes=" + stats.cqes()
                     + ", completion-tasks=" + stats.completionTasks()
                     + ", protocol-tasks=" + stats.protocolTasks()
@@ -3005,7 +3093,6 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                     + ", capacity-misses=" + stats.capacityMisses()
                     + ", admission-waiters=" + stats.admissionWaiters());
         }
-
         try {
             int unused = (int) Libc.close.invokeExact(evfd);
         } catch (Throwable t) {
