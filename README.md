@@ -1,147 +1,28 @@
 # Cardigan
 
-Cardigan is an experimental Java HTTP server built around direct io_uring,
-Panama FFI and memory access, the Java Vector API, and virtual threads. It
-currently implements HTTP/1.1, cleartext and ALPN-negotiated HTTP/2, streaming
-request and response bodies, and an experimental OpenSSL/kTLS transport.
+**Vision: “Build it like it’s 2005. Scale it like it’s 2026.”**
 
-The project is deliberately Linux-specific and is not yet a production-ready
-framework. The current focus is validating its execution model, protocol
-correctness, resource bounds, and performance.
+Java has acquired capabilities previously reserved for systems programming
+languages: low-overhead native interop and explicit off-heap memory access
+through Project Panama, SIMD through the incubating Vector API, and M:N virtual
+threading through Project Loom.
 
-## Requirements
+Cardigan asks what happens when those capabilities are combined with a
+Seastar/Glommio-shaped, shared-nothing transport architecture built around
+modern Linux io_uring.
 
-- 64-bit Linux; x86-64 is the regularly exercised target.
-- Linux 6.1 or newer. Cardigan requires `IORING_SETUP_SINGLE_ISSUER`,
-  `IORING_SETUP_SUBMIT_ALL`, `IORING_SETUP_DEFER_TASKRUN`, and
-  `IORING_SETUP_TASKRUN_FLAG`, registered files, provided-buffer rings,
-  multishot accept/receive, pinned event loops, and its TCP listener options.
-  It does not select a degraded fallback when a required operation is
-  rejected. Direct kTLS remains an optional capability.
-- JDK 26 with the incubating Vector API.
-- Maven 3.9 or newer.
-- OpenSSL 3 at runtime when TLS is enabled.
-- `wrk` and `h2load` for live benchmarks; `h2spec` for HTTP/2 conformance.
+Cardigan is an experimental answer to that question. It lets developers write
+simple, blocking handlers while retaining strong mechanical sympathy with the
+underlying hardware. Application code needs no asynchronous APIs, Futures,
+Promises, Mono/Flux chains, or async function coloring. Cardigan asks you to
+write the straight-line code you already wanted to write, on a runtime that
+does not need the traditional workarounds.
 
-## Maven
+Slip on the cardigan; it’s peak cozy.
 
-```xml
-<dependency>
-    <groupId>dev.cardigan</groupId>
-    <artifactId>cardigan</artifactId>
-    <version>0.1.0-alpha.3</version>
-</dependency>
-```
+See [DOCUMENTATION.md](DOCUMENTATION.md) for requirements, usage, configuration,
+validation, and publication. [APOLOGY.md](APOLOGY.md) explains Cardigan's
+deliberate use of unsupported JDK internals.
 
-## Build and test
-
-Compile and run the portable unit tier:
-
-```sh
-mvn test
-```
-
-Live integration tests require a compatible Linux/io_uring host:
-
-```sh
-mvn -Pintegration-tests test
-```
-
-TLS and deliberately heavy stress tests can be selected independently:
-
-```sh
-mvn -Ptls-tests test
-mvn -Pstress-tests test
-mvn -Padvanced-tls-tests test
-mvn -Pall-tests test
-```
-
-## Run
-
-```sh
-./dev/example-server/run.sh
-```
-
-The development executable starts demonstration and benchmark routes on port
-8080. Its classes live under `dev/example-server` and are not part of the
-framework artifact. Consumers configure their own listener and route set:
-
-```java
-try (CardiganServer server = CardiganServer.builder()
-        .port(8080)
-        .eventLoops(4)
-        .protocol(ProtocolMode.HTTP1_AND_HTTP2)
-        .routes(new ApplicationController())
-        .build()) {
-    server.start();
-    Thread.currentThread().join();
-}
-```
-
-Event loops are assigned one hardware thread from each physical core before
-SMT siblings are used, always within the process affinity mask. Applications
-that need an exact NUMA or NIC-queue placement can replace `.eventLoops(4)`
-with `.eventLoopCpus("0,2,4,6")`; the same override is available through
-`-Dcardigan.eventloop.cpus=0,2,4,6`.
-
-The server installs no implicit routes. TLS is selected with `.tls(config)`;
-the example launcher alone opts into `.tlsFromSystemProperties()` for script
-compatibility. The HttpArena consumer is an independent Maven project under
-[`dev/httparena`](dev/httparena/README.md).
-
-Small, bounded binary protocol messages can bind a sole primitive `long`
-handler argument with `@DecodedBody(SomeLongBodyDecoder.class)`. The decoder
-runs against the complete buffered body on the connection owner before
-handover, avoiding request retention and copying. It must be bounded,
-non-blocking, thread-safe, and must not retain the supplied memory segment.
-
-## Benchmark and conformance
-
-```sh
-./dev/benchmarks/benchmark.sh --cpus=2 --duration=10s --endpoint=1
-./dev/benchmarks/benchmark.sh --http2 --http2-streams=16 --cpus=2 --duration=10s --endpoint=1
-./dev/benchmarks/benchmark.sh --tls --http2 --http2-streams=16 --cpus=2 --duration=10s --endpoint=1
-./dev/verification/h2spec.sh
-```
-
-`dev/benchmarks/benchmark.sh --help` documents protocol, pipeline, streaming,
-microbenchmark and profiling modes. Benchmark results are meaningful only when
-the server and client CPU placement, protocol concurrency and payload are kept
-comparable.
-
-Independent results from HttpArena's 64-core reference host are available in
-the [overall Engine composite](https://www.http-arena.com/#scope=all&type=engine),
-[HTTP/1 Engine results](https://www.http-arena.com/#type=engine), and
-[HTTP/2 Engine results](https://www.http-arena.com/#scope=h2&type=engine).
-HttpArena scores unimplemented profiles as zero, so its composite rankings
-measure profile coverage as well as performance; use the individual profile
-tables for like-for-like comparisons.
-
-Microbenchmark and probe sources live outside the runtime artifact under
-`dev/benchmarks/src/main/java`. They are compiled by the benchmark script, or explicitly with:
-
-```sh
-mvn -f dev/pom.xml -pl :cardigan-benchmarks -am test
-```
-
-## Documentation
-
-- [DOCUMENTATION](DOCUMENTATION.md) — execution model, API contracts,
-  configuration, TLS, validation and publication
-- [APOLOGY](APOLOGY.md) — why the experiment deliberately uses sharp edges
-- [RATIONALE](RATIONALE.md) — the architectural thesis behind Cardigan
-
-## Status
-
-The wire protocols and core transport have substantial correctness and stress
-coverage, but the public API, configuration surface, packaging and operational
-diagnostics are still evolving. Bidirectional gRPC-style handler streaming is
-currently a non-goal; handlers consume a request body before returning their
-response.
-
-## License
-
-Cardigan-authored source is licensed under the
-[Mozilla Public License 2.0](LICENSE). Ports and adaptations of third-party
-code retain their applicable upstream licenses and notices; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The following song is not affiliated with the cardigan.dev project:
+https://www.youtube.com/watch?v=NI6aOFI7hms
