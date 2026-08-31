@@ -38,30 +38,31 @@ public final class RawSegment {
     }
 
     public static byte getByte(long address, long offset) {
-        return (byte) BYTE.get(raw(address), offset);
+        return (byte) BYTE.get(ADDRESS_SPACE, address + offset);
     }
 
     public static int getInt(long address, long offset) {
-        return (int) INT_UNALIGNED.get(raw(address), offset);
+        return (int) INT_UNALIGNED.get(ADDRESS_SPACE, address + offset);
     }
 
     public static long getLong(long address, long offset) {
-        return (long) LONG_UNALIGNED.get(raw(address), offset);
+        return (long) LONG_UNALIGNED.get(ADDRESS_SPACE, address + offset);
     }
 
     public static void copy(byte[] src, int srcPos, long destAddr, int len) {
-        MemorySegment.copy(src, srcPos, raw(destAddr), ValueLayout.JAVA_BYTE, 0, len);
+        MemorySegment.copy(
+            src, srcPos, ADDRESS_SPACE, ValueLayout.JAVA_BYTE, destAddr, len);
     }
 
     public static void copy(long srcAddr, long destAddr, long len) {
-        MemorySegment.copy(raw(srcAddr), 0, raw(destAddr), 0, len);
+        MemorySegment.copy(ADDRESS_SPACE, srcAddr, ADDRESS_SPACE, destAddr, len);
     }
 
     public static void putLong(long address, long offset, long value) {
-        LONG_UNALIGNED.set(raw(address), offset, value);
+        LONG_UNALIGNED.set(ADDRESS_SPACE, address + offset, value);
     }
 
     public static void putInt(long address, long offset, int value) {
-        INT_UNALIGNED.set(raw(address), offset, value);
+        INT_UNALIGNED.set(ADDRESS_SPACE, address + offset, value);
     }
 }
