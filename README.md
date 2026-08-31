@@ -11,11 +11,11 @@ Cardigan asks what happens when those capabilities are combined with a
 Seastar/Glommio-shaped, shared-nothing transport architecture built around
 modern Linux io_uring.
 
-Cardigan lets developers write simple, blocking handlers while retaining strong 
-mechanical sympathy with the underlying hardware. Application code needs no asynchronous 
-APIs, Futures, Promises, Mono/Flux chains, or async function coloring. Cardigan asks 
-you to write the straight-line code you already wanted to write, on a runtime that
-does not need the traditional workarounds.
+Cardigan lets developers write simple, blocking handlers while retaining strong
+mechanical sympathy with the underlying hardware. Application code needs no
+asynchronous APIs, Futures, Promises, Mono/Flux chains, or async function
+coloring. Cardigan asks you to write the straight-line code you already wanted
+to write, with asynchronous coordination handled by the runtime.
 
 Slip on the cardigan; it’s peak cozy.
 
