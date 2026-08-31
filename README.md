@@ -12,8 +12,8 @@ threading through Project Loom.
 
 Cardigan asks what happens when those capabilities are combined with a
 thread-per-core, shared-nothing transport architecture built around modern
-Linux io_uring. Each pinned carrier thread both drives io_uring submissions and
-completions and runs application logic through virtual threads.
+Linux io_uring. Each pinned carrier thread both handles io_uring processing and
+runs application logic through virtual threads.
 
 Cardigan lets developers write simple, blocking handlers while retaining strong
 mechanical sympathy with the underlying hardware. Application code needs no
@@ -29,8 +29,6 @@ public Response hello() {
     return Response.text("hello");
 }
 ```
-
-Cardigan handles transport, parsing, scheduling, ordering, and backpressure.
 
 Slip on the cardigan; it’s peak cozy.
 
