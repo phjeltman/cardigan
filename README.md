@@ -30,8 +30,7 @@ public Response hello() {
 }
 ```
 
-Cardigan handles transport, parsing, scheduling, ordering, and backpressure
-around that straight-line code.
+Cardigan handles transport, parsing, scheduling, ordering, and backpressure.
 
 Slip on the cardigan; it’s peak cozy.
 
