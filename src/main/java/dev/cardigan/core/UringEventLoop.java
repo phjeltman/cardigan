@@ -517,9 +517,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             System.out.println(
                 "Pinned cardigan-loop-" + cpuId + " to Linux CPU " + cpuId);
 
-            int flags = Opcodes.IORING_SETUP_SINGLE_ISSUER
-                | Opcodes.IORING_SETUP_DEFER_TASKRUN;
-            this.ring = new RawUring(arena, entries, flags);
+            this.ring = new RawUring(
+                arena, entries, ringSetupFlags());
 
             this.evfd = (int) Libc.eventfd.invokeExact(0, 0);
             if (this.evfd < 0) {
@@ -648,6 +647,13 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                 System.err.println("Error in event loop for CPU " + cpuId + ": " + t.getMessage());
             }
         }
+    }
+
+    static int ringSetupFlags() {
+        return Opcodes.IORING_SETUP_SINGLE_ISSUER
+            | Opcodes.IORING_SETUP_SUBMIT_ALL
+            | Opcodes.IORING_SETUP_DEFER_TASKRUN
+            | Opcodes.IORING_SETUP_TASKRUN_FLAG;
     }
 
     /** Runs one bounded reactor turn without draining any lane indefinitely. */

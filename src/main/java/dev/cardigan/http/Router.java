@@ -716,10 +716,40 @@ public class Router {
             PreparedInvocation target,
             Runnable requestMaterializer,
             AutoCloseable requestStorage) {
+        return prepareKnownMethod(
+            request,
+            target,
+            requestMaterializer,
+            requestStorage,
+            requestMethodCode(request));
+    }
+
+    /**
+     * Prepares a request whose caller has already established that it uses
+     * Cardigan's safe HTTP method.
+     */
+    public PreparedInvocation prepareSafe(
+            HttpRequest request,
+            PreparedInvocation target,
+            AutoCloseable requestStorage) {
+        return prepareKnownMethod(
+            request, target, null, requestStorage, 1);
+    }
+
+    private PreparedInvocation prepareKnownMethod(
+            HttpRequest request,
+            PreparedInvocation target,
+            Runnable requestMaterializer,
+            AutoCloseable requestStorage,
+            int methodCode) {
         target.beginPreparation();
         try {
             return prepareInternal(
-                request, target, requestMaterializer, requestStorage);
+                request,
+                target,
+                requestMaterializer,
+                requestStorage,
+                methodCode);
         } finally {
             if (requestStorage != null
                     && !target.ownsRequestStorage(requestStorage)) {
@@ -732,7 +762,8 @@ public class Router {
             HttpRequest request,
             PreparedInvocation target,
             Runnable requestMaterializer,
-            AutoCloseable requestStorage) {
+            AutoCloseable requestStorage,
+            int methodCode) {
         Utf8Slice path = request.path();
         if (path == null) {
             return target.setImmediate(Response.notFound(), false);
@@ -742,7 +773,6 @@ public class Router {
         long baseAddress = segment.address();
         long pathOffset = path.offset();
         long pathLength = path.length();
-        int methodCode = requestMethodCode(request);
 
         if (request.routeResolved()
             && request.resolvedSegmentCount() >= 0) {

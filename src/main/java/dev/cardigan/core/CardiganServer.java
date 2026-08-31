@@ -1098,8 +1098,15 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     );
                     session.control.http1 = exchangeSequencer;
                 }
-                if (!exchangeSequencer.hasSubmissionCapacity()) {
+                int reservation =
+                    exchangeSequencer.tryReserveSubmission();
+                if (reservation
+                        == Http1ExchangeSequencer.RESERVATION_FULL) {
                     return Http1CqeDriver.FALLBACK_SEQUENCER_CAPACITY;
+                }
+                if (reservation
+                        == Http1ExchangeSequencer.RESERVATION_FAILED) {
+                    return Http1CqeDriver.DONE;
                 }
 
                 AutoCloseable requestStorage = null;
@@ -1108,7 +1115,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     currentChunk = null;
                     currentBuf = null;
                 }
-                if (!exchangeSequencer.submit(
+                if (!exchangeSequencer.submitReservedSafe(
                         router,
                         request,
                         requestKeepAlive,

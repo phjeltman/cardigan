@@ -15,6 +15,9 @@ import java.util.concurrent.locks.LockSupport;
  * Applies HTTP/1 response ordering to otherwise independent exchanges.
  */
 final class Http1ExchangeSequencer implements Exchange.Completion {
+    static final int RESERVATION_FAILED = -1;
+    static final int RESERVATION_FULL = 0;
+    static final int RESERVATION_ACQUIRED = 1;
     private static final VarHandle IN_FLIGHT;
     private static final VarHandle FREE_TASK_COUNT;
     private static final VarHandle TASK_ACTIVE;
@@ -93,19 +96,68 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
             boolean requestKeepAlive,
             boolean requestKeepAliveHeader,
             AutoCloseable requestStorage) {
-        if (!awaitCapacity()) {
+        if (!awaitAndReserveCapacity()) {
             closeRequestStorage(requestStorage);
             return false;
         }
 
-        long id = nextSubmission++;
-        setInFlight(inFlight() + 1);
-        ExchangeTask task = acquireTask();
-        router.prepare(
+        return submitReserved(
+            router,
             request,
-            task.exchange.invocation(),
-            null,
-            requestStorage);
+            requestKeepAlive,
+            requestKeepAliveHeader,
+            requestStorage,
+            false);
+    }
+
+    int tryReserveSubmission() {
+        if (failed) {
+            return RESERVATION_FAILED;
+        }
+        int current = inFlight();
+        if (current >= maxInFlight) {
+            return RESERVATION_FULL;
+        }
+        setInFlight(current + 1);
+        return RESERVATION_ACQUIRED;
+    }
+
+    boolean submitReservedSafe(
+            Router router,
+            HttpRequest request,
+            boolean requestKeepAlive,
+            boolean requestKeepAliveHeader,
+            AutoCloseable requestStorage) {
+        return submitReserved(
+            router,
+            request,
+            requestKeepAlive,
+            requestKeepAliveHeader,
+            requestStorage,
+            true);
+    }
+
+    private boolean submitReserved(
+            Router router,
+            HttpRequest request,
+            boolean requestKeepAlive,
+            boolean requestKeepAliveHeader,
+            AutoCloseable requestStorage,
+            boolean safeMethodKnown) {
+        long id = nextSubmission++;
+        ExchangeTask task = acquireTask();
+        if (safeMethodKnown) {
+            router.prepareSafe(
+                request,
+                task.exchange.invocation(),
+                requestStorage);
+        } else {
+            router.prepare(
+                request,
+                task.exchange.invocation(),
+                null,
+                requestStorage);
+        }
         task.exchange.prepare(
             id, requestKeepAlive, requestKeepAliveHeader);
         task.setActive(true);
@@ -134,10 +186,6 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
 
     boolean hasInFlight() {
         return inFlight() != 0;
-    }
-
-    boolean hasSubmissionCapacity() {
-        return inFlight() < maxInFlight || failed;
     }
 
     long submissionCount() {
@@ -223,15 +271,21 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
         keepAliveHeader[index] = exchange.keepAliveHeader();
     }
 
-    private boolean awaitCapacity() {
-        if (inFlight() < maxInFlight || failed) {
-            return !failed;
+    private boolean awaitAndReserveCapacity() {
+        int currentInFlight = inFlight();
+        if (currentInFlight < maxInFlight && !failed) {
+            setInFlight(currentInFlight + 1);
+            return true;
+        }
+        if (failed) {
+            return false;
         }
 
         Thread current = Thread.currentThread();
         boolean interrupted = false;
         waiter = current;
-        while (inFlight() >= maxInFlight && !failed) {
+        while ((currentInFlight = inFlight()) >= maxInFlight
+                && !failed) {
             LockSupport.park(this);
             if (inFlight() >= maxInFlight && !failed && Thread.interrupted()) {
                 interrupted = true;
@@ -241,7 +295,11 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
         if (interrupted) {
             current.interrupt();
         }
-        return !failed;
+        if (failed) {
+            return false;
+        }
+        setInFlight(currentInFlight + 1);
+        return true;
     }
 
     private ExchangeTask acquireTask() {
