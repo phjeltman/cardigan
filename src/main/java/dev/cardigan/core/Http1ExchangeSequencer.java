@@ -15,6 +15,9 @@ import java.util.concurrent.locks.LockSupport;
  * Applies HTTP/1 response ordering to otherwise independent exchanges.
  */
 final class Http1ExchangeSequencer implements Exchange.Completion {
+    static final int RESERVATION_FAILED = -1;
+    static final int RESERVATION_FULL = 0;
+    static final int RESERVATION_ACQUIRED = 1;
     private static final VarHandle IN_FLIGHT;
     private static final VarHandle FREE_TASK_COUNT;
     private static final VarHandle TASK_ACTIVE;
@@ -32,15 +35,24 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
 
     @FunctionalInterface
     interface ResponseSender {
-        boolean send(Response response, boolean keepAlive);
+        boolean send(
+            Response response,
+            boolean keepAlive,
+            boolean keepAliveHeader);
     }
 
-    private final ExchangeExecutor executor;
+    @FunctionalInterface
+    interface TaskExecutor {
+        boolean submit(Runnable task);
+    }
+
+    private final TaskExecutor executor;
     private final ResponseSender responseSender;
     private final int maxInFlight;
     private final int mask;
     private final Response[] completedResponses;
     private final boolean[] keepAlive;
+    private final boolean[] keepAliveHeader;
     private final ExchangeTask[] freeTasks;
     private final ExchangeTask[] allTasks;
 
@@ -57,6 +69,11 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
 
     Http1ExchangeSequencer(ExchangeExecutor executor, int requestedMaxInFlight,
                            ResponseSender responseSender) {
+        this(executor::submit, requestedMaxInFlight, responseSender);
+    }
+
+    Http1ExchangeSequencer(TaskExecutor executor, int requestedMaxInFlight,
+                           ResponseSender responseSender) {
         this.executor = executor;
         this.responseSender = responseSender;
 
@@ -68,23 +85,85 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
         this.mask = capacity - 1;
         this.completedResponses = new Response[capacity];
         this.keepAlive = new boolean[capacity];
+        this.keepAliveHeader = new boolean[capacity];
         this.freeTasks = new ExchangeTask[capacity];
         this.allTasks = new ExchangeTask[capacity];
     }
 
-    boolean submit(Router router, HttpRequest request, boolean requestKeepAlive) {
-        if (!awaitCapacity()) {
+    boolean submit(
+            Router router,
+            HttpRequest request,
+            boolean requestKeepAlive,
+            boolean requestKeepAliveHeader,
+            AutoCloseable requestStorage) {
+        if (!awaitAndReserveCapacity()) {
+            closeRequestStorage(requestStorage);
             return false;
         }
 
+        return submitReserved(
+            router,
+            request,
+            requestKeepAlive,
+            requestKeepAliveHeader,
+            requestStorage,
+            false);
+    }
+
+    int tryReserveSubmission() {
+        if (failed) {
+            return RESERVATION_FAILED;
+        }
+        int current = inFlight();
+        if (current >= maxInFlight) {
+            return RESERVATION_FULL;
+        }
+        setInFlight(current + 1);
+        return RESERVATION_ACQUIRED;
+    }
+
+    boolean submitReservedSafe(
+            Router router,
+            HttpRequest request,
+            boolean requestKeepAlive,
+            boolean requestKeepAliveHeader,
+            AutoCloseable requestStorage) {
+        return submitReserved(
+            router,
+            request,
+            requestKeepAlive,
+            requestKeepAliveHeader,
+            requestStorage,
+            true);
+    }
+
+    private boolean submitReserved(
+            Router router,
+            HttpRequest request,
+            boolean requestKeepAlive,
+            boolean requestKeepAliveHeader,
+            AutoCloseable requestStorage,
+            boolean safeMethodKnown) {
         long id = nextSubmission++;
-        setInFlight(inFlight() + 1);
         ExchangeTask task = acquireTask();
-        router.prepare(request, task.exchange.invocation());
-        task.exchange.prepare(id, requestKeepAlive);
+        if (safeMethodKnown) {
+            router.prepareSafe(
+                request,
+                task.exchange.invocation(),
+                requestStorage);
+        } else {
+            router.prepare(
+                request,
+                task.exchange.invocation(),
+                null,
+                requestStorage);
+        }
+        task.exchange.prepare(
+            id, requestKeepAlive, requestKeepAliveHeader);
         task.setActive(true);
         if (!executor.submit(task)) {
             task.setActive(false);
+            task.exchange.invocation().discard();
             releaseTask(task);
             setInFlight(inFlight() - 1);
             failed = true;
@@ -94,8 +173,23 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
         return true;
     }
 
+    private static void closeRequestStorage(AutoCloseable storage) {
+        if (storage == null) {
+            return;
+        }
+        try {
+            storage.close();
+        } catch (Throwable ignored) {
+            // A failed submission must still retire the exchange cleanly.
+        }
+    }
+
     boolean hasInFlight() {
         return inFlight() != 0;
+    }
+
+    long submissionCount() {
+        return nextSubmission;
     }
 
     boolean isFailed() {
@@ -161,7 +255,8 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
                 nextResponse++;
                 if (sendCompleted(
                         response,
-                        responseKeepAlive(exchange.keepAlive()))) {
+                        responseKeepAlive(exchange.keepAlive()),
+                        exchange.keepAliveHeader())) {
                     drainCompletedResponses();
                 }
             } finally {
@@ -173,17 +268,24 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
         int index = (int) exchange.id() & mask;
         completedResponses[index] = response;
         keepAlive[index] = exchange.keepAlive();
+        keepAliveHeader[index] = exchange.keepAliveHeader();
     }
 
-    private boolean awaitCapacity() {
-        if (inFlight() < maxInFlight || failed) {
-            return !failed;
+    private boolean awaitAndReserveCapacity() {
+        int currentInFlight = inFlight();
+        if (currentInFlight < maxInFlight && !failed) {
+            setInFlight(currentInFlight + 1);
+            return true;
+        }
+        if (failed) {
+            return false;
         }
 
         Thread current = Thread.currentThread();
         boolean interrupted = false;
         waiter = current;
-        while (inFlight() >= maxInFlight && !failed) {
+        while ((currentInFlight = inFlight()) >= maxInFlight
+                && !failed) {
             LockSupport.park(this);
             if (inFlight() >= maxInFlight && !failed && Thread.interrupted()) {
                 interrupted = true;
@@ -193,7 +295,11 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
         if (interrupted) {
             current.interrupt();
         }
-        return !failed;
+        if (failed) {
+            return false;
+        }
+        setInFlight(currentInFlight + 1);
+        return true;
     }
 
     private ExchangeTask acquireTask() {
@@ -228,10 +334,14 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
             }
 
             boolean responseKeepAlive = keepAlive[index];
+            boolean responseKeepAliveHeader = keepAliveHeader[index];
             completedResponses[index] = null;
             nextResponse++;
 
-            if (!sendCompleted(response, responseKeepAlive(responseKeepAlive))) {
+            if (!sendCompleted(
+                    response,
+                    responseKeepAlive(responseKeepAlive),
+                    responseKeepAliveHeader)) {
                 break;
             }
         }
@@ -242,17 +352,25 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
             && !(draining && nextResponse == nextSubmission);
     }
 
-    private boolean sendCompleted(Response response, boolean responseKeepAlive) {
-        StreamingBody streamingBody = response.body()
-            instanceof StreamingBody body ? body : null;
+    private boolean sendCompleted(
+            Response response,
+            boolean responseKeepAlive,
+            boolean responseKeepAliveHeader) {
+        StreamingBody streamingBody = response.streamingBody();
         boolean sent;
         if (streamingBody == null) {
             // Only streaming bodies need cancellation publication.
-            sent = responseSender.send(response, responseKeepAlive);
+            sent = responseSender.send(
+                response,
+                responseKeepAlive,
+                responseKeepAlive && responseKeepAliveHeader);
         } else {
             activeResponseBody = streamingBody;
             try {
-                sent = responseSender.send(response, responseKeepAlive);
+                sent = responseSender.send(
+                    response,
+                    responseKeepAlive,
+                    responseKeepAlive && responseKeepAliveHeader);
             } finally {
                 activeResponseBody = null;
             }
@@ -297,8 +415,9 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
     }
 
     private static void closeResponseBody(Response response) {
-        if (response != null
-            && response.body() instanceof StreamingBody streamingBody) {
+        StreamingBody streamingBody = response == null
+            ? null : response.streamingBody();
+        if (streamingBody != null) {
             try {
                 streamingBody.close();
             } catch (Throwable ignored) {

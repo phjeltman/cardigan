@@ -7,7 +7,9 @@ import java.lang.foreign.MemorySegment;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import dev.cardigan.ffi.RawSegment;
 
 public class Router {
@@ -37,9 +39,286 @@ public class Router {
         }
     }
 
-    private final List<Route> routeList = new ArrayList<>();
-    private volatile Route[][] routesBySegCount = new Route[16][0];
-    private volatile FastPrefixRoute[] fastPrefixRoutes = new FastPrefixRoute[0];
+    private static final class FastPrefixTable {
+        private static final FastPrefixTable EMPTY =
+            new FastPrefixTable();
+
+        private final FastPrefixRoute[] routes;
+        private final int mask;
+        private final int prefixLengths;
+        private final FastPrefixRoute singleRoute;
+
+        private FastPrefixTable() {
+            routes = new FastPrefixRoute[0];
+            mask = 0;
+            prefixLengths = 0;
+            singleRoute = null;
+        }
+
+        private FastPrefixTable(List<FastPrefixRoute> source) {
+            int capacity = 2;
+            while (capacity < source.size() * 4) {
+                capacity <<= 1;
+            }
+            routes = new FastPrefixRoute[capacity];
+            mask = capacity - 1;
+            int lengths = 0;
+            int routeCount = 0;
+            FastPrefixRoute onlyRoute = null;
+            for (FastPrefixRoute route : source) {
+                int slot = prefixSlot(
+                    route.methodCode,
+                    route.prefixLen,
+                    route.prefixLong,
+                    mask);
+                FastPrefixRoute existing;
+                while ((existing = routes[slot]) != null) {
+                    if (samePrefix(existing, route)) {
+                        break;
+                    }
+                    slot = (slot + 1) & mask;
+                }
+                if (existing == null) {
+                    routes[slot] = route;
+                    lengths |= 1 << route.prefixLen;
+                    routeCount++;
+                    onlyRoute = route;
+                }
+            }
+            prefixLengths = lengths;
+            singleRoute = routeCount == 1 ? onlyRoute : null;
+        }
+
+        private FastPrefixRoute find(
+                int methodCode,
+                long baseAddress,
+                long pathOffset,
+                long pathLength,
+                boolean validateSegment) {
+            if (routes.length == 0 || pathLength < 8) {
+                return null;
+            }
+            long head = RawSegment.getLong(baseAddress, pathOffset);
+            FastPrefixRoute onlyRoute = singleRoute;
+            if (onlyRoute != null) {
+                return onlyRoute.methodCode == methodCode
+                    && pathLength > onlyRoute.prefixLen
+                    && (head & onlyRoute.prefixMask)
+                        == onlyRoute.prefixLong
+                    && (!validateSegment || !containsSlash(
+                        baseAddress,
+                        pathOffset + onlyRoute.prefixLen,
+                        pathLength - onlyRoute.prefixLen))
+                            ? onlyRoute : null;
+            }
+            int lengths = prefixLengths;
+            while (lengths != 0) {
+                int prefixLength = 31
+                    - Integer.numberOfLeadingZeros(lengths);
+                lengths &= ~(1 << prefixLength);
+                if (pathLength <= prefixLength) {
+                    continue;
+                }
+                long prefixMask = prefixLength == 8
+                    ? -1L : (1L << (prefixLength * 8)) - 1;
+                long prefix = head & prefixMask;
+                int slot = prefixSlot(
+                    methodCode, prefixLength, prefix, mask);
+                FastPrefixRoute candidate;
+                while ((candidate = routes[slot]) != null) {
+                    if (candidate.methodCode == methodCode
+                            && candidate.prefixLen == prefixLength
+                            && candidate.prefixLong == prefix) {
+                        return validateSegment && containsSlash(
+                            baseAddress,
+                            pathOffset + prefixLength,
+                            pathLength - prefixLength)
+                                ? null : candidate;
+                    }
+                    slot = (slot + 1) & mask;
+                }
+            }
+            return null;
+        }
+
+        private static boolean samePrefix(
+                FastPrefixRoute left, FastPrefixRoute right) {
+            return left.methodCode == right.methodCode
+                && left.prefixLen == right.prefixLen
+                && left.prefixLong == right.prefixLong;
+        }
+
+        private static int prefixSlot(
+                int methodCode,
+                int prefixLength,
+                long prefix,
+                int mask) {
+            long hash = prefix
+                ^ ((long) methodCode * 0x9e37_79b9_7f4a_7c15L)
+                ^ ((long) prefixLength * 0xc2b2_ae3d_27d4_eb4fL);
+            hash = (hash ^ (hash >>> 33))
+                * 0xff51_afd7_ed55_8ccdL;
+            hash = (hash ^ (hash >>> 33))
+                * 0xc4ce_b9fe_1a85_ec53L;
+            hash ^= hash >>> 33;
+            return (int) hash & mask;
+        }
+    }
+
+    private static final class MutableRouteNode {
+        private final Map<String, MutableRouteNode> staticChildren =
+            new HashMap<>();
+        private MutableRouteNode parameterChild;
+        private Route getRoute;
+        private Route postRoute;
+
+        private void add(Route route, int segmentIndex) {
+            if (segmentIndex == route.segmentCount) {
+                if (route.methodCode == 1) {
+                    if (getRoute == null) {
+                        getRoute = route;
+                    }
+                } else if (route.methodCode == 2 && postRoute == null) {
+                    postRoute = route;
+                }
+                return;
+            }
+
+            MutableRouteNode child;
+            if (route.isParam[segmentIndex]) {
+                child = parameterChild;
+                if (child == null) {
+                    child = new MutableRouteNode();
+                    parameterChild = child;
+                }
+            } else {
+                child = staticChildren.computeIfAbsent(
+                    route.segments[segmentIndex],
+                    ignored -> new MutableRouteNode());
+            }
+            child.add(route, segmentIndex + 1);
+        }
+    }
+
+    private static final class StaticRouteEdge {
+        private final byte[] segment;
+        private final int hash;
+        private final CompiledRouteNode child;
+
+        private StaticRouteEdge(
+                String segment, CompiledRouteNode child) {
+            this.segment = segment.getBytes(StandardCharsets.UTF_8);
+            this.hash = hashBytes(this.segment);
+            this.child = child;
+        }
+
+        private boolean matches(long baseAddress, long offset, int length) {
+            return segment.length == length
+                && matchSegmentBytes(
+                    baseAddress, offset, length, segment);
+        }
+    }
+
+    private static final class CompiledRouteNode {
+        private final StaticRouteEdge[] staticChildren;
+        private final int staticMask;
+        private final CompiledRouteNode parameterChild;
+        private final Route getRoute;
+        private final Route postRoute;
+
+        private CompiledRouteNode(MutableRouteNode source) {
+            int childCount = source.staticChildren.size();
+            if (childCount == 0) {
+                staticChildren = new StaticRouteEdge[0];
+                staticMask = 0;
+            } else {
+                int capacity = 2;
+                while (capacity < childCount * 2) {
+                    capacity <<= 1;
+                }
+                staticChildren = new StaticRouteEdge[capacity];
+                staticMask = capacity - 1;
+                for (Map.Entry<String, MutableRouteNode> entry
+                        : source.staticChildren.entrySet()) {
+                    StaticRouteEdge edge = new StaticRouteEdge(
+                        entry.getKey(),
+                        new CompiledRouteNode(entry.getValue()));
+                    int slot = spread(edge.hash) & staticMask;
+                    while (staticChildren[slot] != null) {
+                        slot = (slot + 1) & staticMask;
+                    }
+                    staticChildren[slot] = edge;
+                }
+            }
+            parameterChild = source.parameterChild == null
+                ? null : new CompiledRouteNode(source.parameterChild);
+            getRoute = source.getRoute;
+            postRoute = source.postRoute;
+        }
+
+        private Route find(
+                long baseAddress, long[] segments, int segmentCount,
+                int methodCode) {
+            return findFrom(
+                baseAddress, segments, segmentCount, methodCode, 0);
+        }
+
+        private Route findFrom(
+                long baseAddress, long[] segments, int segmentCount,
+                int methodCode, int segmentIndex) {
+            if (segmentIndex == segmentCount) {
+                return methodCode == 1
+                    ? getRoute
+                    : methodCode == 2 ? postRoute : null;
+            }
+
+            long packed = segments[segmentIndex];
+            long offset = packed >>> 32;
+            int length = (int) packed;
+            CompiledRouteNode staticChild = findStaticChild(
+                baseAddress, offset, length);
+            if (staticChild != null) {
+                Route route = staticChild.findFrom(
+                    baseAddress, segments, segmentCount,
+                    methodCode, segmentIndex + 1);
+                if (route != null) {
+                    return route;
+                }
+            }
+            return parameterChild == null
+                ? null
+                : parameterChild.findFrom(
+                    baseAddress, segments, segmentCount,
+                    methodCode, segmentIndex + 1);
+        }
+
+        private CompiledRouteNode findStaticChild(
+                long baseAddress, long offset, int length) {
+            if (staticChildren.length == 0) {
+                return null;
+            }
+            int hash = hashSegment(baseAddress, offset, length);
+            int slot = spread(hash) & staticMask;
+            StaticRouteEdge edge;
+            while ((edge = staticChildren[slot]) != null) {
+                if (edge.hash == hash
+                        && edge.matches(baseAddress, offset, length)) {
+                    return edge.child;
+                }
+                slot = (slot + 1) & staticMask;
+            }
+            return null;
+        }
+    }
+
+    private final MutableRouteNode mutableRouteRoot = new MutableRouteNode();
+    private volatile CompiledRouteNode compiledRouteRoot;
+    private volatile boolean routeTreeDirty = true;
+    private final List<FastPrefixRoute> mutableFastPrefixRoutes =
+        new ArrayList<>();
+    private volatile FastPrefixTable compiledFastPrefixRoutes =
+        FastPrefixTable.EMPTY;
+    private volatile boolean fastPrefixRoutesDirty;
 
     public synchronized void registerController(Object controller) {
         for (Method method : controller.getClass().getDeclaredMethods()) {
@@ -53,7 +332,7 @@ public class Router {
         }
     }
 
-    private void registerRoute(String httpMethod, String pattern, Method method, Object controller) {
+    private synchronized void registerRoute(String httpMethod, String pattern, Method method, Object controller) {
         String[] parts = pattern.split("/");
         List<String> list = new ArrayList<>();
         for (String p : parts) {
@@ -64,15 +343,11 @@ public class Router {
 
         String[] segments = list.toArray(new String[0]);
         boolean[] isParam = new boolean[segments.length];
-        String[] paramNames = new String[segments.length];
 
         for (int i = 0; i < segments.length; i++) {
             String s = segments[i];
             if (s.startsWith("{") && s.endsWith("}")) {
                 isParam[i] = true;
-                paramNames[i] = s.substring(1, s.length() - 1);
-            } else {
-                isParam[i] = false;
             }
         }
 
@@ -89,27 +364,26 @@ public class Router {
             }
         }
 
-        java.lang.invoke.MethodHandle mh = null;
-        RouteHandler handler = null;
+        java.lang.invoke.MethodHandle methodHandle = null;
         try {
             method.setAccessible(true);
-            mh = java.lang.invoke.MethodHandles.lookup().unreflect(method).bindTo(controller);
-            handler = compileLambda(method, controller);
-        } catch (Throwable t) {
-            t.printStackTrace();
+            methodHandle = java.lang.invoke.MethodHandles.lookup()
+                .unreflect(method).bindTo(controller);
+        } catch (Throwable ignored) {
+            // The reflective handler below remains available as a fallback.
         }
-
-        boolean isBodyRecord = false;
-        Class<? extends Record> bodyRecordClass = null;
-        for (Class<?> ptype : parameterTypes) {
-            if (Record.class.isAssignableFrom(ptype)) {
-                isBodyRecord = true;
-                bodyRecordClass = (Class<? extends Record>) ptype;
-                break;
-            }
-        }
-
-        Route newRoute = new Route(httpMethod, pattern, segments, isParam, paramNames, method, mh, handler, controller, parameterTypes, paramIndexMap, isBodyRecord, bodyRecordClass);
+        RouteHandler handler = compileLambda(method, controller);
+        Route newRoute = new Route(
+            httpMethod,
+            pattern,
+            segments,
+            isParam,
+            method,
+            methodHandle,
+            handler,
+            controller,
+            parameterTypes,
+            paramIndexMap);
         if (newRoute.isStreamingBody && newRoute.methodCode == 1) {
             throw new IllegalArgumentException(
                 "Request-body streaming is only supported on unsafe routes: "
@@ -122,89 +396,159 @@ public class Router {
                 "@DecodedBody requires an unsafe route without path "
                     + "parameters: " + method);
         }
-        routeList.add(newRoute);
+        mutableRouteRoot.add(newRoute, 0);
+        routeTreeDirty = true;
+        if (!mutableFastPrefixRoutes.isEmpty()) {
+            fastPrefixRoutesDirty = true;
+        }
 
-        if (paramCount == 1 && isParam[segments.length - 1]) {
+        if (paramCount == 1 && isParam[segments.length - 1]
+                && !newRoute.bindsArguments) {
             int braceIdx = pattern.indexOf('{');
             if (braceIdx > 0 && braceIdx <= 8) {
                 String prefix = pattern.substring(0, braceIdx);
-                int mCode = "GET".equalsIgnoreCase(httpMethod) ? 1 : ("POST".equalsIgnoreCase(httpMethod) ? 2 : 0);
-                FastPrefixRoute fpr = new FastPrefixRoute(mCode, prefix, newRoute);
-                List<FastPrefixRoute> fprList = new ArrayList<>(List.of(fastPrefixRoutes));
-                fprList.add(fpr);
-                this.fastPrefixRoutes = fprList.toArray(new FastPrefixRoute[0]);
+                FastPrefixRoute fpr = new FastPrefixRoute(
+                    newRoute.methodCode, prefix, newRoute);
+                mutableFastPrefixRoutes.add(fpr);
+                fastPrefixRoutesDirty = true;
             }
         }
 
-        // Rebuild segCount table
-        int maxSeg = 0;
-        for (Route r : routeList) {
-            if (r.segmentCount > maxSeg) maxSeg = r.segmentCount;
-        }
-        Route[][] newTable = new Route[maxSeg + 1][];
-        for (int sc = 0; sc <= maxSeg; sc++) {
-            List<Route> matched = new ArrayList<>();
-            for (Route r : routeList) {
-                if (r.segmentCount == sc) {
-                    matched.add(r);
-                }
-            }
-            newTable[sc] = matched.toArray(new Route[0]);
-        }
-        this.routesBySegCount = newTable;
         System.out.println("Registered Route: [" + httpMethod + "] " + pattern + " -> " + method.getDeclaringClass().getSimpleName() + "." + method.getName());
+    }
+
+    private CompiledRouteNode compiledRoutes() {
+        CompiledRouteNode routes = compiledRouteRoot;
+        if (!routeTreeDirty && routes != null) {
+            return routes;
+        }
+        synchronized (this) {
+            if (routeTreeDirty || compiledRouteRoot == null) {
+                compiledRouteRoot = new CompiledRouteNode(mutableRouteRoot);
+                routeTreeDirty = false;
+            }
+            return compiledRouteRoot;
+        }
+    }
+
+    private FastPrefixTable compiledFastPrefixes() {
+        FastPrefixTable routes = compiledFastPrefixRoutes;
+        if (!fastPrefixRoutesDirty) {
+            return routes;
+        }
+        synchronized (this) {
+            if (fastPrefixRoutesDirty) {
+                List<FastPrefixRoute> eligible = new ArrayList<>(
+                    mutableFastPrefixRoutes.size());
+                for (FastPrefixRoute route : mutableFastPrefixRoutes) {
+                    if (!hasStaticSibling(route.route)) {
+                        eligible.add(route);
+                    }
+                }
+                compiledFastPrefixRoutes = eligible.isEmpty()
+                    ? FastPrefixTable.EMPTY
+                    : new FastPrefixTable(eligible);
+                fastPrefixRoutesDirty = false;
+            }
+            return compiledFastPrefixRoutes;
+        }
+    }
+
+    private boolean hasStaticSibling(Route route) {
+        MutableRouteNode node = mutableRouteRoot;
+        for (int segment = 0; segment + 1 < route.segmentCount;
+                segment++) {
+            node = node.staticChildren.get(route.segments[segment]);
+            if (node == null) {
+                return true;
+            }
+        }
+        return !node.staticChildren.isEmpty();
+    }
+
+    private FastPrefixRoute findFastPrefix(
+            int methodCode,
+            long baseAddress,
+            long pathOffset,
+            long pathLength,
+            boolean validateSegment) {
+        return compiledFastPrefixes().find(
+            methodCode,
+            baseAddress,
+            pathOffset,
+            pathLength,
+            validateSegment);
+    }
+
+    private static int hashBytes(byte[] bytes) {
+        int hash = 0x811c9dc5;
+        for (byte value : bytes) {
+            hash = (hash ^ (value & 0xff)) * 0x01000193;
+        }
+        return hash;
+    }
+
+    private static int hashSegment(
+            long baseAddress, long offset, int length) {
+        int hash = 0x811c9dc5;
+        for (int index = 0; index < length; index++) {
+            hash = (hash ^ (RawSegment.getByte(
+                baseAddress, offset + index) & 0xff)) * 0x01000193;
+        }
+        return hash;
+    }
+
+    private static int spread(int hash) {
+        return hash ^ (hash >>> 16);
     }
 
     private RouteHandler compileLambda(Method method, Object controller) {
         try {
-            java.lang.invoke.MethodHandles.Lookup lookup = java.lang.invoke.MethodHandles.lookup();
             method.setAccessible(true);
-            java.lang.invoke.MethodHandle mh = lookup.unreflect(method);
+            java.lang.invoke.MethodHandle methodHandle =
+                java.lang.invoke.MethodHandles.lookup().unreflect(method);
             boolean isIsolated = method.isAnnotationPresent(Isolated.class);
-
             Class<?>[] ptypes = method.getParameterTypes();
+            int type;
             if (ptypes.length == 1 && (ptypes[0] == long.class || ptypes[0] == int.class)) {
-                int type = ptypes[0] == int.class ? FastRouteHandler.TYPE_INT_PARAM : FastRouteHandler.TYPE_LONG_PARAM;
-                return isIsolated ? new IsolatedRouteHandler(controller, mh, type) : new FastRouteHandler(controller, mh, type);
+                type = ptypes[0] == int.class
+                    ? FastRouteHandler.TYPE_INT_PARAM
+                    : FastRouteHandler.TYPE_LONG_PARAM;
             } else if (ptypes.length == 1 && Record.class.isAssignableFrom(ptypes[0])) {
-                int type = FastRouteHandler.TYPE_RECORD_PARAM;
-                return isIsolated ? new IsolatedRouteHandler(controller, mh, type) : new FastRouteHandler(controller, mh, type);
+                type = FastRouteHandler.TYPE_RECORD_PARAM;
             } else if (ptypes.length == 1 && ptypes[0] == HttpRequest.class) {
-                int type = FastRouteHandler.TYPE_REQUEST_PARAM;
-                return isIsolated ? new IsolatedRouteHandler(controller, mh, type) : new FastRouteHandler(controller, mh, type);
+                type = FastRouteHandler.TYPE_REQUEST_PARAM;
             } else if (ptypes.length == 1 && ptypes[0] == dev.cardigan.simdjson.ondemand.Value.class) {
-                int type = FastRouteHandler.TYPE_VALUE_PARAM;
-                return isIsolated ? new IsolatedRouteHandler(controller, mh, type) : new FastRouteHandler(controller, mh, type);
+                type = FastRouteHandler.TYPE_VALUE_PARAM;
             } else if (ptypes.length == 1 && ptypes[0] == RequestBody.class) {
-                int type = FastRouteHandler.TYPE_STREAMING_BODY_PARAM;
-                return isIsolated ? new IsolatedRouteHandler(controller, mh, type) : new FastRouteHandler(controller, mh, type);
+                type = FastRouteHandler.TYPE_STREAMING_BODY_PARAM;
             } else if (ptypes.length == 2
                     && ptypes[0] == HttpRequest.class
                     && ptypes[1] == RequestBody.class) {
-                int type = FastRouteHandler.TYPE_REQUEST_STREAMING_BODY_PARAM;
-                return isIsolated ? new IsolatedRouteHandler(controller, mh, type) : new FastRouteHandler(controller, mh, type);
+                type = FastRouteHandler.TYPE_REQUEST_STREAMING_BODY_PARAM;
             } else if (ptypes.length == 2
                     && (ptypes[0] == long.class || ptypes[0] == int.class)
                     && ptypes[1] == HttpRequest.class) {
-                int type = ptypes[0] == int.class
+                type = ptypes[0] == int.class
                     ? FastRouteHandler.TYPE_INT_REQUEST_PARAM
                     : FastRouteHandler.TYPE_LONG_REQUEST_PARAM;
-                return isIsolated ? new IsolatedRouteHandler(controller, mh, type) : new FastRouteHandler(controller, mh, type);
             } else if (ptypes.length == 2
                     && ptypes[0] == int.class && ptypes[1] == int.class
                     && hasQueryParameter(method)) {
-                int type = FastRouteHandler.TYPE_TWO_INT_PARAMS;
-                return isIsolated ? new IsolatedRouteHandler(controller, mh, type) : new FastRouteHandler(controller, mh, type);
+                type = FastRouteHandler.TYPE_TWO_INT_PARAMS;
             } else if (ptypes.length == 3
                     && ptypes[0] == int.class && ptypes[1] == int.class
                     && ptypes[2] == RequestBody.class
                     && hasQueryParameter(method)) {
-                int type = FastRouteHandler.TYPE_TWO_INT_STREAMING_BODY_PARAMS;
-                return isIsolated ? new IsolatedRouteHandler(controller, mh, type) : new FastRouteHandler(controller, mh, type);
+                type = FastRouteHandler.TYPE_TWO_INT_STREAMING_BODY_PARAMS;
             } else if (ptypes.length == 0) {
-                int type = FastRouteHandler.TYPE_NO_ARG;
-                return isIsolated ? new IsolatedRouteHandler(controller, mh, type) : new FastRouteHandler(controller, mh, type);
+                type = FastRouteHandler.TYPE_NO_ARG;
+            } else {
+                type = FastRouteHandler.TYPE_BOUND_ARGUMENTS;
             }
+            return isIsolated
+                ? new IsolatedRouteHandler(controller, methodHandle, type)
+                : new FastRouteHandler(controller, methodHandle, type);
         } catch (Throwable t) {
             return (req, pathLong, bodyObj) -> {
                 method.setAccessible(true);
@@ -253,7 +597,6 @@ public class Router {
                 return Response.error("Unsupported endpoint signature");
             };
         }
-        return null;
     }
 
     private static boolean hasQueryParameter(Method method) {
@@ -282,87 +625,19 @@ public class Router {
         long pathOffset = pathSlice.offset();
         long pathLen = pathSlice.length();
 
-        long methodOffset = request.picoRequest().methodOffset;
-        long methodLen = request.picoRequest().methodLen;
-        int reqMethodCode = request.picoRequest().methodCode;
-        if (reqMethodCode == 0 && methodOffset >= 0
-            && methodLen == 3
-            && (RawSegment.getInt(baseAddr, methodOffset) & 0x00ffffff)
-                == 0x00544547) {
-            reqMethodCode = 1; // GET
-        } else if (reqMethodCode == 0 && methodOffset >= 0
-            && methodLen == 4
-            && RawSegment.getInt(baseAddr, methodOffset) == 0x54534f50) {
-            reqMethodCode = 2; // POST
-        }
+        int reqMethodCode = requestMethodCode(request);
 
-        FastPrefixRoute[] fprs = this.fastPrefixRoutes;
-        int fprCount = fprs.length;
-        if (fprCount > 0 && pathLen >= 8) {
-            long headWord = RawSegment.getLong(baseAddr, pathOffset);
-            for (int i = 0; i < fprCount; i++) {
-                FastPrefixRoute fpr = fprs[i];
-                if (reqMethodCode == fpr.methodCode && pathLen > fpr.prefixLen) {
-                    if ((headWord & fpr.prefixMask) == fpr.prefixLong) {
-                        return request.cacheRoute(fpr.route, -1);
-                    }
-                }
-            }
+        FastPrefixRoute prefixRoute = findFastPrefix(
+            reqMethodCode, baseAddr, pathOffset, pathLen, true);
+        if (prefixRoute != null) {
+            return request.cacheRoute(prefixRoute.route, -1);
         }
 
         long[] segPacked = request.segPacked();
         int segCount = splitPath(baseAddr, pathOffset, pathLen, segPacked);
-
-        Route[][] table = this.routesBySegCount;
-        if (segCount >= table.length) {
-            return request.cacheRoute(null, segCount);
-        }
-        Route[] rList = table[segCount];
-        if (rList == null) {
-            return request.cacheRoute(null, segCount);
-        }
-        int rCount = rList.length;
-
-        for (int r = 0; r < rCount; r++) {
-            Route route = rList[r];
-            if (route.methodCode != reqMethodCode) {
-                if (reqMethodCode != 0 || methodOffset < 0
-                    || !request.method()
-                        .equalsIgnoreCaseString(route.httpMethod)) {
-                    continue;
-                }
-            }
-
-            boolean match = true;
-            for (int i = 0; i < segCount; i++) {
-                if (route.isParam[i]) continue;
-                long seg = segPacked[i];
-                long len = seg & 0xFFFFFFFFL;
-                if (len != route.segmentLengths[i]) {
-                    match = false;
-                    break;
-                }
-                long offset = seg >>> 32;
-                if (len <= 8) {
-                    long inputWord = RawSegment.getLong(baseAddr, offset) & route.segmentMasks[i];
-                    if (inputWord != route.segmentLongs[i]) {
-                        match = false;
-                        break;
-                    }
-                } else {
-                    if (!matchSegmentBytes(baseAddr, offset, len, route.segmentBytes[i])) {
-                        match = false;
-                        break;
-                    }
-                }
-            }
-
-            if (match) {
-                return request.cacheRoute(route, segCount);
-            }
-        }
-
-        return request.cacheRoute(null, segCount);
+        Route route = compiledRoutes().find(
+            baseAddr, segPacked, segCount, reqMethodCode);
+        return request.cacheRoute(route, segCount);
     }
 
     public boolean isIsolatedRoute(HttpRequest request) {
@@ -392,15 +667,30 @@ public class Router {
             : BODY_STREAMING;
     }
 
-    public boolean isSafeMethod(HttpRequest request) {
-        if (request.picoRequest().methodCode != 0) {
-            return request.picoRequest().methodCode == 1;
+    private static int requestMethodCode(HttpRequest request) {
+        int methodCode = request.picoRequest().methodCode;
+        if (methodCode != 0) {
+            return methodCode;
+        }
+        long methodOffset = request.picoRequest().methodOffset;
+        if (methodOffset < 0) {
+            return 0;
         }
         long methodLength = request.picoRequest().methodLen;
-        return request.picoRequest().methodOffset >= 0
-            && methodLength == 3
-            && (RawSegment.getInt(request.address(), request.picoRequest().methodOffset) & 0x00ff_ffff)
-            == 0x0054_4547;
+        if (methodLength == 3
+                && (RawSegment.getInt(
+                    request.address(), methodOffset) & 0x00ff_ffff)
+                    == 0x0054_4547) {
+            return 1;
+        }
+        return methodLength == 4
+                && RawSegment.getInt(request.address(), methodOffset)
+                    == 0x5453_4f50
+            ? 2 : 0;
+    }
+
+    public boolean isSafeMethod(HttpRequest request) {
+        return requestMethodCode(request) == 1;
     }
 
     public PreparedInvocation prepare(HttpRequest request) {
@@ -413,6 +703,67 @@ public class Router {
 
     public PreparedInvocation prepare(HttpRequest request, PreparedInvocation target,
                                       Runnable requestMaterializer) {
+        return prepare(request, target, requestMaterializer, null);
+    }
+
+    /**
+     * Prepares a request while optionally transferring ownership of the
+     * request's backing storage. Storage not needed by the matched route is
+     * closed before this method returns.
+     */
+    public PreparedInvocation prepare(
+            HttpRequest request,
+            PreparedInvocation target,
+            Runnable requestMaterializer,
+            AutoCloseable requestStorage) {
+        return prepareKnownMethod(
+            request,
+            target,
+            requestMaterializer,
+            requestStorage,
+            requestMethodCode(request));
+    }
+
+    /**
+     * Prepares a request whose caller has already established that it uses
+     * Cardigan's safe HTTP method.
+     */
+    public PreparedInvocation prepareSafe(
+            HttpRequest request,
+            PreparedInvocation target,
+            AutoCloseable requestStorage) {
+        return prepareKnownMethod(
+            request, target, null, requestStorage, 1);
+    }
+
+    private PreparedInvocation prepareKnownMethod(
+            HttpRequest request,
+            PreparedInvocation target,
+            Runnable requestMaterializer,
+            AutoCloseable requestStorage,
+            int methodCode) {
+        target.beginPreparation();
+        try {
+            return prepareInternal(
+                request,
+                target,
+                requestMaterializer,
+                requestStorage,
+                methodCode);
+        } finally {
+            if (requestStorage != null
+                    && !target.ownsRequestStorage(requestStorage)) {
+                closeRequestStorage(requestStorage);
+            }
+        }
+    }
+
+    private PreparedInvocation prepareInternal(
+            HttpRequest request,
+            PreparedInvocation target,
+            Runnable requestMaterializer,
+            AutoCloseable requestStorage,
+            int methodCode) {
         Utf8Slice path = request.path();
         if (path == null) {
             return target.setImmediate(Response.notFound(), false);
@@ -422,19 +773,6 @@ public class Router {
         long baseAddress = segment.address();
         long pathOffset = path.offset();
         long pathLength = path.length();
-        long methodOffset = request.picoRequest().methodOffset;
-        long methodLength = request.picoRequest().methodLen;
-        int methodCode = request.picoRequest().methodCode;
-        if (methodCode == 0 && methodOffset >= 0
-            && methodLength == 3
-            && (RawSegment.getInt(baseAddress, methodOffset) & 0x00ff_ffff)
-                == 0x0054_4547) {
-            methodCode = 1;
-        } else if (methodCode == 0 && methodOffset >= 0
-            && methodLength == 4
-            && RawSegment.getInt(baseAddress, methodOffset) == 0x5453_4f50) {
-            methodCode = 2;
-        }
 
         if (request.routeResolved()
             && request.resolvedSegmentCount() >= 0) {
@@ -448,26 +786,24 @@ public class Router {
                 request,
                 target,
                 requestMaterializer,
+                requestStorage,
                 request.resolvedSegmentCount()
             );
         }
 
-        FastPrefixRoute[] prefixRoutes = fastPrefixRoutes;
-        if (pathLength >= 8 && prefixRoutes.length != 0) {
-            long headWord = RawSegment.getLong(baseAddress, pathOffset);
-            for (FastPrefixRoute prefixRoute : prefixRoutes) {
-                if (methodCode == prefixRoute.methodCode && pathLength > prefixRoute.prefixLen
-                    && (headWord & prefixRoute.prefixMask) == prefixRoute.prefixLong) {
-                    long parameterLength = pathLength - prefixRoute.prefixLen;
-                    long pathLong = parseLongFast(
-                        baseAddress,
-                        pathOffset + prefixRoute.prefixLen,
-                        parameterLength
-                    );
-                    return prepareMatchedRoute(
-                        prefixRoute.route, request, pathLong, target,
-                        requestMaterializer);
-                }
+        FastPrefixRoute prefixRoute = findFastPrefix(
+            methodCode, baseAddress, pathOffset, pathLength, false);
+        if (prefixRoute != null) {
+            long parameterLength = pathLength - prefixRoute.prefixLen;
+            long pathLong = parseFastPrefixLong(
+                baseAddress,
+                pathOffset + prefixRoute.prefixLen,
+                parameterLength
+            );
+            if (pathLong != Long.MIN_VALUE) {
+                return prepareMatchedRoute(
+                    prefixRoute.route, request, pathLong, target,
+                    requestMaterializer, requestStorage);
             }
         }
 
@@ -481,6 +817,7 @@ public class Router {
             request,
             target,
             requestMaterializer,
+            requestStorage,
             request.resolvedSegmentCount()
         );
     }
@@ -490,6 +827,7 @@ public class Router {
         HttpRequest request,
         PreparedInvocation target,
         Runnable requestMaterializer,
+        AutoCloseable requestStorage,
         int segmentCount
     ) {
         try {
@@ -508,7 +846,8 @@ public class Router {
                 }
             }
             return prepareMatchedRoute(
-                route, request, pathLong, target, requestMaterializer);
+                route, request, pathLong, target,
+                requestMaterializer, requestStorage);
         } catch (Throwable t) {
             return target.setImmediate(
                 Response.error("Internal Server Error: " + t.getMessage()),
@@ -519,12 +858,16 @@ public class Router {
 
     private PreparedInvocation prepareMatchedRoute(Route route, HttpRequest request, long pathLong,
                                                     PreparedInvocation target,
-                                                    Runnable requestMaterializer) {
+                                                    Runnable requestMaterializer,
+                                                    AutoCloseable requestStorage) {
         boolean safe = route.methodCode == 1;
         try {
             if (route.handler == null) {
                 materializeRequest(requestMaterializer);
-                return target.setFallback(this, detachRequest(request), safe);
+                return target.setFallback(
+                    this,
+                    target.storeRequest(request, requestStorage, false),
+                    safe);
             }
 
             if (route.longBodyDecoder != null) {
@@ -553,7 +896,14 @@ public class Router {
             HttpRequest handlerRequest = null;
             if (route.requiresRequestStorage) {
                 materializeRequest(requestMaterializer);
-                handlerRequest = detachRequest(request);
+                handlerRequest = target.storeRequest(
+                    request, requestStorage, route.isIsolated);
+            }
+            if (route.bindsArguments) {
+                HttpRequest bindingRequest = handlerRequest == null
+                    ? request : handlerRequest;
+                bodyRecord = bindRouteArguments(
+                    route, bindingRequest, pathLong, bodyRecord, target);
             }
             return target.setHandler(route.handler, handlerRequest, pathLong, bodyRecord, safe);
         } catch (Throwable t) {
@@ -570,8 +920,12 @@ public class Router {
         }
     }
 
-    private static HttpRequest detachRequest(HttpRequest request) {
-        return request.detachedCopy();
+    private static void closeRequestStorage(AutoCloseable storage) {
+        try {
+            storage.close();
+        } catch (Throwable ignored) {
+            // Request preparation has already produced its result.
+        }
     }
 
     public Response dispatch(HttpRequest request) {
@@ -585,19 +939,7 @@ public class Router {
         long pathOffset = pathSlice.offset();
         long pathLen = pathSlice.length();
 
-        long methodOffset = request.picoRequest().methodOffset;
-        long methodLen = request.picoRequest().methodLen;
-        int reqMethodCode = request.picoRequest().methodCode;
-        if (reqMethodCode == 0 && methodOffset >= 0
-            && methodLen == 3
-            && (RawSegment.getInt(baseAddr, methodOffset) & 0x00ffffff)
-                == 0x00544547) {
-            reqMethodCode = 1; // GET
-        } else if (reqMethodCode == 0 && methodOffset >= 0
-            && methodLen == 4
-            && RawSegment.getInt(baseAddr, methodOffset) == 0x54534f50) {
-            reqMethodCode = 2; // POST
-        }
+        int reqMethodCode = requestMethodCode(request);
 
         if (request.routeResolved()
             && request.resolvedSegmentCount() >= 0) {
@@ -613,88 +955,38 @@ public class Router {
                 );
         }
 
-        FastPrefixRoute[] fprs = this.fastPrefixRoutes;
-        int fprCount = fprs.length;
-        if (fprCount > 0 && pathLen >= 8) {
-            long headWord = RawSegment.getLong(baseAddr, pathOffset);
-            for (int i = 0; i < fprCount; i++) {
-                FastPrefixRoute fpr = fprs[i];
-                if (reqMethodCode == fpr.methodCode && pathLen > fpr.prefixLen) {
-                    if ((headWord & fpr.prefixMask) == fpr.prefixLong) {
-                        long paramLen = pathLen - fpr.prefixLen;
-                        long id = parseLongFast(baseAddr, pathOffset + fpr.prefixLen, paramLen);
-                        try {
-                            if (fpr.route.handler != null) {
-                                Object body = fpr.route.isStreamingBody
-                                    ? request.bodyStream()
-                                    : null;
-                                long arguments = bindPackedIntArguments(
-                                    fpr.route, request, id);
-                                return fpr.route.handler.handle(
-                                    request, arguments, body);
-                            }
-                        } catch (Throwable t) {
-                            return Response.error("Internal Server Error: " + t.getMessage());
-                        }
+        FastPrefixRoute prefixRoute = findFastPrefix(
+            reqMethodCode, baseAddr, pathOffset, pathLen, false);
+        if (prefixRoute != null) {
+            long paramLen = pathLen - prefixRoute.prefixLen;
+            long id = parseFastPrefixLong(
+                baseAddr, pathOffset + prefixRoute.prefixLen, paramLen);
+            if (id != Long.MIN_VALUE) {
+                try {
+                    if (prefixRoute.route.handler != null) {
+                        Object body = prefixRoute.route.isStreamingBody
+                            ? request.bodyStream()
+                            : null;
+                        long arguments = bindPackedIntArguments(
+                            prefixRoute.route, request, id);
+                        return prefixRoute.route.handler.handle(
+                            request, arguments, body);
                     }
+                } catch (Throwable t) {
+                    return Response.error(
+                        "Internal Server Error: " + t.getMessage());
                 }
             }
         }
 
         long[] segPacked = request.segPacked();
         int segCount = splitPath(baseAddr, pathOffset, pathLen, segPacked);
-
-        Route[][] table = this.routesBySegCount;
-        if (segCount >= table.length) {
-            return Response.notFound();
-        }
-        Route[] rList = table[segCount];
-        if (rList == null) {
-            return Response.notFound();
-        }
-        int rCount = rList.length;
-
-        for (int r = 0; r < rCount; r++) {
-            Route route = rList[r];
-            if (route.methodCode != reqMethodCode) {
-                if (reqMethodCode != 0 || methodOffset < 0
-                    || !request.method()
-                        .equalsIgnoreCaseString(route.httpMethod)) {
-                    continue;
-                }
-            }
-
-            boolean match = true;
-            for (int i = 0; i < segCount; i++) {
-                if (route.isParam[i]) continue;
-                long seg = segPacked[i];
-                long len = seg & 0xFFFFFFFFL;
-                if (len != route.segmentLengths[i]) {
-                    match = false;
-                    break;
-                }
-                long offset = seg >>> 32;
-                if (len <= 8) {
-                    long inputWord = RawSegment.getLong(baseAddr, offset) & route.segmentMasks[i];
-                    if (inputWord != route.segmentLongs[i]) {
-                        match = false;
-                        break;
-                    }
-                } else {
-                    if (!matchSegmentBytes(baseAddr, offset, len, route.segmentBytes[i])) {
-                        match = false;
-                        break;
-                    }
-                }
-            }
-
-            if (match) {
-                return invokeMatchedRoute(
-                    route, request, segment, baseAddr, segCount);
-            }
-        }
-
-        return Response.notFound();
+        Route route = compiledRoutes().find(
+            baseAddr, segPacked, segCount, reqMethodCode);
+        return route == null
+            ? Response.notFound()
+            : invokeMatchedRoute(
+                route, request, segment, baseAddr, segCount);
     }
 
     private Response invokeMatchedRoute(
@@ -740,6 +1032,10 @@ public class Router {
                             route.bodyRecordMetadata);
                     }
                 }
+                if (route.bindsArguments) {
+                    bodyRecord = bindRouteArguments(
+                        route, request, pathLong, bodyRecord, null);
+                }
                 return route.handler.handle(
                     request, pathLong, bodyRecord);
             }
@@ -783,6 +1079,79 @@ public class Router {
         }
         return (first & 0xffff_ffffL)
             | ((long) second << 32);
+    }
+
+    private static Object[] bindRouteArguments(
+            Route route,
+            HttpRequest request,
+            long decodedLong,
+            Object decodedBody,
+            PreparedInvocation target) {
+        int argumentCount = route.parameterTypes.length;
+        Object[] arguments = target == null
+            ? new Object[argumentCount]
+            : target.arguments(argumentCount, route.isIsolated);
+        long baseAddress = request.address();
+        long[] segments = request.segPacked();
+
+        for (int argument = 0; argument < argumentCount; argument++) {
+            int binding = route.argumentBindings[argument];
+            if (binding >= Route.ARGUMENT_PATH_LONG
+                    && binding <= Route.ARGUMENT_PATH_STRING
+                    && route.argumentPathSegments[argument] < 0) {
+                arguments[argument] = null;
+                continue;
+            }
+            switch (binding) {
+                case Route.ARGUMENT_PATH_LONG -> {
+                    long packed = pathSegment(
+                        route, segments, argument);
+                    arguments[argument] = parseLongFast(
+                        baseAddress,
+                        packed >>> 32,
+                        packed & 0xffff_ffffL);
+                }
+                case Route.ARGUMENT_PATH_INT -> {
+                    long packed = pathSegment(
+                        route, segments, argument);
+                    arguments[argument] = (int) parseLongFast(
+                        baseAddress,
+                        packed >>> 32,
+                        packed & 0xffff_ffffL);
+                }
+                case Route.ARGUMENT_PATH_STRING -> {
+                    long packed = pathSegment(
+                        route, segments, argument);
+                    byte[] bytes = request.segment().asSlice(
+                        packed >>> 32,
+                        packed & 0xffff_ffffL
+                    ).toArray(java.lang.foreign.ValueLayout.JAVA_BYTE);
+                    arguments[argument] = new String(
+                        bytes, StandardCharsets.UTF_8);
+                }
+                case Route.ARGUMENT_REQUEST ->
+                    arguments[argument] = request;
+                case Route.ARGUMENT_VALUE ->
+                    arguments[argument] = request.bodyJson();
+                case Route.ARGUMENT_BODY_STREAM,
+                     Route.ARGUMENT_BODY_RECORD ->
+                    arguments[argument] = decodedBody;
+                case Route.ARGUMENT_QUERY_INT ->
+                    arguments[argument] = request.queryInt(
+                        route.queryParameterNames[argument],
+                        route.queryParameterDefaults[argument]);
+                case Route.ARGUMENT_DECODED_LONG ->
+                    arguments[argument] = decodedLong;
+                default -> arguments[argument] = null;
+            }
+        }
+        return arguments;
+    }
+
+    private static long pathSegment(
+            Route route, long[] segments, int argument) {
+        int segmentIndex = route.argumentPathSegments[argument];
+        return segmentIndex < 0 ? 0 : segments[segmentIndex];
     }
 
     public Response dispatch(String httpMethod, HttpRequest request) {
@@ -851,38 +1220,6 @@ public class Router {
     }
 
     private static int splitPath(long baseAddr, long offset, long length, long[] segPacked) {
-        if (length <= 16) {
-            long idx = offset;
-            long end = offset + length;
-            if (idx < end && RawSegment.getByte(baseAddr, idx) == '/') idx++;
-            long segStart = idx;
-
-            long word0 = RawSegment.getLong(baseAddr, idx);
-            long diff0 = word0 ^ 0x2f2f2f2f2f2f2f2fL;
-            long mask0 = (diff0 - 0x0101010101010101L) & ~diff0 & 0x8080808080808080L;
-
-            int count = 0;
-            while (mask0 != 0) {
-                int pos = Long.numberOfTrailingZeros(mask0) >>> 3;
-                long segEnd = idx + pos;
-                if (segEnd >= end) break;
-                long segLen = segEnd - segStart;
-                if (segLen > 0) {
-                    segPacked[count++] = (segStart << 32) | segLen;
-                }
-                segStart = segEnd + 1;
-                mask0 &= (mask0 - 1);
-            }
-
-            if (end > segStart) {
-                long segLen = end - segStart;
-                if (segLen > 0) {
-                    segPacked[count++] = (segStart << 32) | segLen;
-                }
-            }
-            return count;
-        }
-
         long idx = offset;
         long end = offset + length;
         if (idx < end && RawSegment.getByte(baseAddr, idx) == '/') idx++;
@@ -894,19 +1231,19 @@ public class Router {
             long word = RawSegment.getLong(baseAddr, idx);
             long diff = word ^ 0x2f2f2f2f2f2f2f2fL;
             long matchMask = (diff - 0x0101010101010101L) & ~diff & 0x8080808080808080L;
-            if (matchMask != 0) {
-                while (matchMask != 0) {
-                    int slashByteOffset = Long.numberOfTrailingZeros(matchMask) >>> 3;
-                    long segEnd = idx + slashByteOffset;
+            while (matchMask != 0) {
+                int slashByteOffset =
+                    Long.numberOfTrailingZeros(matchMask) >>> 3;
+                long segEnd = idx + slashByteOffset;
+                if (RawSegment.getByte(baseAddr, segEnd) == '/') {
                     long segLen = segEnd - segStart;
                     if (segLen > 0) {
-                        segPacked[count++] = (segStart << 32) | segLen;
+                        segPacked[count++] =
+                            (segStart << 32) | segLen;
                     }
                     segStart = segEnd + 1;
-                    matchMask &= (matchMask - 1);
                 }
-                idx = segStart;
-                continue;
+                matchMask &= (matchMask - 1);
             }
             idx += 8;
         }
@@ -942,6 +1279,33 @@ public class Router {
         return true;
     }
 
+    private static boolean containsSlash(
+            long baseAddress, long offset, long length) {
+        long end = offset + length;
+        while (offset + Long.BYTES <= end) {
+            long word = RawSegment.getLong(baseAddress, offset);
+            long difference = word ^ 0x2f2f2f2f2f2f2f2fL;
+            long matches = (difference - 0x0101010101010101L)
+                & ~difference & 0x8080808080808080L;
+            while (matches != 0) {
+                int candidate =
+                    Long.numberOfTrailingZeros(matches) >>> 3;
+                if (RawSegment.getByte(
+                        baseAddress, offset + candidate) == '/') {
+                    return true;
+                }
+                matches &= matches - 1;
+            }
+            offset += Long.BYTES;
+        }
+        while (offset < end) {
+            if (RawSegment.getByte(baseAddress, offset++) == '/') {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static long parseLongFast(long baseAddr, long offset, long len) {
         long index = offset;
         long end = offset + len;
@@ -956,5 +1320,25 @@ public class Router {
             index++;
         }
         return val;
+    }
+
+    private static long parseFastPrefixLong(
+            long baseAddress, long offset, long length) {
+        long index = offset;
+        long end = offset + length;
+        long value = 0;
+        boolean parsingNumber = true;
+        while (index < end) {
+            byte current = RawSegment.getByte(baseAddress, index++);
+            if (current == '/') {
+                return Long.MIN_VALUE;
+            }
+            if (parsingNumber && current >= '0' && current <= '9') {
+                value = value * 10 + current - '0';
+            } else {
+                parsingNumber = false;
+            }
+        }
+        return value;
     }
 }

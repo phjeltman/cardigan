@@ -376,7 +376,11 @@ final class ExchangeExecutor implements AutoCloseable {
         private void runContinuation() {
             scheduledContinuations.decrementAndGet();
             try {
-                continuation.run();
+                if (UringEventLoop.VIRTUAL_THREAD_STATS_ENABLED) {
+                    loop.runCountedHandlerContinuation(continuation);
+                } else {
+                    continuation.run();
+                }
             } finally {
                 if (epochScheduler) {
                     advanceClaimedHandlerRanges();

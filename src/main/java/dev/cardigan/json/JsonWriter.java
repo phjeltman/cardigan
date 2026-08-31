@@ -39,9 +39,10 @@ public class JsonWriter {
         for (int i = 0; i < n; i++) {
             byte[] keyBytes = keyBytesArray[i];
             int keyLen = keyBytes.length;
-            for (int j = 0; j < keyLen; j++) {
-                segment.set(ValueLayout.JAVA_BYTE, currentOffset++, keyBytes[j]);
-            }
+            MemorySegment.copy(
+                keyBytes, 0, segment, ValueLayout.JAVA_BYTE,
+                currentOffset, keyLen);
+            currentOffset += keyLen;
             try {
                 currentOffset = writers[i].write(segment, currentOffset, record);
             } catch (Throwable e) {
@@ -51,6 +52,125 @@ public class JsonWriter {
 
         segment.set(ValueLayout.JAVA_BYTE, currentOffset++, (byte) '}');
         return (int) (currentOffset - offset);
+    }
+
+    public static int encodedSize(Object value) {
+        if (value == null) {
+            return 4;
+        }
+        if (value instanceof String string) {
+            return encodedStringSize(string);
+        }
+        if (value instanceof Utf8Slice slice) {
+            return Math.addExact(Math.toIntExact(slice.length()), 2);
+        }
+        if (value instanceof Integer integer) {
+            return encodedIntSize(integer);
+        }
+        if (value instanceof Short number) {
+            return encodedIntSize(number.intValue());
+        }
+        if (value instanceof Byte number) {
+            return encodedIntSize(number.intValue());
+        }
+        if (value instanceof Long number) {
+            return encodedLongSize(number);
+        }
+        if (value instanceof Number number) {
+            return number.toString().length();
+        }
+        if (value instanceof Boolean bool) {
+            return bool ? 4 : 5;
+        }
+        if (value instanceof Record record) {
+            return encodedRecordSize(record);
+        }
+        throw new IllegalArgumentException(
+            "Unsupported JSON serialization type: " + value.getClass());
+    }
+
+    public static int encodedRecordSize(Record record) {
+        if (record == null) {
+            return 4;
+        }
+        RecordCache.RecordMetadata metadata =
+            RecordCache.getMetadata(record.getClass());
+        int fields = metadata.preEncodedKeyBytes.length;
+        if (fields == 0) {
+            return 2;
+        }
+        int size = 0;
+        for (int index = 0; index < fields; index++) {
+            size = Math.addExact(
+                size, metadata.preEncodedKeyBytes[index].length);
+            try {
+                Object value = metadata.accessorHandles[index].invoke(record);
+                size = Math.addExact(size, encodedSize(value));
+            } catch (Throwable failure) {
+                throw new RuntimeException(
+                    "Failed to size field: "
+                        + metadata.componentNames[index],
+                    failure);
+            }
+        }
+        return Math.addExact(size, 1);
+    }
+
+    public static int encodedStringSize(String string) {
+        if (string == null) {
+            return 4;
+        }
+        int size = 2;
+        for (int index = 0; index < string.length(); index++) {
+            char current = string.charAt(index);
+            if (current < 0x20) {
+                size = Math.addExact(size,
+                    current == '\b' || current == '\f'
+                        || current == '\n' || current == '\r'
+                        || current == '\t' ? 2 : 6);
+            } else if (current < 0x80) {
+                size = Math.addExact(size,
+                    current == '"' || current == '\\' ? 2 : 1);
+            } else if (current < 0x800) {
+                size = Math.addExact(size, 2);
+            } else if (Character.isSurrogate(current)) {
+                if (index + 1 < string.length()) {
+                    size = Math.addExact(size, 4);
+                    index++;
+                } else {
+                    size = Math.addExact(size, 1);
+                }
+            } else {
+                size = Math.addExact(size, 3);
+            }
+        }
+        return size;
+    }
+
+    private static int encodedIntSize(int value) {
+        if (value == Integer.MIN_VALUE) {
+            return 11;
+        }
+        int size = value < 0 ? 1 : 0;
+        int magnitude = value < 0 ? -value : value;
+        do {
+            size++;
+            magnitude /= 10;
+        } while (magnitude != 0);
+        return size;
+    }
+
+    private static int encodedLongSize(long value) {
+        if (value == Long.MIN_VALUE) {
+            return 20;
+        }
+        int size = value < 0 ? 1 : 0;
+        long magnitude = value < 0 ? -value : value;
+        do {
+            size++;
+            magnitude /= 10;
+        } while (magnitude != 0);
+        return size;
     }
 
     public static long writeUtf8String(MemorySegment segment, long offset, String str) {
@@ -70,7 +190,7 @@ public class JsonWriter {
                 }
                 segment.set(ValueLayout.JAVA_BYTE, offset++, (byte) c);
             } else {
-                return writeUtf8Multibyte(segment, offset - 1, str, i);
+                return writeUtf8Multibyte(segment, offset, str, i);
             }
         }
         segment.set(ValueLayout.JAVA_BYTE, offset++, (byte) '"');

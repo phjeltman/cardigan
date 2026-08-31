@@ -28,6 +28,8 @@ public class JsonTest {
         User userInfo
     ) {}
 
+    public record UnicodeRecord(String text) {}
+
     @Test
     public void testJsonWriterAndReader() {
         User user = new User("Alice Smith", 427, true);
@@ -58,6 +60,30 @@ public class JsonTest {
             
             boolean parsedActive = JsonReader.findBoolean(segment, 0, bytesWritten, "active", false);
             assertTrue(parsedActive, "Parsed active state should be true");
+
+            JsonReader.IndexedObject indexed = JsonReader.indexObject(
+                segment, 0, bytesWritten);
+            assertEquals("Alice Smith", indexed.findString("name").toString());
+            assertEquals(427, indexed.findInt("id", -1));
+            assertTrue(indexed.findBoolean("active", false));
+            assertEquals(-1, indexed.findInt("missing", -1));
+        }
+    }
+
+    @Test
+    void writerSizeMatchesEscapedUtf8Output() {
+        UnicodeRecord record = new UnicodeRecord(
+            "prefix € emoji 😀 newline\nquote\"");
+        int expectedSize = JsonWriter.encodedRecordSize(record);
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment output = arena.allocate(expectedSize);
+            int written = JsonWriter.writeRecord(output, 0, record);
+            assertEquals(expectedSize, written);
+            assertEquals(
+                "{\"text\":\"prefix € emoji 😀 newline\\nquote\\\"\"}",
+                new String(
+                    output.toArray(ValueLayout.JAVA_BYTE),
+                    StandardCharsets.UTF_8));
         }
     }
 

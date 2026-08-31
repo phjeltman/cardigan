@@ -13,6 +13,7 @@ import java.util.Objects;
 import dev.cardigan.http.HttpRequest;
 import dev.cardigan.pico.PicoHTTPParser;
 import dev.cardigan.pico.Header;
+import dev.cardigan.pico.Request;
 import dev.cardigan.http.Router;
 import dev.cardigan.http.Response;
 import dev.cardigan.http.ResponseHeaders;
@@ -53,7 +54,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
     private final TlsContext tlsContext;
     private final FixedFilesMode fixedFilesMode;
     private final boolean directAccept;
-    private final EgressBufferPool egressBufferPool;
+    private final Http1CqeDriverStats http1CqeDriverStats =
+        new Http1CqeDriverStats();
     private final List<UringEventLoop> eventLoops = new ArrayList<>();
     private final List<Integer> serverFds = new ArrayList<>();
     private final List<AcceptHandler> acceptHandlers = new ArrayList<>();
@@ -102,6 +104,14 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
     public static final long MAX_REQUEST_SIZE = Long.getLong("cardigan.max.request.size", 10 * 1024 * 1024L);
     public static final int MAX_HEADER_SIZE = Integer.getInteger("cardigan.max.header.size", 8192);
     public static final int MAX_HTTP1_IN_FLIGHT = Integer.getInteger("cardigan.http1.max.inflight", 128);
+    private static final boolean HTTP1_CQE_DRIVER = Boolean.parseBoolean(
+        System.getProperty("cardigan.http1.cqeDriver", "true"));
+    private static final boolean HTTP1_DIRECT_BATCH = Boolean.parseBoolean(
+        System.getProperty("cardigan.http1.directBatch", "true"));
+
+    static boolean http1CqeDriverEnabled() {
+        return HTTP1_CQE_DRIVER;
+    }
 
     private static final long HTTP1_FRAMING_CHUNKED = 1L << 60;
     private static final long HTTP1_EXPECT_CONTINUE = 1L << 61;
@@ -143,8 +153,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
 
     private static final MemorySegment SEG_HDR_200_TEXT = createStaticSegment("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ");
     private static final MemorySegment SEG_HDR_200_JSON = createStaticSegment("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
+    private static final MemorySegment SEG_POST_LENGTH_DEFAULT = createStaticSegment("\r\n\r\n");
     private static final MemorySegment SEG_POST_LENGTH_KA = createStaticSegment("\r\nConnection: keep-alive\r\n\r\n");
-    private static final MemorySegment SEG_POST_LENGTH_CLOSE = createStaticSegment("\r\nConnection: close\r\n\r\n");
 
     private static final long ADDR_STATUS_200 = SEG_STATUS_200.address();
     private static final int LEN_STATUS_200 = (int) SEG_STATUS_200.byteSize();
@@ -188,10 +198,12 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
     private static final int LEN_HDR_200_TEXT = (int) SEG_HDR_200_TEXT.byteSize();
     private static final long ADDR_HDR_200_JSON = SEG_HDR_200_JSON.address();
     private static final int LEN_HDR_200_JSON = (int) SEG_HDR_200_JSON.byteSize();
+    private static final long ADDR_POST_LENGTH_DEFAULT =
+        SEG_POST_LENGTH_DEFAULT.address();
+    private static final int LEN_POST_LENGTH_DEFAULT =
+        (int) SEG_POST_LENGTH_DEFAULT.byteSize();
     private static final long ADDR_POST_LENGTH_KA = SEG_POST_LENGTH_KA.address();
     private static final int LEN_POST_LENGTH_KA = (int) SEG_POST_LENGTH_KA.byteSize();
-    private static final long ADDR_POST_LENGTH_CLOSE = SEG_POST_LENGTH_CLOSE.address();
-    private static final int LEN_POST_LENGTH_CLOSE = (int) SEG_POST_LENGTH_CLOSE.byteSize();
 
     public CardiganServer(int port) {
         this(port, Runtime.getRuntime().availableProcessors());
@@ -223,8 +235,6 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             ? ThreadAffinity.processCpus(threadCount)
             : ThreadAffinity.processCpus(cpuList);
         this.cores = eventLoopCpus.length;
-        int maxEgressBuffers =
-            EgressBufferPool.configuredMaxBuffers(cores);
         Objects.requireNonNull(protocolMode, "protocolMode");
         this.http2Only = protocolMode == ProtocolMode.HTTP2_ONLY;
         this.http1Only = protocolMode == ProtocolMode.HTTP1_ONLY;
@@ -241,8 +251,6 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         this.tlsContext = tlsConfig == null
             ? null
             : new TlsContext(tlsConfig, http2Only, http1Only);
-        this.egressBufferPool = new EgressBufferPool(
-            maxEgressBuffers, UringEventLoop.EGRESS_FRAME_SIZE);
         this.gracefulShutdownMillis = Math.max(
             0L,
             Long.getLong("cardigan.shutdown.grace.millis", 30_000L));
@@ -376,8 +384,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     cpuId,
                     512,
                     ingressBuffersPerLoop,
-                    directKtlsReceiveConfigured,
-                    egressBufferPool));
+                    directKtlsReceiveConfigured));
             }
 
             CountDownLatch listenersReady = new CountDownLatch(cores);
@@ -526,10 +533,6 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
 
     int activeConnectionCount() {
         return activeConnectionCount.get();
-    }
-
-    EgressBufferPool.Stats egressBufferPoolStats() {
-        return egressBufferPool.stats();
     }
 
     boolean isDraining() {
@@ -988,6 +991,9 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             control
         );
         try {
+            if (HTTP1_CQE_DRIVER && driveHttp1FromCompletions(session)) {
+                return;
+            }
             while (drainHttp1Session(session)) {
                 InboundChunk next = inbound.nextChunk();
                 if (next == null) {
@@ -997,6 +1003,142 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             }
         } finally {
             session.close();
+        }
+    }
+
+    private boolean driveHttp1FromCompletions(Http1Session session) {
+        if (Http1CqeDriverStats.ENABLED) {
+            http1CqeDriverStats.connectionAttempted();
+        }
+        Http1CqeDriver driver = new Http1CqeDriver(
+            session, Thread.currentThread());
+        if (!driver.start()) {
+            if (Http1CqeDriverStats.ENABLED) {
+                http1CqeDriverStats.listenerUnavailable();
+            }
+            return false;
+        }
+        return driver.awaitOutcome() == Http1CqeDriver.DONE;
+    }
+
+    /**
+     * Processes the buffered, zero-body GET path without parking. Any request
+     * that needs the general blocking protocol machinery is left untouched and
+     * handed back to the connection owner.
+     */
+    private int drainHttp1CqeBatch(Http1Session session) {
+        boolean keepAlive = session.keepAlive;
+        InboundChunk currentChunk = session.currentChunk;
+        MemorySegment currentBuf = session.currentBuf;
+        int readOffset = session.readOffset;
+        int requestOffset = session.requestOffset;
+        HttpRequest request = session.request;
+        Http1ExchangeSequencer exchangeSequencer = session.exchangeSequencer;
+        try {
+            while (keepAlive) {
+                if (session.control.draining
+                        || (exchangeSequencer != null
+                            && exchangeSequencer.isFailed())) {
+                    return Http1CqeDriver.DONE;
+                }
+                if (currentChunk == null) {
+                    return Http1CqeDriver.NEED_INPUT;
+                }
+
+                request.init(currentBuf, requestOffset);
+                long parseResult = PicoHTTPParser.parseRequest(
+                    currentBuf,
+                    requestOffset,
+                    Math.min(readOffset, requestOffset + MAX_HEADER_SIZE),
+                    request.picoRequest(),
+                    0
+                );
+                if (parseResult < 0) {
+                    if (parseResult == PicoHTTPParser.ERROR_PARTIAL
+                            && readOffset - requestOffset
+                                < MAX_HEADER_SIZE) {
+                        return Http1CqeDriver.FALLBACK_PARTIAL_HEADER;
+                    }
+                    return Http1CqeDriver.FALLBACK_HEADER_REJECTED;
+                }
+
+                request.splitQuery();
+                long framing = parseHttp1Framing(request);
+                if (framing != 0) {
+                    return Http1CqeDriver.FALLBACK_REQUEST_FRAMING;
+                }
+                if (!router.isSafeMethod(request)) {
+                    return Http1CqeDriver.FALLBACK_UNSAFE_METHOD;
+                }
+
+                int headerLength = (int) parseResult;
+                int requestEnd = requestOffset + headerLength;
+                if (requestEnd > readOffset) {
+                    return Http1CqeDriver.FALLBACK_PARTIAL_HEADER;
+                }
+
+                boolean requestKeepAlive = request.isKeepAlive();
+                boolean requestKeepAliveHeader =
+                    requestKeepAlive && request.version() == 0;
+                keepAlive = requestKeepAlive;
+                int leftover = readOffset - requestEnd;
+
+                if (exchangeSequencer == null) {
+                    exchangeSequencer = new Http1ExchangeSequencer(
+                        session.loop.exchangeExecutor(),
+                        MAX_HTTP1_IN_FLIGHT,
+                        (completedResponse, responseKeepAlive,
+                                responseKeepAliveHeader) ->
+                            sendResponse(
+                                session.writer,
+                                completedResponse,
+                                responseKeepAlive,
+                                responseKeepAliveHeader,
+                                true)
+                    );
+                    session.control.http1 = exchangeSequencer;
+                }
+                int reservation =
+                    exchangeSequencer.tryReserveSubmission();
+                if (reservation
+                        == Http1ExchangeSequencer.RESERVATION_FULL) {
+                    return Http1CqeDriver.FALLBACK_SEQUENCER_CAPACITY;
+                }
+                if (reservation
+                        == Http1ExchangeSequencer.RESERVATION_FAILED) {
+                    return Http1CqeDriver.DONE;
+                }
+
+                AutoCloseable requestStorage = null;
+                if (leftover == 0) {
+                    requestStorage = currentChunk;
+                    currentChunk = null;
+                    currentBuf = null;
+                }
+                if (!exchangeSequencer.submitReservedSafe(
+                        router,
+                        request,
+                        requestKeepAlive,
+                        requestKeepAliveHeader,
+                        requestStorage)) {
+                    return Http1CqeDriver.DONE;
+                }
+
+                if (leftover == 0) {
+                    readOffset = 0;
+                    requestOffset = 0;
+                } else {
+                    requestOffset = requestEnd;
+                }
+            }
+            return Http1CqeDriver.DONE;
+        } finally {
+            session.keepAlive = keepAlive;
+            session.currentChunk = currentChunk;
+            session.currentBuf = currentBuf;
+            session.readOffset = readOffset;
+            session.requestOffset = requestOffset;
+            session.exchangeSequencer = exchangeSequencer;
         }
     }
 
@@ -1180,6 +1322,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
 
                 if (streamingRoute) {
                     boolean requestKeepAlive = request.isKeepAlive();
+                    boolean requestKeepAliveHeader =
+                        requestKeepAlive && request.version() == 0;
                     keepAlive = requestKeepAlive;
                     boolean isolatedStreamingRoute = streamingBodyMode
                         == Router.BODY_STREAMING_ISOLATED;
@@ -1240,6 +1384,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                         writer,
                         response,
                         requestKeepAlive && !control.draining,
+                        requestKeepAliveHeader,
                         readOffset != 0
                     );
                     if (!sent) {
@@ -1302,6 +1447,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 request.setBody(headerEndPos, contentLength);
 
                 boolean requestKeepAlive = request.isKeepAlive();
+                boolean requestKeepAliveHeader =
+                    requestKeepAlive && request.version() == 0;
                 keepAlive = requestKeepAlive;
                 int leftover = jumboArena == null
                     ? (int) (readOffset - totalRequestSize)
@@ -1313,18 +1460,34 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                         exchangeSequencer = new Http1ExchangeSequencer(
                             loop.exchangeExecutor(),
                             MAX_HTTP1_IN_FLIGHT,
-                            (completedResponse, responseKeepAlive) ->
+                            (completedResponse, responseKeepAlive,
+                                    responseKeepAliveHeader) ->
                                 sendResponse(
                                     writer, completedResponse,
-                                    responseKeepAlive, true)
+                                    responseKeepAlive,
+                                    responseKeepAliveHeader,
+                                    true)
                         );
                         control.http1 = exchangeSequencer;
                         if (control.draining) {
                             exchangeSequencer.beginDrain();
                         }
                     }
+                    AutoCloseable requestStorage = null;
+                    if (jumboArena != null) {
+                        requestStorage = jumboArena;
+                        jumboArena = null;
+                    } else if (leftover == 0) {
+                        requestStorage = currentChunk;
+                        currentChunk = null;
+                        currentBuf = null;
+                    }
                     sentOk = exchangeSequencer.submit(
-                        router, request, requestKeepAlive);
+                        router,
+                        request,
+                        requestKeepAlive,
+                        requestKeepAliveHeader,
+                        requestStorage);
                 } else if (exchangeSequencer != null
                     && exchangeSequencer.hasInFlight()) {
                     PreparedInvocation invocation = router.prepare(request);
@@ -1333,12 +1496,14 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                         sentOk = sendResponse(
                             writer, invocation.invoke(),
                             requestKeepAlive && !control.draining,
+                            requestKeepAliveHeader,
                             leftover > 0);
                     }
                 } else {
                     sentOk = sendResponse(
                         writer, router.dispatch(request),
                         requestKeepAlive && !control.draining,
+                        requestKeepAliveHeader,
                         leftover > 0);
                 }
 
@@ -1347,7 +1512,9 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     readOffset = 0;
                     requestOffset = 0;
                 } else if (leftover == 0) {
-                    currentChunk.close();
+                    if (currentChunk != null) {
+                        currentChunk.close();
+                    }
                     currentChunk = null;
                     currentBuf = null;
                     readOffset = 0;
@@ -1368,6 +1535,161 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             session.readOffset = readOffset;
             session.requestOffset = requestOffset;
             session.exchangeSequencer = exchangeSequencer;
+        }
+    }
+
+    private final class Http1CqeDriver
+            implements UringEventLoop.ProtocolTask {
+        private static final int RUNNING = 0;
+        private static final int NEED_INPUT = 1;
+        private static final int DONE = 2;
+        private static final int FALLBACK_PARTIAL_HEADER = 3;
+        private static final int FALLBACK_HEADER_REJECTED = 4;
+        private static final int FALLBACK_REQUEST_FRAMING = 5;
+        private static final int FALLBACK_UNSAFE_METHOD = 6;
+        private static final int FALLBACK_SEQUENCER_CAPACITY = 7;
+
+        private final Http1Session session;
+        private final Thread owner;
+        private final Runnable availabilityListener = this::schedule;
+        private volatile int outcome = RUNNING;
+        private boolean scheduled;
+        private long drivenRequests;
+        private long protocolRuns;
+        private long queuedChunksConsumed;
+
+        private Http1CqeDriver(Http1Session session, Thread owner) {
+            this.session = session;
+            this.owner = owner;
+        }
+
+        private boolean start() {
+            if (!session.inbound.registerAvailabilityListener(
+                    availabilityListener)) {
+                return false;
+            }
+            schedule();
+            return true;
+        }
+
+        private int awaitOutcome() {
+            boolean interrupted = false;
+            while (outcome == RUNNING) {
+                LockSupport.park(this);
+                if (outcome == RUNNING && Thread.interrupted()) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            return outcome;
+        }
+
+        private void schedule() {
+            if (outcome != RUNNING || scheduled) {
+                return;
+            }
+            scheduled = true;
+            try {
+                session.loop.execute(this);
+            } catch (Throwable failure) {
+                scheduled = false;
+                finish(
+                    DONE,
+                    Http1CqeDriverStats.STOP_SCHEDULE_FAILURE);
+            }
+        }
+
+        @Override
+        public void run() {
+            scheduled = false;
+            if (Http1CqeDriverStats.ENABLED) {
+                protocolRuns++;
+            }
+            try {
+                while (outcome == RUNNING) {
+                    long previousSubmissions = 0;
+                    if (Http1CqeDriverStats.ENABLED
+                            && session.exchangeSequencer != null) {
+                        previousSubmissions =
+                            session.exchangeSequencer.submissionCount();
+                    }
+                    int result = drainHttp1CqeBatch(session);
+                    if (Http1CqeDriverStats.ENABLED
+                            && session.exchangeSequencer != null) {
+                        drivenRequests +=
+                            session.exchangeSequencer.submissionCount()
+                                - previousSubmissions;
+                    }
+                    int fallbackReason = fallbackStopReason(result);
+                    if (fallbackReason >= 0) {
+                        finish(result, fallbackReason);
+                        return;
+                    }
+                    if (result == DONE) {
+                        finish(
+                            DONE,
+                            Http1CqeDriverStats.STOP_COMPLETED);
+                        return;
+                    }
+
+                    InboundChunk chunk =
+                        session.inbound.nextAvailableChunk();
+                    if (chunk == null) {
+                        if (session.inbound.inputTerminated()) {
+                            finish(
+                                DONE,
+                                Http1CqeDriverStats.STOP_COMPLETED);
+                        }
+                        return;
+                    }
+                    if (Http1CqeDriverStats.ENABLED) {
+                        queuedChunksConsumed++;
+                    }
+                    session.accept(chunk);
+                }
+            } catch (Throwable failure) {
+                if (!session.control.draining) {
+                    failure.printStackTrace();
+                }
+                finish(
+                    DONE,
+                    Http1CqeDriverStats.STOP_DRIVER_EXCEPTION);
+            }
+        }
+
+        private int fallbackStopReason(int result) {
+            return switch (result) {
+                case FALLBACK_PARTIAL_HEADER ->
+                    Http1CqeDriverStats.STOP_PARTIAL_HEADER;
+                case FALLBACK_HEADER_REJECTED ->
+                    Http1CqeDriverStats.STOP_HEADER_REJECTED;
+                case FALLBACK_REQUEST_FRAMING ->
+                    Http1CqeDriverStats.STOP_REQUEST_FRAMING;
+                case FALLBACK_UNSAFE_METHOD ->
+                    Http1CqeDriverStats.STOP_UNSAFE_METHOD;
+                case FALLBACK_SEQUENCER_CAPACITY ->
+                    Http1CqeDriverStats.STOP_SEQUENCER_CAPACITY;
+                default -> -1;
+            };
+        }
+
+        private void finish(int terminalOutcome, int stopReason) {
+            if (outcome != RUNNING) {
+                return;
+            }
+            session.inbound.clearAvailabilityListener(
+                availabilityListener);
+            if (Http1CqeDriverStats.ENABLED) {
+                http1CqeDriverStats.driverStopped(
+                    drivenRequests,
+                    protocolRuns,
+                    queuedChunksConsumed,
+                    stopReason);
+            }
+            outcome = terminalOutcome;
+            LockSupport.unpark(owner);
         }
     }
 
@@ -1526,56 +1848,72 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
      * rejects ambiguous framing before a body can desynchronise a keep-alive
      * connection.
      */
-    private static long parseHttp1Framing(HttpRequest request) {
-        boolean contentLengthSeen = false;
-        boolean transferEncodingSeen = false;
-        boolean expectationSeen = false;
+    static long parseHttp1Framing(HttpRequest request) {
         long contentLength = 0;
         long flags = 0;
         MemorySegment segment = request.segment();
-        Header[] headers = request.picoRequest().headers;
-        int headerCount = request.picoRequest().numHeaders;
+        Request parsed = request.picoRequest();
+        long framingHeaders = parsed.framingHeaders;
+        if (framingHeaders == 0) {
+            request.cacheConnectionHeader(-1);
+            return 0;
+        }
+        Header[] headers = parsed.headers;
+        long contentLengthLane = framingHeaders & 0xffffL;
+        long transferEncodingLane =
+            (framingHeaders >>> 16) & 0xffffL;
+        long expectLane = (framingHeaders >>> 32) & 0xffffL;
+        int connectionHeaderIndex = (int) ((framingHeaders >>> 48)
+            & Request.FRAMING_INDEX_MASK) - 1;
 
-        for (int index = 0; index < headerCount; index++) {
-            Header header = headers[index];
-            if (header.nameLen == 14
-                && asciiEqualsIgnoreCase(
-                    segment, header.nameOffset, 14, "content-length")) {
-                if (contentLengthSeen) {
-                    return HTTP1_FRAMING_INVALID;
-                }
-                contentLengthSeen = true;
-                contentLength = parseContentLength(
-                    segment, header.valueOffset, header.valueLen);
-                if (contentLength < 0) {
-                    return contentLength;
-                }
-            } else if (header.nameLen == 17
-                && asciiEqualsIgnoreCase(
-                    segment, header.nameOffset, 17, "transfer-encoding")) {
-                if (transferEncodingSeen
-                    || !isChunkedTransferEncoding(
-                        segment, header.valueOffset, header.valueLen)) {
-                    return HTTP1_FRAMING_INVALID;
-                }
-                transferEncodingSeen = true;
-            } else if (header.nameLen == 6
-                && asciiEqualsIgnoreCase(
-                    segment, header.nameOffset, 6, "expect")) {
-                if (expectationSeen || !isContinueExpectation(
-                        segment, header.valueOffset, header.valueLen)) {
-                    flags |= HTTP1_EXPECT_UNSUPPORTED;
-                } else {
-                    flags |= HTTP1_EXPECT_CONTINUE;
-                }
-                expectationSeen = true;
+        if ((contentLengthLane
+                & Request.FRAMING_DUPLICATE_MASK) != 0
+            || (transferEncodingLane
+                & Request.FRAMING_DUPLICATE_MASK) != 0) {
+            return HTTP1_FRAMING_INVALID;
+        }
+
+        int contentLengthIndex = (int) (contentLengthLane
+            & Request.FRAMING_INDEX_MASK) - 1;
+        if (contentLengthIndex >= 0) {
+            Header header = headers[contentLengthIndex];
+            contentLength = parseContentLength(
+                segment, header.valueOffset, header.valueLen);
+            if (contentLength < 0) {
+                return contentLength;
             }
         }
 
-        if (transferEncodingSeen) {
+        int transferEncodingIndex = (int) (transferEncodingLane
+            & Request.FRAMING_INDEX_MASK) - 1;
+        if (transferEncodingIndex >= 0) {
+            Header header = headers[transferEncodingIndex];
+            if (!isChunkedTransferEncoding(
+                    segment, header.valueOffset, header.valueLen)) {
+                return HTTP1_FRAMING_INVALID;
+            }
+        }
+
+        int expectIndex = (int) (expectLane
+            & Request.FRAMING_INDEX_MASK) - 1;
+        if (expectIndex >= 0) {
+            Header header = headers[expectIndex];
+            if ((expectLane
+                    & Request.FRAMING_DUPLICATE_MASK) != 0
+                    || !isContinueExpectation(
+                        segment, header.valueOffset, header.valueLen)) {
+                flags |= HTTP1_EXPECT_UNSUPPORTED;
+            } else {
+                flags |= HTTP1_EXPECT_CONTINUE;
+            }
+        }
+
+        request.cacheConnectionHeader(connectionHeaderIndex);
+
+        if (transferEncodingIndex >= 0) {
             // Cardigan supports only HTTP/1.1's terminal chunked coding;
             // Content-Length plus Transfer-Encoding is ambiguous framing.
-            if (contentLengthSeen || request.version() != 1) {
+            if (contentLengthIndex >= 0 || request.version() != 1) {
                 return HTTP1_FRAMING_INVALID;
             }
             return flags | HTTP1_FRAMING_CHUNKED;
@@ -1709,20 +2047,26 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
     }
 
     private boolean sendResponse(ConnectionWriter writer, Response response, boolean keepAlive) {
-        return sendResponse(writer, response, keepAlive, false);
+        return sendResponse(writer, response, keepAlive, false, false);
     }
 
-    private boolean sendResponse(ConnectionWriter writer, Response response, boolean keepAlive, boolean hasPipelinedBytes) {
+    private boolean sendResponse(
+            ConnectionWriter writer,
+            Response response,
+            boolean keepAlive,
+            boolean keepAliveHeader,
+            boolean hasPipelinedBytes) {
         try {
             if (response.hasMetadata()) {
                 return sendMetadataResponse(
-                    writer, response, keepAlive);
+                    writer, response, keepAlive, keepAliveHeader);
             }
             UringEventLoop loop = writer.eventLoop();
             int statusCode = response.statusCode();
             int contentTypeCode = response.contentTypeCode();
             String contentType = response.contentType();
-            Object body = response.body();
+            boolean asciiLongBody = response.hasAsciiLongBody();
+            Object body = asciiLongBody ? null : response.body();
             byte[] materializedBytes = null;
             if (body instanceof byte[] bytes) {
                 materializedBytes = bytes;
@@ -1730,6 +2074,70 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 materializedBytes = Http2ResponseWriter.asciiBytes(text);
                 if (materializedBytes == null) {
                     materializedBytes = text.getBytes(StandardCharsets.UTF_8);
+                }
+            }
+
+            int appendBodyLength = -1;
+            if (asciiLongBody) {
+                appendBodyLength = response.asciiLongBodyLength();
+            } else if (body == null) {
+                appendBodyLength = 0;
+            } else if (body instanceof EncodedBody encodedBody) {
+                appendBodyLength = encodedBody.length();
+            } else if (materializedBytes != null) {
+                appendBodyLength = materializedBytes.length;
+            }
+            int appendHeaderLength = HTTP1_DIRECT_BATCH
+                && hasPipelinedBytes
+                ? fastHttp1HeaderLength(
+                    statusCode,
+                    contentTypeCode,
+                    appendBodyLength,
+                    keepAlive,
+                    keepAliveHeader)
+                : -1;
+            if (appendHeaderLength >= 0) {
+                int appendLength = Math.addExact(
+                    appendHeaderLength, appendBodyLength);
+                if (appendLength <= UringEventLoop.EGRESS_FRAME_SIZE) {
+                    MemorySegment append =
+                        writer.beginOwnedAppend(appendLength);
+                    if (append != null) {
+                        try {
+                            int headersLen = writeHeaders(
+                                append,
+                                statusCode,
+                                contentTypeCode,
+                                contentType,
+                                appendBodyLength,
+                                keepAlive,
+                                keepAliveHeader);
+                            if (headersLen != appendHeaderLength) {
+                                throw new IllegalStateException(
+                                    "HTTP/1 batch header length changed");
+                            }
+                            if (asciiLongBody) {
+                                response.writeAsciiLongBody(
+                                    append.asSlice(
+                                        headersLen, appendBodyLength));
+                            } else if (body instanceof EncodedBody encodedBody) {
+                                encodedBody.write(
+                                    append.asSlice(
+                                        headersLen, appendBodyLength));
+                            } else if (materializedBytes != null) {
+                                RawSegment.copy(
+                                    materializedBytes,
+                                    0,
+                                    append.address() + headersLen,
+                                    appendBodyLength);
+                            }
+                            writer.commitOwnedAppend(appendLength);
+                            return true;
+                        } catch (Throwable failure) {
+                            writer.abortOwnedAppend();
+                            throw failure;
+                        }
+                    }
                 }
             }
 
@@ -1746,10 +2154,28 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     respSeg = fallbackArena.allocate(16 * 1024);
                 }
 
-                if (body == null) {
-                    int headersLen = writeHeaders(respSeg, statusCode, contentTypeCode, contentType, 0, keepAlive);
+                if (asciiLongBody) {
+                    int bodyLen = response.asciiLongBodyLength();
+                    int headersLen = writeHeaders(
+                        respSeg, statusCode, contentTypeCode,
+                        contentType, bodyLen, keepAlive, keepAliveHeader);
+                    response.writeAsciiLongBody(
+                        respSeg.asSlice(headersLen, bodyLen));
+                    int responseLength = headersLen + bodyLen;
+                    if (hasPipelinedBytes && keepAlive
+                        && egressId >= 0 && fallbackArena == null) {
+                        boolean queued = writer.enqueueOwned(
+                            egressId, responseLength);
+                        egressId = -1;
+                        return queued;
+                    }
+                    res = writer.writeFully(respSeg, responseLength);
+                } else if (body == null) {
+                    int headersLen = writeHeaders(
+                        respSeg, statusCode, contentTypeCode,
+                        contentType, 0, keepAlive, keepAliveHeader);
                     if (hasPipelinedBytes && keepAlive && egressId >= 0 && fallbackArena == null) {
-                        boolean queued = writer.enqueue(egressId, headersLen);
+                        boolean queued = writer.enqueueOwned(egressId, headersLen);
                         egressId = -1;
                         return queued;
                     }
@@ -1762,7 +2188,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                         contentTypeCode,
                         contentType,
                         bodyLen,
-                        keepAlive
+                        keepAlive,
+                        keepAliveHeader
                     );
                     int totalLength = Math.addExact(headersLen, bodyLen);
                     if (totalLength <= respSeg.byteSize()) {
@@ -1770,7 +2197,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                             respSeg.asSlice(headersLen, bodyLen));
                         if (hasPipelinedBytes && keepAlive
                             && egressId >= 0 && fallbackArena == null) {
-                            boolean queued = writer.enqueue(
+                            boolean queued = writer.enqueueOwned(
                                 egressId, totalLength);
                             egressId = -1;
                             return queued;
@@ -1799,7 +2226,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                                 contentTypeCode,
                                 contentType,
                                 bodyLen,
-                                keepAlive
+                                keepAlive,
+                                keepAliveHeader
                             );
                             res = writer.writeFully(respSeg, headersLen);
                             int remaining = bodyLen;
@@ -1823,7 +2251,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                                 respSeg,
                                 statusCode,
                                 contentType,
-                                keepAlive
+                                keepAlive,
+                                keepAliveHeader
                             );
                         }
                     } finally {
@@ -1837,10 +2266,11 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                         contentTypeCode,
                         contentType,
                         bodyLen,
-                        keepAlive
+                        keepAlive,
+                        keepAliveHeader
                     );
                     if (egressId >= 0 && fallbackArena == null) {
-                        boolean queued = writer.enqueue(egressId, headersLen);
+                        boolean queued = writer.enqueueOwned(egressId, headersLen);
                         egressId = -1;
                         if (!queued) {
                             return false;
@@ -1864,7 +2294,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     int bodyLen = materializedBytes.length;
                     int headersLen = writeHeaders(
                         respSeg, statusCode, contentTypeCode, contentType,
-                        bodyLen, keepAlive);
+                        bodyLen, keepAlive, keepAliveHeader);
                     int firstBodyLen = Math.min(
                         bodyLen,
                         Math.toIntExact(respSeg.byteSize()) - headersLen);
@@ -1877,7 +2307,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     if (firstBodyLen == bodyLen
                         && hasPipelinedBytes && keepAlive
                         && egressId >= 0 && fallbackArena == null) {
-                        boolean queued = writer.enqueue(
+                        boolean queued = writer.enqueueOwned(
                             egressId, headersLen + bodyLen);
                         egressId = -1;
                         return queued;
@@ -1908,12 +2338,14 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                         bodyLen = JsonWriter.writeRecord(
                             respSeg, 256, recordBody);
                     }
-                    int headersLen = writeHeaders(respSeg, statusCode, contentTypeCode, contentType, bodyLen, keepAlive);
+                    int headersLen = writeHeaders(
+                        respSeg, statusCode, contentTypeCode, contentType,
+                        bodyLen, keepAlive, keepAliveHeader);
                     if (headersLen != 256) {
                         RawSegment.copy(respSeg.address() + 256, respSeg.address() + headersLen, bodyLen);
                     }
                     if (hasPipelinedBytes && keepAlive && egressId >= 0 && fallbackArena == null) {
-                        boolean queued = writer.enqueue(egressId, headersLen + bodyLen);
+                        boolean queued = writer.enqueueOwned(egressId, headersLen + bodyLen);
                         egressId = -1;
                         return queued;
                     }
@@ -1937,7 +2369,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
     private static boolean sendMetadataResponse(
             ConnectionWriter writer,
             Response response,
-            boolean keepAlive) {
+            boolean keepAlive,
+            boolean keepAliveHeader) {
         UringEventLoop loop = writer.eventLoop();
         int egressId = loop.acquireEgressBuffer();
         Arena bufferArena = null;
@@ -1952,11 +2385,17 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 buffer = bufferArena.allocate(UringEventLoop.EGRESS_FRAME_SIZE);
             }
 
-            Object body = response.body();
+            boolean asciiLongBody = response.hasAsciiLongBody();
+            Object body = asciiLongBody ? null : response.body();
             byte[] byteBody = null;
             MemorySegment segmentBody = null;
             int bodyLength;
-            if (body == null) {
+            if (asciiLongBody) {
+                bodyLength = response.asciiLongBodyLength();
+                bodyArena = Arena.ofConfined();
+                segmentBody = bodyArena.allocate(bodyLength);
+                response.writeAsciiLongBody(segmentBody);
+            } else if (body == null) {
                 bodyLength = 0;
             } else if (body instanceof byte[] bytes) {
                 byteBody = bytes;
@@ -1991,7 +2430,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             boolean chunked = !response.trailers().isEmpty()
                 || bodyLength == StreamingBody.UNKNOWN_LENGTH;
             int headerLength = writeMetadataHeaders(
-                buffer, response, bodyLength, keepAlive, chunked);
+                buffer, response, bodyLength,
+                keepAlive, keepAliveHeader, chunked);
             int byteBodyOffset = 0;
             int firstLength = headerLength;
             if (!chunked && byteBody != null) {
@@ -2146,6 +2586,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             Response response,
             int bodyLength,
             boolean keepAlive,
+            boolean keepAliveHeader,
             boolean chunked) {
         long address = buffer.address();
         int offset = writeStatusLine(
@@ -2176,11 +2617,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             offset += LEN_CRLF;
         }
 
-        long connectionAddress = keepAlive ? ADDR_CONN_KA : ADDR_CONN_CLOSE;
-        int connectionLength = keepAlive ? LEN_CONN_KA : LEN_CONN_CLOSE;
-        RawSegment.copy(
-            connectionAddress, address + offset, connectionLength);
-        return offset + connectionLength;
+        return writeConnectionTerminator(
+            address, offset, keepAlive, keepAliveHeader);
     }
 
     private static int writeStatusLine(long address, int statusCode) {
@@ -2310,12 +2748,14 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         MemorySegment buffer,
         int statusCode,
         String contentType,
-        boolean keepAlive
+        boolean keepAlive,
+        boolean keepAliveHeader
     ) {
         int result = writer.writeFully(
             buffer,
             writeChunkedHeaders(
-                buffer, statusCode, contentType, keepAlive));
+                buffer, statusCode, contentType,
+                keepAlive, keepAliveHeader));
         int capacity = Math.toIntExact(buffer.byteSize()) - 12;
         while (result > 0) {
             int produced = body.read(buffer.asSlice(10, capacity));
@@ -2363,7 +2803,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         MemorySegment segment,
         int statusCode,
         String contentType,
-        boolean keepAlive
+        boolean keepAlive,
+        boolean keepAliveHeader
     ) {
         long baseAddress = segment.address();
         int offset = 0;
@@ -2446,20 +2887,18 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             baseAddress + offset,
             LEN_TRANSFER_CHUNKED);
         offset += LEN_TRANSFER_CHUNKED;
-        long connectionAddress = keepAlive
-            ? ADDR_CONN_KA
-            : ADDR_CONN_CLOSE;
-        int connectionLength = keepAlive
-            ? LEN_CONN_KA
-            : LEN_CONN_CLOSE;
-        RawSegment.copy(
-            connectionAddress,
-            baseAddress + offset,
-            connectionLength);
-        return offset + connectionLength;
+        return writeConnectionTerminator(
+            baseAddress, offset, keepAlive, keepAliveHeader);
     }
 
-    private static int writeHeaders(MemorySegment segment, int statusCode, int contentTypeCode, String contentType, int bodyLen, boolean keepAlive) {
+    private static int writeHeaders(
+            MemorySegment segment,
+            int statusCode,
+            int contentTypeCode,
+            String contentType,
+            int bodyLen,
+            boolean keepAlive,
+            boolean keepAliveHeader) {
         long baseAddr = segment.address();
 
         if (statusCode == 200 && keepAlive) {
@@ -2483,8 +2922,12 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 RawSegment.copy(hdrAddr, baseAddr, hdrLen);
                 int offset = hdrLen;
                 offset = (int) dev.cardigan.json.JsonWriter.writeInt(segment, offset, bodyLen);
-                long connAddr = ADDR_POST_LENGTH_KA;
-                int connLen = LEN_POST_LENGTH_KA;
+                long connAddr = keepAliveHeader
+                    ? ADDR_POST_LENGTH_KA
+                    : ADDR_POST_LENGTH_DEFAULT;
+                int connLen = keepAliveHeader
+                    ? LEN_POST_LENGTH_KA
+                    : LEN_POST_LENGTH_DEFAULT;
                 RawSegment.copy(connAddr, baseAddr + offset, connLen);
                 return offset + connLen;
             }
@@ -2552,12 +2995,83 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         RawSegment.copy(ADDR_CRLF, baseAddr + offset, LEN_CRLF);
         offset += LEN_CRLF;
 
-        long connAddr = keepAlive ? ADDR_CONN_KA : ADDR_CONN_CLOSE;
-        int connLen = keepAlive ? LEN_CONN_KA : LEN_CONN_CLOSE;
-        RawSegment.copy(connAddr, baseAddr + offset, connLen);
-        offset += connLen;
+        return writeConnectionTerminator(
+            baseAddr, offset, keepAlive, keepAliveHeader);
+    }
 
-        return offset;
+    private static int fastHttp1HeaderLength(
+            int statusCode,
+            int contentTypeCode,
+            int bodyLength,
+            boolean keepAlive,
+            boolean keepAliveHeader) {
+        if (statusCode != 200 || !keepAlive || bodyLength < 0) {
+            return -1;
+        }
+        int prefixLength = switch (contentTypeCode) {
+            case Response.CT_TEXT -> LEN_HDR_200_TEXT;
+            case Response.CT_JSON -> LEN_HDR_200_JSON;
+            default -> -1;
+        };
+        if (prefixLength < 0) {
+            return -1;
+        }
+        int suffixLength = keepAliveHeader
+            ? LEN_POST_LENGTH_KA
+            : LEN_POST_LENGTH_DEFAULT;
+        return prefixLength + decimalLength(bodyLength) + suffixLength;
+    }
+
+    private static int decimalLength(int value) {
+        if (value < 10) {
+            return 1;
+        }
+        if (value < 100) {
+            return 2;
+        }
+        if (value < 1_000) {
+            return 3;
+        }
+        if (value < 10_000) {
+            return 4;
+        }
+        if (value < 100_000) {
+            return 5;
+        }
+        if (value < 1_000_000) {
+            return 6;
+        }
+        if (value < 10_000_000) {
+            return 7;
+        }
+        if (value < 100_000_000) {
+            return 8;
+        }
+        if (value < 1_000_000_000) {
+            return 9;
+        }
+        return 10;
+    }
+
+    private static int writeConnectionTerminator(
+            long address,
+            int offset,
+            boolean keepAlive,
+            boolean keepAliveHeader) {
+        long source;
+        int length;
+        if (!keepAlive) {
+            source = ADDR_CONN_CLOSE;
+            length = LEN_CONN_CLOSE;
+        } else if (keepAliveHeader) {
+            source = ADDR_CONN_KA;
+            length = LEN_CONN_KA;
+        } else {
+            source = ADDR_CRLF;
+            length = LEN_CRLF;
+        }
+        RawSegment.copy(source, address + offset, length);
+        return offset + length;
     }
 
     @Override
@@ -2607,6 +3121,46 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 "HTTP/2 resource stats: "
                     + Http2ResourceStats.snapshot().summary());
         }
+        if (Http1CqeDriverStats.ENABLED) {
+            System.out.println(
+                "HTTP/1 CQE driver stats: "
+                    + http1CqeDriverStats.snapshot().summary());
+        }
+        if (UringEventLoop.VIRTUAL_THREAD_STATS_ENABLED) {
+            long coreMounts = 0;
+            long coreUnmounts = 0;
+            long handlerMounts = 0;
+            long handlerUnmounts = 0;
+            for (UringEventLoop loop : eventLoops) {
+                UringEventLoop.VirtualThreadStats stats =
+                    loop.virtualThreadStats();
+                coreMounts += stats.coreMounts();
+                coreUnmounts += stats.coreUnmounts();
+                handlerMounts += stats.handlerMounts();
+                handlerUnmounts += stats.handlerUnmounts();
+            }
+            long mounts = coreMounts + handlerMounts;
+            long unmounts = coreUnmounts + handlerUnmounts;
+            long drivenRequests = Http1CqeDriverStats.ENABLED
+                ? http1CqeDriverStats.snapshot().drivenRequests()
+                : 0;
+            String mountsPerRequest = drivenRequests == 0
+                ? "n/a"
+                : String.format(
+                    Locale.ROOT,
+                    "%.6f",
+                    (double) mounts / drivenRequests);
+            System.out.println(
+                "Virtual-thread mount stats: core=" + coreMounts
+                    + ", core-unmounts=" + coreUnmounts
+                    + ", handlers=" + handlerMounts
+                    + ", handler-unmounts=" + handlerUnmounts
+                    + ", total-mounts=" + mounts
+                    + ", total-unmounts=" + unmounts
+                    + ", driven-requests=" + drivenRequests
+                    + ", mounts-per-driven-request="
+                    + mountsPerRequest);
+        }
 
         IllegalStateException loopCloseFailure = null;
         for (UringEventLoop loop : eventLoops) {
@@ -2620,19 +3174,6 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 } else {
                     loopCloseFailure.addSuppressed(e);
                 }
-            }
-        }
-        if (loopCloseFailure == null) {
-            if (EgressBufferPool.STATS_ENABLED) {
-                System.out.println(
-                    "Egress buffer pool: "
-                        + egressBufferPool.stats().summary());
-            }
-            try {
-                egressBufferPool.close();
-            } catch (Exception e) {
-                loopCloseFailure = new IllegalStateException(
-                    "Egress buffer pool could not be closed safely", e);
             }
         }
         if (loopCloseFailure != null) {

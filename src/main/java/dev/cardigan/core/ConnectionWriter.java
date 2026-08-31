@@ -46,9 +46,13 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
     private MemorySegment[] references;
     private int queueHead;
     private int queueSize;
+    private int appendReservationIndex = -1;
+    private int appendReservationOffset;
+    private int appendReservationCapacity;
 
     private boolean startScheduled;
     private boolean sendInFlight;
+    private int inFlightBufferId = -1;
     private int inFlightFrameCount;
     private int inFlightBufferCount;
     private int[] inFlightBufferIds;
@@ -87,7 +91,11 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         return loop;
     }
 
-    boolean enqueue(int bufferId, int length) {
+    /**
+     * Consumes an owned reactor buffer whether the frame is accepted or the
+     * writer has already failed.
+     */
+    boolean enqueueOwned(int bufferId, int length) {
         return enqueue(
             bufferId,
             loop.getEgressBufferSegment(bufferId).address(),
@@ -107,6 +115,74 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         return enqueue(-1, segment.address() + offset, length, segment);
     }
 
+    /**
+     * Reserves the unused tail of the final queued owned buffer. The returned
+     * slice remains exclusively mutable until it is committed or aborted.
+     */
+    MemorySegment beginOwnedAppend(int maximumLength) {
+        if (maximumLength <= 0
+                || maximumLength > UringEventLoop.EGRESS_FRAME_SIZE) {
+            throw new IllegalArgumentException(
+                "Invalid append reservation length: " + maximumLength);
+        }
+        if (!loop.inCarrierDomain()) {
+            throw new IllegalStateException(
+                "Owned appends must run on the writer's event loop");
+        }
+        if (appendReservationIndex >= 0) {
+            throw new IllegalStateException(
+                "An owned append reservation is already active");
+        }
+        if (failure != 0 || queueSize == 0) {
+            return null;
+        }
+
+        int index = (queueHead + queueSize - 1) & (bufferIds.length - 1);
+        int bufferId = bufferIds[index];
+        int offset = lengths[index];
+        int capacity = UringEventLoop.EGRESS_FRAME_SIZE - offset;
+        if (bufferId < 0 || references[index] != null
+                || maximumLength > capacity) {
+            return null;
+        }
+
+        appendReservationIndex = index;
+        appendReservationOffset = offset;
+        appendReservationCapacity = maximumLength;
+        return loop.getEgressBufferSegment(bufferId)
+            .asSlice(offset, maximumLength);
+    }
+
+    void commitOwnedAppend(int length) {
+        int index = appendReservationIndex;
+        if (index < 0) {
+            throw new IllegalStateException(
+                "No owned append reservation is active");
+        }
+        if (length <= 0 || length > appendReservationCapacity) {
+            throw new IllegalArgumentException(
+                "Invalid committed append length: " + length);
+        }
+        if (lengths[index] != appendReservationOffset) {
+            throw new IllegalStateException(
+                "The queued append target changed during encoding");
+        }
+        lengths[index] = appendReservationOffset + length;
+        clearAppendReservation();
+    }
+
+    void abortOwnedAppend() {
+        if (appendReservationIndex >= 0) {
+            clearAppendReservation();
+        }
+    }
+
+    private void clearAppendReservation() {
+        appendReservationIndex = -1;
+        appendReservationOffset = 0;
+        appendReservationCapacity = 0;
+    }
+
     private boolean enqueue(int bufferId, long address, int length,
                             MemorySegment reference) {
         if (failure != 0) {
@@ -120,7 +196,13 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         addQueued(bufferId, address, length, reference);
         if (!sendInFlight && !startScheduled) {
             startScheduled = true;
-            loop.executeEgress(this);
+            try {
+                loop.executeEgress(this);
+            } catch (Throwable failure) {
+                startScheduled = false;
+                fail(-5);
+                return false;
+            }
         }
         return true;
     }
@@ -192,7 +274,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
             return;
         }
 
-        releaseInFlightVectorBuffers();
+        retireInFlightBuffers();
         inFlightReference = null;
         sendInFlight = false;
         setPendingFrames(pendingFrames() - inFlightFrameCount);
@@ -224,7 +306,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
                            MemorySegment reference) {
         if (tls != null && !directKtlsSend) {
             ensureVectorStorage();
-            inFlightBufferIds[0] = bufferId;
+            inFlightBufferIds[0] = -1;
             inFlightAddresses[0] = address;
             inFlightLengths[0] = length;
             inFlightReferences[0] = reference;
@@ -244,7 +326,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
             : reference.asSlice(address - reference.address(), length);
         inFlightReference = reference;
         boolean submitted = loop.writeAsync(
-            clientFd, buffer, length, fixedSlot, bufferId, this);
+            clientFd, buffer, length, fixedSlot, this);
         if (submitted && directKtlsSend && TlsStats.ENABLED) {
             TlsStats.directSend(1);
         }
@@ -369,6 +451,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         inFlightFrameCount = frameCount;
         boolean submitted;
         if (vectorCount == 1) {
+            inFlightBufferId = bufferId;
             submitted = submit(bufferId, address, length, reference);
         } else {
             inFlightBufferCount = vectorCount;
@@ -377,14 +460,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         if (!submitted) {
             sendInFlight = false;
             inFlightFrameCount = 0;
-            if (vectorCount == 1) {
-                inFlightReference = null;
-                if (bufferId >= 0) {
-                    loop.releaseEgressBuffer(bufferId);
-                }
-            } else {
-                releaseInFlightVectorBuffers();
-            }
+            retireInFlightBuffers();
             setPendingFrames(pendingFrames() - frameCount);
             fail(-5);
         }
@@ -400,7 +476,11 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         }
     }
 
-    private void releaseInFlightVectorBuffers() {
+    private void retireInFlightBuffers() {
+        if (inFlightBufferId >= 0) {
+            loop.releaseEgressBuffer(inFlightBufferId);
+            inFlightBufferId = -1;
+        }
         for (int i = 0; i < inFlightBufferCount; i++) {
             int bufferId = inFlightBufferIds[i];
             if (bufferId >= 0) {
@@ -409,6 +489,9 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
             inFlightReferences[i] = null;
         }
         inFlightBufferCount = 0;
+        if (inFlightReferences != null) {
+            inFlightReferences[0] = null;
+        }
     }
 
     private void addQueued(int bufferId, long address, int length,

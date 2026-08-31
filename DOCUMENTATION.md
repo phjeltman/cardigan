@@ -5,6 +5,59 @@ when the host stack can provide it. It is an experimental, Linux-specific
 framework requiring JDK 26, the incubating Vector API, native access, OpenSSL 3
 for TLS, and a Linux kernel with the io_uring features listed below.
 
+The wire protocols and core transport have substantial correctness and stress
+coverage. The public API, configuration surface, packaging, and operational
+diagnostics remain experimental.
+
+## Requirements
+
+- 64-bit Linux; x86-64 is the regularly exercised target.
+- Linux 6.1 or newer with the required io_uring operations and TCP listener
+  options described below. Direct kTLS is optional.
+- JDK 26 with the incubating Vector API.
+- Maven 3.9 or newer.
+- OpenSSL 3 at runtime when TLS is enabled.
+- `wrk` and `h2load` for live benchmarks; `h2spec` for HTTP/2 conformance.
+
+## Maven dependency
+
+```xml
+<dependency>
+    <groupId>dev.cardigan</groupId>
+    <artifactId>cardigan</artifactId>
+    <version>0.1.0-alpha.4</version>
+</dependency>
+```
+
+## Running a server
+
+The development executable starts demonstration and benchmark routes on port
+8080:
+
+```sh
+./dev/example-server/run.sh
+```
+
+Its classes live under `dev/example-server` and are not part of the framework
+artifact. Consumers configure their own listener and route set:
+
+```java
+try (CardiganServer server = CardiganServer.builder()
+        .port(8080)
+        .eventLoops(4)
+        .protocol(ProtocolMode.HTTP1_AND_HTTP2)
+        .routes(new ApplicationController())
+        .build()) {
+    server.start();
+    Thread.currentThread().join();
+}
+```
+
+The server installs no implicit routes. TLS is selected with `.tls(config)`;
+the example launcher uses `.tlsFromSystemProperties()` for script
+compatibility. The HttpArena consumer is an independent Maven project under
+[`dev/httparena`](dev/httparena/README.md).
+
 ## Transport and execution model
 
 Cardigan drives io_uring directly through Panama. Ring geometry and mapping
@@ -75,6 +128,12 @@ or `registerController(...)`. Ordinary handlers may use straight-line blocking
 code: operations such as request-body reads and flow-controlled writes park the
 virtual thread without blocking the event loop.
 
+Small, bounded binary protocol messages can bind a sole primitive `long`
+handler argument with `@DecodedBody(SomeLongBodyDecoder.class)`. The decoder
+runs against the complete buffered body on the connection owner before
+handover, avoiding request retention and copying. It must be bounded,
+non-blocking, thread-safe, and must not retain the supplied memory segment.
+
 `@Isolated` is an escape hatch for CPU-intensive or otherwise untrusted
 blocking work. It runs the handler on a separate carrier pool and therefore
 costs more than an ordinary route.
@@ -134,14 +193,14 @@ they are not dynamically reloadable. Defaults remain experimental.
 | `cardigan.max.request.size` | 10 MiB | Maximum retained request |
 | `cardigan.max.header.size` | 8 KiB | Maximum HTTP/1 header block |
 | `cardigan.http1.max.inflight` | 128 | Exchanges admitted per connection |
+| `cardigan.http1.cqeDriver` | `true` | Drive eligible HTTP/1 requests from receive completions |
+| `cardigan.http1.directBatch` | `true` | Encode ordered pipelined responses into available queued-buffer capacity |
 | `cardigan.http2.max.concurrent.streams` | 128 | Concurrent streams per connection |
 | `cardigan.http2.max.header.list.size` | 16 KiB | Decoded header-list limit |
 | `cardigan.http2.max.streaming.bodies.per.connection` | 16 | Streaming request bodies per connection |
 | `cardigan.http2.max.streaming.buffer.bytes` | 256 MiB | Process-wide streaming-buffer budget |
 | `cardigan.ingress.buffers.per.loop` | 128 | 16 KiB provided receive buffers per event loop; power of two |
-| `cardigan.egress.buffers.per.loop` | 4096 | Private 16 KiB response buffers per event loop; power of two from 128 to 32768 and never below ingress capacity |
-| `cardigan.egress.buffers.max` | max(4096, 256 x event loops) | Process-wide lazily allocated egress-buffer limit |
-| `cardigan.egress.pool.stats` | `false` | Report shared egress-pool occupancy and batch counters |
+| `cardigan.egress.buffers.per.loop` | 4096 | Logical per-loop response-buffer limit; power of two from 128 to 32768 and never below ingress capacity |
 | `cardigan.fixed.files.mode` | `auto` | `auto`, `legacy`, `async-explicit`, `async-alloc`, or `direct`; auto uses direct plaintext accept and async allocation for TLS |
 | `cardigan.fixed.files.capacity` | 8192 | Registered socket slots per event loop |
 | `cardigan.max.tasks` | 2 x fixed-file capacity + SQ entries | io_uring task slots per event loop |
@@ -164,13 +223,20 @@ they are not dynamically reloadable. Defaults remain experimental.
 | `cardigan.tls.handshake.timeout.millis` | 10000 | TLS handshake deadline |
 | `cardigan.openssl.libraryDir` | empty | Optional system OpenSSL library directory |
 | `cardigan.tls.stats` | `false` | Report TLS counters at shutdown |
-| `cardigan.http2.resource.stats` | `false` | Report HTTP/2 resource high-water marks |
+| `cardigan.http2.resource.stats` | `false` | Report transport and HTTP/2 resource high-water marks |
 
-The egress pool, fixed-file table, io_uring task pool, exchange queue, and
-retained-worker limit are resource capacities. They bound admission and
-storage; they do not select or tune the scheduler's epoch policy.
+The per-loop egress buffers, fixed-file table, io_uring task pool, exchange
+queue, and retained-worker limit are resource capacities. They bound admission
+and storage; they do not select or tune the scheduler's epoch policy.
+
+Egress capacity is a logical per-loop limit backed by native memory in
+grow-only 64-buffer slabs. Each event loop allocates slabs on demand and
+retains them until the loop closes.
 
 ## Validation
+
+Compile and run the portable unit tier with `mvn test`. Live transport tests
+require a compatible Linux/io_uring host.
 
 ```sh
 mvn test                         # deterministic unit tests
@@ -180,6 +246,35 @@ mvn -Padvanced-tls-tests test    # TLS 1.3 KeyUpdate tests
 mvn -Pstress-tests test          # resource-heavy tests
 mvn -Pall-tests test             # every JUnit tier
 ./dev/verification/h2spec.sh     # HTTP/2 conformance
+```
+
+Quick live benchmark examples:
+
+```sh
+./dev/benchmarks/benchmark.sh --cpus=2 --duration=10s --endpoint=1
+./dev/benchmarks/benchmark.sh --http2 --http2-streams=16 --cpus=2 --duration=10s --endpoint=1
+./dev/benchmarks/benchmark.sh --tls --http2 --http2-streams=16 --cpus=2 --duration=10s --endpoint=1
+```
+
+`dev/benchmarks/benchmark.sh --help` documents protocol, pipeline, streaming,
+microbenchmark, and profiling modes. Benchmark results are meaningful when the
+server and client CPU placement, protocol concurrency, and payload remain
+comparable.
+
+Independent results from HttpArena's 64-core reference host are available in
+the [overall Engine composite](https://www.http-arena.com/#scope=all&type=engine),
+[HTTP/1 Engine results](https://www.http-arena.com/#type=engine), and
+[HTTP/2 Engine results](https://www.http-arena.com/#scope=h2&type=engine).
+HttpArena scores unimplemented profiles as zero, so its composite rankings
+measure profile coverage as well as performance; use the individual profile
+tables for like-for-like comparisons.
+
+Microbenchmark and probe sources live outside the runtime artifact under
+`dev/benchmarks/src/main/java`. Compile them through the development reactor
+with:
+
+```sh
+mvn -f dev/pom.xml -pl :cardigan-benchmarks -am test
 ```
 
 Contributor applications and benchmarks are built through `dev/pom.xml` and
@@ -256,3 +351,10 @@ mvn -Ppublication,central clean deploy
 
 Automatic publication is disabled; an uploaded bundle still requires review
 in the Central Portal.
+
+## License
+
+Cardigan-authored source is licensed under the
+[Mozilla Public License 2.0](LICENSE). Ports and adaptations of third-party
+code retain their applicable upstream licenses and notices; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

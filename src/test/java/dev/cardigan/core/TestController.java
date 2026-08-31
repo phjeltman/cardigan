@@ -2,6 +2,7 @@
 
 package dev.cardigan.core;
 
+import dev.cardigan.http.EncodedBody;
 import dev.cardigan.http.Get;
 import dev.cardigan.http.Isolated;
 import dev.cardigan.http.Post;
@@ -18,6 +19,14 @@ import java.lang.foreign.ValueLayout;
 final class TestController {
     private static final StaticBody LARGE_PAYLOAD = StaticBody.utf8(
         "A".repeat(65_536));
+    private static final byte[] DIRECT_ENCODED_BYTES =
+        "encoded".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+    private static final Response DIRECT_ENCODED_RESPONSE = Response.encoded(
+        "text/plain",
+        EncodedBody.of(DIRECT_ENCODED_BYTES.length, destination -> {
+            destination.copyFrom(MemorySegment.ofArray(DIRECT_ENCODED_BYTES));
+            return DIRECT_ENCODED_BYTES.length;
+        }));
     private final int sleepMillis;
 
     TestController() {
@@ -49,6 +58,22 @@ final class TestController {
         return Response.bytes(
             "application/octet-stream",
             new byte[] {0, 1, 2, (byte) 0xfe, (byte) 0xff});
+    }
+
+    @Get("/direct/long/{value}")
+    public Response getDirectLong(long value) {
+        return Response.text(value);
+    }
+
+    @Get("/direct/empty")
+    public Response getDirectEmpty() {
+        return new Response(
+            200, "text/plain", Response.CT_TEXT, null);
+    }
+
+    @Get("/direct/encoded")
+    public Response getDirectEncoded() {
+        return DIRECT_ENCODED_RESPONSE;
     }
 
     @Get("/stream/{bytes}")

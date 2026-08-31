@@ -43,7 +43,6 @@ class UringCompletionDispatchIntegrationTest {
                 task.result = resultSentinel;
                 task.flags = flagsSentinel;
                 task.thread = threadSentinel;
-                task.egressId = -1;
                 task.vectorSlot = -1;
                 task.completionHandler = (result, flags, terminal) -> {
                     callbackResult.set(result);

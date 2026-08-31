@@ -247,15 +247,22 @@ class Http1ShallowInputTrampolineTest {
             Thread owner = connectionOwner(server);
             if (owner != null) {
                 last = owner.getStackTrace();
-                if (hasFrame(last, "receive")
-                        && hasClass(last, MultishotReceiver.class.getName())) {
+                boolean cqeDriver =
+                    CardiganServer.http1CqeDriverEnabled();
+                if (cqeDriver && hasFrame(last, "awaitOutcome")) {
+                    return last;
+                }
+                if (!cqeDriver
+                        && hasFrame(last, "receive")
+                        && hasClass(
+                            last, MultishotReceiver.class.getName())) {
                     return last;
                 }
             }
             Thread.sleep(2);
         }
         throw new AssertionError(
-            "connection owner did not park in MultishotReceiver.receive: "
+            "connection owner did not park in the configured H1 input driver: "
                 + java.util.Arrays.toString(last));
     }
 

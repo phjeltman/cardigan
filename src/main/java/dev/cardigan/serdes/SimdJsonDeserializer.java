@@ -37,6 +37,8 @@ public final class SimdJsonDeserializer {
     private long offset;
     private long maxOffset;
     private boolean mayContainEscapes = true;
+    private final int[] positionalBounds = new int[32];
+    private boolean positionalBoundsReady;
 
     public SimdJsonDeserializer() {
     }
@@ -61,6 +63,7 @@ public final class SimdJsonDeserializer {
         this.offset = 0;
         this.maxOffset = length;
         this.mayContainEscapes = mayContainEscapes;
+        this.positionalBoundsReady = false;
         Object base = segment.heapBase().orElse(null);
         if (base instanceof byte[] bytes) {
             this.heapBytes = bytes;
@@ -77,6 +80,14 @@ public final class SimdJsonDeserializer {
 
     public long getOffset() {
         return offset;
+    }
+
+    int[] positionalBounds() {
+        return positionalBounds;
+    }
+
+    void useValidatedPositionalBounds() {
+        positionalBoundsReady = true;
     }
 
     public boolean isNull() {
@@ -313,81 +324,111 @@ public final class SimdJsonDeserializer {
         boolean isNative = indexes.isNative();
         int[] idxArr = isNative ? null : indexes.indexes();
 
-        for (int i = 0; i < numFields; i++) {
-            int colonIdx = 1 + 2 * i;
-            int colonPos = isNative ? indexes.get(colonIdx) : idxArr[colonIdx];
-            byte c = (localBytes != null) ? localBytes[baseOff + colonPos] : seg.get(ValueLayout.JAVA_BYTE, colonPos);
-            if (c != ':') return null;
+        if (!positionalBoundsReady) {
+            for (int i = 0; i < numFields; i++) {
+                int colonIdx = 1 + 2 * i;
+                int colonPos = isNative
+                    ? indexes.get(colonIdx) : idxArr[colonIdx];
+                byte c = localBytes != null
+                    ? localBytes[baseOff + colonPos]
+                    : seg.get(ValueLayout.JAVA_BYTE, colonPos);
+                if (c != ':') return null;
 
-            int prevPos = isNative ? indexes.get(2 * i) : idxArr[2 * i];
-            int keyStart = prevPos + 1;
-            if (localBytes != null) {
-                while (keyStart < colonPos && (localBytes[baseOff + keyStart] & 0xFF) <= ' ') keyStart++;
-            } else {
-                while (keyStart < colonPos && (seg.get(ValueLayout.JAVA_BYTE, keyStart) & 0xFF) <= ' ') keyStart++;
-            }
-            if (keyStart >= colonPos) return null;
-
-            byte bStart = (localBytes != null) ? localBytes[baseOff + keyStart] : seg.get(ValueLayout.JAVA_BYTE, keyStart);
-            if (bStart != '"') return null;
-
-            int keyEnd = colonPos - 1;
-            if (localBytes != null) {
-                while (keyEnd > keyStart && (localBytes[baseOff + keyEnd] & 0xFF) <= ' ') keyEnd--;
-            } else {
-                while (keyEnd > keyStart && (seg.get(ValueLayout.JAVA_BYTE, keyEnd) & 0xFF) <= ' ') keyEnd--;
-            }
-            if (keyEnd <= keyStart) return null;
-
-            byte bEnd = (localBytes != null) ? localBytes[baseOff + keyEnd] : seg.get(ValueLayout.JAVA_BYTE, keyEnd);
-            if (bEnd != '"') return null;
-
-            int keyLen = keyEnd - (keyStart + 1);
-            if (keyLen != metadata.componentLengths[i]) return null;
-
-            long word;
-            int kStart = keyStart + 1;
-            if (localBytes != null) {
-                if (baseOff + kStart + 8 <= localBytes.length) {
-                    word = (long) BYTE_ARRAY_LONG_UNALIGNED.get(localBytes, baseOff + kStart);
+                int prevPos = isNative
+                    ? indexes.get(2 * i) : idxArr[2 * i];
+                int keyStart = prevPos + 1;
+                if (localBytes != null) {
+                    while (keyStart < colonPos
+                            && (localBytes[baseOff + keyStart] & 0xFF)
+                                <= ' ') keyStart++;
                 } else {
-                    word = 0;
-                    int limit = Math.min(keyLen, 8);
-                    for (int j = 0; j < limit; j++) {
-                        word |= ((long) (localBytes[baseOff + kStart + j] & 0xFF)) << (j * 8);
-                    }
+                    while (keyStart < colonPos
+                            && (seg.get(ValueLayout.JAVA_BYTE, keyStart)
+                                & 0xFF) <= ' ') keyStart++;
                 }
-            } else {
-                long addr = seg.address() + kStart;
-                word = RawSegment.getLong(addr, 0);
-            }
+                if (keyStart >= colonPos) return null;
+                byte bStart = localBytes != null
+                    ? localBytes[baseOff + keyStart]
+                    : seg.get(ValueLayout.JAVA_BYTE, keyStart);
+                if (bStart != '"') return null;
 
-            if ((word & metadata.componentMasks[i]) != metadata.componentLongs[i]) {
-                return null;
+                int keyEnd = colonPos - 1;
+                if (localBytes != null) {
+                    while (keyEnd > keyStart
+                            && (localBytes[baseOff + keyEnd] & 0xFF)
+                                <= ' ') keyEnd--;
+                } else {
+                    while (keyEnd > keyStart
+                            && (seg.get(ValueLayout.JAVA_BYTE, keyEnd)
+                                & 0xFF) <= ' ') keyEnd--;
+                }
+                if (keyEnd <= keyStart) return null;
+                byte bEnd = localBytes != null
+                    ? localBytes[baseOff + keyEnd]
+                    : seg.get(ValueLayout.JAVA_BYTE, keyEnd);
+                if (bEnd != '"') return null;
+
+                int nextPos = isNative
+                    ? indexes.get(2 * i + 2) : idxArr[2 * i + 2];
+                int valStart = colonPos + 1;
+                if (localBytes != null) {
+                    while (valStart < nextPos
+                            && (localBytes[baseOff + valStart] & 0xFF)
+                                <= ' ') valStart++;
+                } else {
+                    while (valStart < nextPos
+                            && (seg.get(ValueLayout.JAVA_BYTE, valStart)
+                                & 0xFF) <= ' ') valStart++;
+                }
+                int valEnd = nextPos - 1;
+                if (localBytes != null) {
+                    while (valEnd >= valStart
+                            && (localBytes[baseOff + valEnd] & 0xFF)
+                                <= ' ') valEnd--;
+                } else {
+                    while (valEnd >= valStart
+                            && (seg.get(ValueLayout.JAVA_BYTE, valEnd)
+                                & 0xFF) <= ' ') valEnd--;
+                }
+
+                int bound = i * 4;
+                positionalBounds[bound] = keyStart + 1;
+                positionalBounds[bound + 1] = keyEnd - keyStart - 1;
+                positionalBounds[bound + 2] = valStart;
+                positionalBounds[bound + 3] = valEnd + 1;
             }
         }
 
         Object a0 = null, a1 = null, a2 = null, a3 = null, a4 = null, a5 = null, a6 = null, a7 = null;
 
         for (int i = 0; i < numFields; i++) {
-            int colonIdx = 1 + 2 * i;
-            int colonPos = isNative ? indexes.get(colonIdx) : idxArr[colonIdx];
-            int nextPos = isNative ? indexes.get(2 * i + 2) : idxArr[2 * i + 2];
-
-            int valStart = colonPos + 1;
+            int bound = i * 4;
+            int keyStart = positionalBounds[bound];
+            int keyLen = positionalBounds[bound + 1];
+            if (keyLen != metadata.componentLengths[i]) return null;
+            long word;
             if (localBytes != null) {
-                while (valStart < nextPos && (localBytes[baseOff + valStart] & 0xFF) <= ' ') valStart++;
+                if (baseOff + keyStart + 8 <= localBytes.length) {
+                    word = (long) BYTE_ARRAY_LONG_UNALIGNED.get(
+                        localBytes, baseOff + keyStart);
+                } else {
+                    word = 0;
+                    int limit = Math.min(keyLen, 8);
+                    for (int j = 0; j < limit; j++) {
+                        word |= ((long) (localBytes[
+                            baseOff + keyStart + j] & 0xFF)) << (j * 8);
+                    }
+                }
             } else {
-                while (valStart < nextPos && (seg.get(ValueLayout.JAVA_BYTE, valStart) & 0xFF) <= ' ') valStart++;
+                word = RawSegment.getLong(seg.address() + keyStart, 0);
+            }
+            if ((word & metadata.componentMasks[i])
+                    != metadata.componentLongs[i]) {
+                return null;
             }
 
-            int valEnd = nextPos - 1;
-            if (localBytes != null) {
-                while (valEnd >= valStart && (localBytes[baseOff + valEnd] & 0xFF) <= ' ') valEnd--;
-            } else {
-                while (valEnd >= valStart && (seg.get(ValueLayout.JAVA_BYTE, valEnd) & 0xFF) <= ' ') valEnd--;
-            }
-            valEnd++;
+            int valStart = positionalBounds[bound + 2];
+            int valEnd = positionalBounds[bound + 3];
 
             int valLen = valEnd - valStart;
             byte firstByte = (localBytes != null) ? localBytes[baseOff + valStart] : seg.get(ValueLayout.JAVA_BYTE, valStart);

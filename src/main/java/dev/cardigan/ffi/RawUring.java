@@ -310,6 +310,11 @@ public final class RawUring implements AutoCloseable {
         return pendingSubmissionCount() != 0;
     }
 
+    /** Returns locally prepared SQEs that have not reached the shared SQ yet. */
+    public int unflushedSubmissionCount() {
+        return sqeTail - sqeHead;
+    }
+
     /** Returns whether deferred completion task work needs a kernel entry. */
     public boolean taskWorkPending() {
         int flags = (int) INT_HANDLE.getAcquire(sqFlags, 0L);

@@ -33,6 +33,9 @@ public final class JsonObject implements Iterable<Map.Entry<String, JsonValue>> 
     private final Tape tape;
     private final int startTapeIndex;
     private final int endTapeIndex;
+    private Map<String, Integer> indexedFields;
+    private int lookups;
+    private int fieldCount = -1;
 
     public JsonObject(MemorySegment segment, Tape tape, int startTapeIndex) {
         this.segment = segment;
@@ -42,6 +45,30 @@ public final class JsonObject implements Iterable<Map.Entry<String, JsonValue>> 
     }
 
     public JsonValue get(String key) {
+        JsonValue value = getOrNull(key);
+        if (value != null) {
+            return value;
+        }
+        throw new SimdJsonException(
+            SimdJsonError.NO_SUCH_FIELD,
+            "Key not found: " + key);
+    }
+
+    private JsonValue getOrNull(String key) {
+        Map<String, Integer> fields = indexedFields;
+        if (fields != null) {
+            Integer valueIndex = fields.get(key);
+            return valueIndex == null
+                ? null : new JsonValue(segment, tape, valueIndex);
+        }
+        if (++lookups >= 2) {
+            fields = indexFields();
+            indexedFields = fields;
+            Integer valueIndex = fields.get(key);
+            return valueIndex == null
+                ? null : new JsonValue(segment, tape, valueIndex);
+        }
+
         int current = startTapeIndex + 1;
         while (current < endTapeIndex) {
             char keyTag = tape.getTag(current);
@@ -59,22 +86,17 @@ public final class JsonObject implements Iterable<Map.Entry<String, JsonValue>> 
 
             current = skipValue(valIndex);
         }
-        throw new SimdJsonException(SimdJsonError.NO_SUCH_FIELD, "Key not found: " + key);
+        return null;
     }
 
     public boolean containsKey(String key) {
-        try {
-            get(key);
-            return true;
-        } catch (SimdJsonException e) {
-            if (e.getError() == SimdJsonError.NO_SUCH_FIELD) {
-                return false;
-            }
-            throw e;
-        }
+        return getOrNull(key) != null;
     }
 
     public int size() {
+        if (fieldCount >= 0) {
+            return fieldCount;
+        }
         int count = 0;
         int current = startTapeIndex + 1;
         while (current < endTapeIndex) {
@@ -82,21 +104,48 @@ public final class JsonObject implements Iterable<Map.Entry<String, JsonValue>> 
             int valIndex = current + 1;
             current = skipValue(valIndex);
         }
+        fieldCount = count;
         return count;
     }
 
     @Override
     public Iterator<Map.Entry<String, JsonValue>> iterator() {
-        List<Map.Entry<String, JsonValue>> entries = new ArrayList<>();
+        return new Iterator<>() {
+            private int current = startTapeIndex + 1;
+
+            @Override
+            public boolean hasNext() {
+                return current < endTapeIndex;
+            }
+
+            @Override
+            public Map.Entry<String, JsonValue> next() {
+                if (!hasNext()) {
+                    throw new NoSuchElementException();
+                }
+                JsonValue key = new JsonValue(segment, tape, current);
+                int valueIndex = current + 1;
+                JsonValue value = new JsonValue(
+                    segment, tape, valueIndex);
+                current = skipValue(valueIndex);
+                return Map.entry(key.getString(), value);
+            }
+        };
+    }
+
+    private Map<String, Integer> indexFields() {
+        Map<String, Integer> fields = new HashMap<>();
         int current = startTapeIndex + 1;
+        int count = 0;
         while (current < endTapeIndex) {
-            JsonValue keyVal = new JsonValue(segment, tape, current);
-            int valIndex = current + 1;
-            JsonValue val = new JsonValue(segment, tape, valIndex);
-            entries.add(Map.entry(keyVal.getString(), val));
-            current = skipValue(valIndex);
+            JsonValue key = new JsonValue(segment, tape, current);
+            int valueIndex = current + 1;
+            fields.putIfAbsent(key.getString(), valueIndex);
+            count++;
+            current = skipValue(valueIndex);
         }
-        return entries.iterator();
+        fieldCount = count;
+        return fields;
     }
 
     private int skipValue(int tapeIndex) {

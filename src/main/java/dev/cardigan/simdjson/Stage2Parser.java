@@ -773,8 +773,16 @@ public final class Stage2Parser {
             heapBytes, sourceAddress, start, end);
         int tokenEnd = trimWhitespace(
             heapBytes, sourceAddress, tokenStart, end);
-        return validateString(
+        return validateKeyToken(
             heapBytes, sourceAddress, tokenStart, tokenEnd,
+            mayContainBackslash);
+    }
+
+    static SimdJsonError validateKeyToken(
+            byte[] heapBytes, long sourceAddress,
+            int start, int end, boolean mayContainBackslash) {
+        return validateString(
+            heapBytes, sourceAddress, start, end,
             mayContainBackslash);
     }
 
@@ -845,6 +853,15 @@ public final class Stage2Parser {
             heapBytes, sourceAddress, start, end);
         int tokenEnd = trimWhitespace(
             heapBytes, sourceAddress, tokenStart, end);
+        return validateScalarToken(
+            heapBytes, sourceAddress, tokenStart, tokenEnd,
+            mayContainBackslash);
+    }
+
+    static SimdJsonError validateScalarToken(
+            byte[] heapBytes, long sourceAddress,
+            int tokenStart, int tokenEnd,
+            boolean mayContainBackslash) {
         if (tokenStart >= tokenEnd) {
             return SimdJsonError.TAPE_ERROR;
         }
@@ -1039,7 +1056,7 @@ public final class Stage2Parser {
             && getByte(heapBytes, sourceAddress, start + 4) == (byte) fifth;
     }
 
-    private static int skipWhitespace(
+    static int skipWhitespace(
             byte[] heapBytes, long sourceAddress,
             int start, int end) {
         int index = start;
@@ -1050,7 +1067,7 @@ public final class Stage2Parser {
         return index;
     }
 
-    private static int trimWhitespace(
+    static int trimWhitespace(
             byte[] heapBytes, long sourceAddress,
             int start, int end) {
         int index = end;

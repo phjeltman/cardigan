@@ -10,7 +10,6 @@ public class UringTask {
     public UringEventLoop.CompletionHandler completionHandler;
     public int result;
     public int flags;
-    public int egressId = -1;
     public int vectorSlot = -1;
     public int vectorIndex;
     public int vectorCount;

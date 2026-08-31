@@ -19,15 +19,17 @@ final class Exchange implements Runnable {
     private long id;
     private final PreparedInvocation invocation = new PreparedInvocation();
     private boolean keepAlive;
+    private boolean keepAliveHeader;
     private final Completion completion;
 
     Exchange(Completion completion) {
         this.completion = completion;
     }
 
-    void prepare(long id, boolean keepAlive) {
+    void prepare(long id, boolean keepAlive, boolean keepAliveHeader) {
         this.id = id;
         this.keepAlive = keepAlive;
+        this.keepAliveHeader = keepAliveHeader;
     }
 
     PreparedInvocation invocation() {
@@ -40,6 +42,10 @@ final class Exchange implements Runnable {
 
     boolean keepAlive() {
         return keepAlive;
+    }
+
+    boolean keepAliveHeader() {
+        return keepAliveHeader;
     }
 
     @Override

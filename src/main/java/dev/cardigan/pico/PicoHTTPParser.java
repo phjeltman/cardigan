@@ -39,30 +39,31 @@ import jdk.incubator.vector.VectorSpecies;
 public class PicoHTTPParser {
     public static final int ERROR_PARSE = -1;
     public static final int ERROR_PARTIAL = -2;
+    public static final int ERROR_CHUNKED_PAYLOAD_LIMIT = -3;
+    public static final int ERROR_CHUNKED_METADATA_LIMIT = -4;
+    public static final int CHUNKED_SPAN_DATA = 0;
+    public static final int CHUNKED_OUTPUT_FULL = 0;
+    public static final int CHUNKED_COMPLETE = 1;
 
     private static final ValueLayout.OfInt JAVA_INT_UNALIGNED_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
     private static final ValueLayout.OfLong JAVA_LONG_UNALIGNED_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfShort JAVA_SHORT_UNALIGNED_LE = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
-    private static final VectorSpecies<Byte> SPECIES = ByteVector.SPECIES_128;
+    private static final VectorSpecies<Byte> RANGE_SPECIES =
+        ByteVector.SPECIES_256;
+    private static final VectorSpecies<Byte> TOKEN_SPECIES =
+        ByteVector.SPECIES_128;
+    private static final int RANGE_VECTOR_WIDTH = RANGE_SPECIES.length();
+    private static final int TOKEN_VECTOR_WIDTH = TOKEN_SPECIES.length();
 
     // SIMD Nibble Shuffle Lookup Tables (vpshufb via selectFrom)
-    private static final byte[] R1_LOW = { (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x02, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x03, (byte) 0x07 };
-    private static final byte[] R1_HIGH = { (byte) 0x01, (byte) 0x02, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x04, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00 };
-
-    private static final byte[] R2_LOW = { (byte) 0x03, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x05 };
-    private static final byte[] R2_HIGH = { (byte) 0x01, (byte) 0x01, (byte) 0x02, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x04, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00 };
-
     private static final byte[] RT_LOW = { (byte) 0x0b, (byte) 0x01, (byte) 0x03, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x03, (byte) 0x03, (byte) 0x05, (byte) 0x35, (byte) 0x17, (byte) 0x35, (byte) 0x05, (byte) 0x27 };
     private static final byte[] RT_HIGH = { (byte) 0x01, (byte) 0x01, (byte) 0x02, (byte) 0x04, (byte) 0x08, (byte) 0x10, (byte) 0x00, (byte) 0x20, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01, (byte) 0x01 };
 
-    private static final ByteVector V_R1_LOW = ByteVector.fromArray(SPECIES, R1_LOW, 0);
-    private static final ByteVector V_R1_HIGH = ByteVector.fromArray(SPECIES, R1_HIGH, 0);
-
-    private static final ByteVector V_R2_LOW = ByteVector.fromArray(SPECIES, R2_LOW, 0);
-    private static final ByteVector V_R2_HIGH = ByteVector.fromArray(SPECIES, R2_HIGH, 0);
-
-    private static final ByteVector V_RT_LOW = ByteVector.fromArray(SPECIES, RT_LOW, 0);
-    private static final ByteVector V_RT_HIGH = ByteVector.fromArray(SPECIES, RT_HIGH, 0);
+    private static final ByteVector V_RT_LOW =
+        ByteVector.fromArray(TOKEN_SPECIES, RT_LOW, 0);
+    private static final ByteVector V_RT_HIGH =
+        ByteVector.fromArray(TOKEN_SPECIES, RT_HIGH, 0);
 
     private static final boolean[] TOKEN_CHAR_MAP = new boolean[256];
     static {
@@ -96,19 +97,16 @@ public class PicoHTTPParser {
                                                long offset, long limit) {
         long i = offset;
         long len = limit - offset;
-        if (len >= 16) {
-            long left = len & ~15;
+        if (len >= RANGE_VECTOR_WIDTH) {
+            long left = len - len % RANGE_VECTOR_WIDTH;
             long end = offset + left;
-            for (; i < end; i += 16) {
+            for (; i < end; i += RANGE_VECTOR_WIDTH) {
                 ByteVector v = ByteVector.fromMemorySegment(
-                    SPECIES, ms, base + i, ByteOrder.nativeOrder());
-                ByteVector lowIdx = v.and((byte) 0x0F);
-                ByteVector highIdx = v.lanewise(VectorOperators.LSHR, 4).and((byte) 0x0F);
-
-                ByteVector lowMask = lowIdx.selectFrom(V_R1_LOW);
-                ByteVector highMask = highIdx.selectFrom(V_R1_HIGH);
-
-                VectorMask<Byte> match = lowMask.and(highMask).compare(VectorOperators.NE, (byte) 0);
+                    RANGE_SPECIES, ms, base + i, ByteOrder.nativeOrder());
+                VectorMask<Byte> match = v.compare(
+                    VectorOperators.ULT, (byte) 0x20).and(
+                        v.compare(VectorOperators.NE, (byte) '\t')).or(
+                            v.compare(VectorOperators.EQ, (byte) 0x7f));
                 if (match.anyTrue()) {
                     return i + match.firstTrue();
                 }
@@ -136,19 +134,15 @@ public class PicoHTTPParser {
                                                long offset, long limit) {
         long i = offset;
         long len = limit - offset;
-        if (len >= 16) {
-            long left = len & ~15;
+        if (len >= RANGE_VECTOR_WIDTH) {
+            long left = len - len % RANGE_VECTOR_WIDTH;
             long end = offset + left;
-            for (; i < end; i += 16) {
+            for (; i < end; i += RANGE_VECTOR_WIDTH) {
                 ByteVector v = ByteVector.fromMemorySegment(
-                    SPECIES, ms, base + i, ByteOrder.nativeOrder());
-                ByteVector lowIdx = v.and((byte) 0x0F);
-                ByteVector highIdx = v.lanewise(VectorOperators.LSHR, 4).and((byte) 0x0F);
-
-                ByteVector lowMask = lowIdx.selectFrom(V_R2_LOW);
-                ByteVector highMask = highIdx.selectFrom(V_R2_HIGH);
-
-                VectorMask<Byte> match = lowMask.and(highMask).compare(VectorOperators.NE, (byte) 0);
+                    RANGE_SPECIES, ms, base + i, ByteOrder.nativeOrder());
+                VectorMask<Byte> match = v.compare(
+                    VectorOperators.ULE, (byte) 0x20).or(
+                        v.compare(VectorOperators.EQ, (byte) 0x7f));
                 if (match.anyTrue()) {
                     return i + match.firstTrue();
                 }
@@ -172,14 +166,15 @@ public class PicoHTTPParser {
                                             long offset, long limit) {
         long i = offset;
         long len = limit - offset;
-        if (len >= 16) {
-            long left = len & ~15;
+        if (len >= TOKEN_VECTOR_WIDTH) {
+            long left = len - len % TOKEN_VECTOR_WIDTH;
             long end = offset + left;
-            for (; i < end; i += 16) {
+            for (; i < end; i += TOKEN_VECTOR_WIDTH) {
                 ByteVector v = ByteVector.fromMemorySegment(
-                    SPECIES, ms, base + i, ByteOrder.nativeOrder());
+                    TOKEN_SPECIES, ms, base + i, ByteOrder.nativeOrder());
                 ByteVector lowIdx = v.and((byte) 0x0F);
-                ByteVector highIdx = v.lanewise(VectorOperators.LSHR, 4).and((byte) 0x0F);
+                ByteVector highIdx = v.lanewise(VectorOperators.LSHR, 4)
+                    .and((byte) 0x0F);
 
                 ByteVector lowMask = lowIdx.selectFrom(V_RT_LOW);
                 ByteVector highMask = highIdx.selectFrom(V_RT_HIGH);
@@ -370,19 +365,19 @@ public class PicoHTTPParser {
         int numHeaders = 0;
         while (true) {
             if (i == limit) {
-                if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                return -2;
+                return finishHeaders(
+                    req, res, outNumHeaders, numHeaders, -2);
             }
             byte currentByte = ms.get(ValueLayout.JAVA_BYTE, base + i);
             if (currentByte == (byte) '\r') {
                 i++;
                 if (i == limit) {
-                    if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                    return -2;
+                    return finishHeaders(
+                        req, res, outNumHeaders, numHeaders, -2);
                 }
                 if (ms.get(ValueLayout.JAVA_BYTE, base + i) != (byte) '\n') {
-                    if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                    return -1;
+                    return finishHeaders(
+                        req, res, outNumHeaders, numHeaders, -1);
                 }
                 i++;
                 break;
@@ -391,29 +386,29 @@ public class PicoHTTPParser {
                 break;
             }
             if (numHeaders == maxHeaders) {
-                if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                return -1;
+                return finishHeaders(
+                    req, res, outNumHeaders, numHeaders, -1);
             }
             Header h = headers[numHeaders];
             byte headByte = ms.get(ValueLayout.JAVA_BYTE, base + i);
             if (!(numHeaders != 0 && (headByte == (byte) ' ' || headByte == (byte) '\t'))) {
                 long colonIndex = parseToken(ms, base, i, limit, (byte) ':');
                 if (colonIndex < 0) {
-                    if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                    return colonIndex;
+                    return finishHeaders(
+                        req, res, outNumHeaders, numHeaders, colonIndex);
                 }
                 long nameLen = colonIndex - i;
                 if (nameLen == 0) {
-                    if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                    return -1;
+                    return finishHeaders(
+                        req, res, outNumHeaders, numHeaders, -1);
                 }
                 h.nameOffset = i;
                 h.nameLen = nameLen;
                 i = colonIndex + 1; // skip ':'
                 while (true) {
                     if (i == limit) {
-                        if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                        return -2;
+                        return finishHeaders(
+                            req, res, outNumHeaders, numHeaders, -2);
                     }
                     byte b = ms.get(ValueLayout.JAVA_BYTE, base + i);
                     if (b != (byte) ' ' && b != (byte) '\t') {
@@ -428,8 +423,8 @@ public class PicoHTTPParser {
 
             long valRes = getTokenToEol(ms, base, i, limit);
             if (valRes < 0) {
-                if (outNumHeaders != null) outNumHeaders[0] = numHeaders;
-                return valRes;
+                return finishHeaders(
+                    req, res, outNumHeaders, numHeaders, valRes);
             }
             long valLen = valRes >>> 32;
             long nextOffset = valRes & 0xFFFFFFFFL;
@@ -446,19 +441,127 @@ public class PicoHTTPParser {
             h.valueOffset = i;
             h.valueLen = valEnd - i;
 
+            if (req != null && h.nameOffset >= 0) {
+                classifyFramingHeader(
+                    ms, base, h.nameOffset, h.nameLen,
+                    numHeaders, req);
+            }
+
             i = nextOffset;
             numHeaders++;
-            if (req != null) {
-                req.numHeaders = numHeaders;
+        }
+        return finishHeaders(
+            req, res, outNumHeaders, numHeaders, i);
+    }
+
+    private static long finishHeaders(
+            Request req, Response res, int[] outNumHeaders,
+            int numHeaders, long result) {
+        if (req != null) {
+            req.numHeaders = numHeaders;
+        } else if (res != null) {
+            res.numHeaders = numHeaders;
+        } else {
+            outNumHeaders[0] = numHeaders;
+        }
+        return result;
+    }
+
+    private static void classifyFramingHeader(
+            MemorySegment ms, long base, long offset, long length,
+            int headerIndex, Request req) {
+        switch ((int) length) {
+            case 6 -> {
+                if (equalsLowercaseAscii6(
+                        ms, base + offset,
+                        0x65707865, 0x7463)) { // "expect"
+                    recordFramingHeader(
+                        req, Request.FRAMING_EXPECT_SHIFT,
+                        headerIndex, true);
+                }
             }
-            if (res != null) {
-                res.numHeaders = numHeaders;
+            case 10 -> {
+                if (equalsLowercaseAscii10(
+                        ms, base + offset,
+                        0x697463656e6e6f63L, 0x6e6f)) { // "connection"
+                    recordFramingHeader(
+                        req, Request.FRAMING_CONNECTION_SHIFT,
+                        headerIndex, false);
+                }
             }
-            if (outNumHeaders != null) {
-                outNumHeaders[0] = numHeaders;
+            case 14 -> {
+                if (equalsLowercaseAscii14(
+                        ms, base + offset,
+                        0x2d746e65746e6f63L,
+                        0x676e656c, 0x6874)) { // "content-length"
+                    recordFramingHeader(
+                        req, Request.FRAMING_CONTENT_LENGTH_SHIFT,
+                        headerIndex, true);
+                }
+            }
+            case 17 -> {
+                if (equalsLowercaseAscii17(
+                        ms, base + offset,
+                        0x726566736e617274L,
+                        0x6e69646f636e652dL, 0x67)) { // "transfer-encoding"
+                    recordFramingHeader(
+                        req, Request.FRAMING_TRANSFER_ENCODING_SHIFT,
+                        headerIndex, true);
+                }
+            }
+            default -> {
             }
         }
-        return i;
+    }
+
+    private static void recordFramingHeader(
+            Request req, int shift, int headerIndex,
+            boolean recordDuplicate) {
+        long lane = (req.framingHeaders >>> shift) & 0xffffL;
+        if ((lane & Request.FRAMING_INDEX_MASK) == 0) {
+            req.framingHeaders |= (long) (headerIndex + 1) << shift;
+        } else if (recordDuplicate) {
+            req.framingHeaders |=
+                Request.FRAMING_DUPLICATE_MASK << shift;
+        }
+    }
+
+    private static boolean equalsLowercaseAscii6(
+            MemorySegment ms, long offset, int first, int second) {
+        return (ms.get(JAVA_INT_UNALIGNED_LE, offset)
+                    | 0x20202020) == first
+            && ((ms.get(JAVA_SHORT_UNALIGNED_LE, offset + 4) & 0xffff)
+                    | 0x2020) == second;
+    }
+
+    private static boolean equalsLowercaseAscii10(
+            MemorySegment ms, long offset, long first, int second) {
+        return (ms.get(JAVA_LONG_UNALIGNED_LE, offset)
+                    | 0x2020202020202020L) == first
+            && ((ms.get(JAVA_SHORT_UNALIGNED_LE, offset + 8) & 0xffff)
+                    | 0x2020) == second;
+    }
+
+    private static boolean equalsLowercaseAscii14(
+            MemorySegment ms, long offset,
+            long first, int second, int third) {
+        return (ms.get(JAVA_LONG_UNALIGNED_LE, offset)
+                    | 0x2020202020202020L) == first
+            && (ms.get(JAVA_INT_UNALIGNED_LE, offset + 8)
+                    | 0x20202020) == second
+            && ((ms.get(JAVA_SHORT_UNALIGNED_LE, offset + 12) & 0xffff)
+                    | 0x2020) == third;
+    }
+
+    private static boolean equalsLowercaseAscii17(
+            MemorySegment ms, long offset,
+            long first, long second, int third) {
+        return (ms.get(JAVA_LONG_UNALIGNED_LE, offset)
+                    | 0x2020202020202020L) == first
+            && (ms.get(JAVA_LONG_UNALIGNED_LE, offset + 8)
+                    | 0x2020202020202020L) == second
+            && ((ms.get(ValueLayout.JAVA_BYTE, offset + 16) & 0xff)
+                    | 0x20) == third;
     }
 
     public static long parseRequest(MemorySegment ms, long offset, long limit, Request req, long lastLen) {
@@ -776,18 +879,120 @@ public class PicoHTTPParser {
             & ~value & 0x8080808080808080L;
     }
 
-    public static long decodeChunked(ChunkedDecoder decoder, MemorySegment ms, long offset, long[] bufsz) {
+    public static long decodeChunked(
+        ChunkedDecoder decoder,
+        MemorySegment ms,
+        long offset,
+        long[] bufsz
+    ) {
+        return decodeChunkedInternal(
+            decoder, ms, offset, bufsz[0], bufsz, null,
+            null, 0, 0, 0, 0);
+    }
+
+    /**
+     * Advances chunk framing without compacting payload bytes. {@code span[0]}
+     * receives the number of input bytes consumed and {@code span[1]} the
+     * trailing payload bytes within that consumed prefix. A data result always
+     * ends at the consumed offset, so its payload begins at
+     * {@code offset + span[0] - span[1]}.
+     * Returns {@link #CHUNKED_SPAN_DATA}, {@link #CHUNKED_COMPLETE},
+     * {@link #ERROR_PARTIAL}, or {@link #ERROR_PARSE}.
+     */
+    public static int decodeChunkedSpan(
+        ChunkedDecoder decoder,
+        MemorySegment ms,
+        long offset,
+        long inputLength,
+        long[] span
+    ) {
+        if (span.length < 2) {
+            throw new IllegalArgumentException(
+                "Chunked span output requires two elements");
+        }
+        return (int) decodeChunkedInternal(
+            decoder, ms, offset, inputLength, null, span,
+            null, 0, 0, 0, 0);
+    }
+
+    /**
+     * Decodes payload directly from the framed input into {@code destination}.
+     * {@code progress[0]} receives consumed input bytes and
+     * {@code progress[1]} produced payload bytes. The decoder stops when the
+     * input or destination is exhausted, the message completes, or a limit is
+     * exceeded. Returns {@link #CHUNKED_OUTPUT_FULL},
+     * {@link #CHUNKED_COMPLETE}, {@link #ERROR_PARTIAL}, or one of the
+     * chunked error constants.
+     */
+    public static int decodeChunkedTo(
+        ChunkedDecoder decoder,
+        MemorySegment ms,
+        long offset,
+        long inputLength,
+        MemorySegment destination,
+        long destinationOffset,
+        long destinationLength,
+        long maximumPayloadLength,
+        long maximumMetadataLength,
+        long[] progress
+    ) {
+        if (progress.length < 2) {
+            throw new IllegalArgumentException(
+                "Chunked progress output requires two elements");
+        }
+        if (destination == null) {
+            throw new IllegalArgumentException(
+                "Chunked decode destination is required");
+        }
+        if (inputLength < 0 || destinationLength < 0
+                || maximumPayloadLength < 0
+                || maximumMetadataLength < 0) {
+            throw new IllegalArgumentException(
+                "Chunked decode lengths must not be negative");
+        }
+        return (int) decodeChunkedInternal(
+            decoder, ms, offset, inputLength, null, progress,
+            destination, destinationOffset, destinationLength,
+            maximumPayloadLength, maximumMetadataLength);
+    }
+
+    private static long decodeChunkedInternal(
+        ChunkedDecoder decoder,
+        MemorySegment ms,
+        long offset,
+        long inputLength,
+        long[] compactedSize,
+        long[] progress,
+        MemorySegment destination,
+        long destinationOffset,
+        long destinationLength,
+        long maximumPayloadLength,
+        long maximumMetadataLength
+    ) {
         long src = 0;
         long dst = 0;
-        long limit = bufsz[0];
+        long limit = inputLength;
         long ret = -2;
         long base = offset;
+        boolean directMode = destination != null;
+        boolean spanMode = progress != null && !directMode;
+        boolean progressiveMode = progress != null;
+        long destinationBase = destinationOffset;
         if (ms.isNative()) {
             base += ms.address();
             ms = RawSegment.ADDRESS_SPACE;
         }
+        if (directMode && destination.isNative()) {
+            destinationBase += destination.address();
+            destination = RawSegment.ADDRESS_SPACE;
+        }
 
-        decoder.totalRead += limit;
+        if (progressiveMode) {
+            progress[0] = 0;
+            progress[1] = 0;
+        } else {
+            decoder.totalRead += limit;
+        }
 
         while (true) {
             switch (decoder.state) {
@@ -859,31 +1064,97 @@ public class PicoHTTPParser {
                             decoder.state = CHUNKED_IN_TRAILERS_LINE_HEAD;
                             break;
                         } else {
-                            ret = limit - src;
+                            ret = progressiveMode
+                                ? CHUNKED_COMPLETE : limit - src;
                             break;
                         }
                     }
                     decoder.state = CHUNKED_IN_CHUNK_DATA;
+                    if (directMode
+                            && src - dst > maximumMetadataLength) {
+                        ret = ERROR_CHUNKED_METADATA_LIMIT;
+                        break;
+                    }
                     // fallthru
                 case CHUNKED_IN_CHUNK_DATA: {
                     long avail = limit - src;
-                    if (Long.compareUnsigned(avail, decoder.bytesLeftInChunk) < 0) {
-                        if (dst != src) {
-                            MemorySegment.copy(ms, base + src, ms, base + dst, avail);
+                    if (directMode) {
+                        if (Long.compareUnsigned(
+                                decoder.bytesLeftInChunk,
+                                maximumPayloadLength - dst) > 0) {
+                            ret = ERROR_CHUNKED_PAYLOAD_LIMIT;
+                            break;
                         }
-                        src += avail;
-                        dst += avail;
-                        decoder.bytesLeftInChunk -= avail;
+                        long count = Math.min(
+                            Math.min(avail, decoder.bytesLeftInChunk),
+                            destinationLength - dst
+                        );
+                        if (count != 0) {
+                            MemorySegment.copy(
+                                ms, base + src,
+                                destination, destinationBase + dst,
+                                count
+                            );
+                            src += count;
+                            dst += count;
+                            decoder.bytesLeftInChunk -= count;
+                            if (decoder.bytesLeftInChunk == 0) {
+                                decoder.state =
+                                    CHUNKED_IN_CHUNK_DATA_EXPECT_CR;
+                            }
+                        }
+                        if (dst == destinationLength) {
+                            ret = CHUNKED_OUTPUT_FULL;
+                            break;
+                        }
+                        if (src == limit) {
+                            break;
+                        }
+                        // A non-full destination and remaining input imply
+                        // that this chunk ended, so consume its delimiter.
+                    } else if (spanMode) {
+                        if (avail == 0) {
+                            break;
+                        }
+                        long count;
+                        if (Long.compareUnsigned(
+                                avail, decoder.bytesLeftInChunk) < 0) {
+                            count = avail;
+                            decoder.bytesLeftInChunk -= count;
+                        } else {
+                            count = decoder.bytesLeftInChunk;
+                            decoder.bytesLeftInChunk = 0;
+                            decoder.state =
+                                CHUNKED_IN_CHUNK_DATA_EXPECT_CR;
+                        }
+                        src += count;
+                        progress[0] = src;
+                        progress[1] = count;
+                        ret = CHUNKED_SPAN_DATA;
                         break;
-                    }
+                    } else {
+                        if (Long.compareUnsigned(
+                                avail, decoder.bytesLeftInChunk) < 0) {
+                            if (dst != src) {
+                                MemorySegment.copy(
+                                    ms, base + src, ms, base + dst, avail);
+                            }
+                            src += avail;
+                            dst += avail;
+                            decoder.bytesLeftInChunk -= avail;
+                            break;
+                        }
 
-                    if (dst != src) {
-                        MemorySegment.copy(ms, base + src, ms, base + dst, decoder.bytesLeftInChunk);
+                        if (dst != src) {
+                            MemorySegment.copy(
+                                ms, base + src, ms, base + dst,
+                                decoder.bytesLeftInChunk);
+                        }
+                        src += decoder.bytesLeftInChunk;
+                        dst += decoder.bytesLeftInChunk;
+                        decoder.bytesLeftInChunk = 0;
+                        decoder.state = CHUNKED_IN_CHUNK_DATA_EXPECT_CR;
                     }
-                    src += decoder.bytesLeftInChunk;
-                    dst += decoder.bytesLeftInChunk;
-                    decoder.bytesLeftInChunk = 0;
-                    decoder.state = CHUNKED_IN_CHUNK_DATA_EXPECT_CR;
                 }
                 case CHUNKED_IN_CHUNK_DATA_EXPECT_CR:
                     if (src == limit) {
@@ -921,7 +1192,8 @@ public class PicoHTTPParser {
                     }
                     if (ms.get(ValueLayout.JAVA_BYTE, base + src) == (byte) '\n') {
                         src++;
-                        ret = limit - src;
+                        ret = progressiveMode
+                            ? CHUNKED_COMPLETE : limit - src;
                         break;
                     }
                     src++;
@@ -950,15 +1222,35 @@ public class PicoHTTPParser {
                     throw new IllegalStateException("decoder is corrupt");
             }
 
-            if (ret >= 0 || ret == -1 || src == limit) {
+            if (ret != ERROR_PARTIAL || src == limit) {
                 break;
             }
+        }
+
+        if (directMode && ret != ERROR_PARSE
+                && src - dst > maximumMetadataLength) {
+            ret = ERROR_CHUNKED_METADATA_LIMIT;
+        }
+
+        if (progressiveMode) {
+            long produced = directMode ? dst : progress[1];
+            progress[0] = src;
+            progress[1] = produced;
+            decoder.totalRead += src;
+            decoder.totalOverhead += src - produced;
+            if ((ret == ERROR_PARTIAL || ret == CHUNKED_OUTPUT_FULL)
+                    && decoder.totalOverhead >= 100 * 1024
+                    && decoder.totalRead - decoder.totalOverhead
+                        < decoder.totalRead / 4) {
+                ret = ERROR_PARSE;
+            }
+            return ret;
         }
 
         if (dst != src) {
             MemorySegment.copy(ms, base + src, ms, base + dst, limit - src);
         }
-        bufsz[0] = dst;
+        compactedSize[0] = dst;
 
         if (ret == -2) {
             decoder.totalOverhead += limit - dst;

@@ -4,6 +4,7 @@ package dev.cardigan.serdes;
 
 import dev.cardigan.http.Utf8Slice;
 import dev.cardigan.json.JsonReader;
+import dev.cardigan.json.JsonWriter;
 import dev.cardigan.simdjson.Stage1Indexer;
 import dev.cardigan.simdjson.Stage2Validator;
 import dev.cardigan.simdjson.StructuralIndexes;
@@ -125,14 +126,19 @@ public final class Serdes {
             }
 
             indexOrThrow(state.indexer, slice, indexes);
-            validateOrThrow(state.validator, slice, indexes);
             de.reset(
                 slice, 0, length, indexes,
                 state.indexer.hasBackslash());
 
             if (Record.class.isAssignableFrom(clazz)) {
-                return (T) de.readRecord((Class<? extends Record>) clazz);
+                dev.cardigan.json.RecordCache.RecordMetadata metadata =
+                    dev.cardigan.json.RecordCache.getMetadata(clazz);
+                validateRecordOrThrow(
+                    state.validator, slice, indexes, metadata, de);
+                return (T) de.readRecord(metadata);
             }
+
+            validateOrThrow(state.validator, slice, indexes);
 
             Deserializer<T> custom = (Deserializer<T>) REGISTRATION_DESERIALIZERS.get(clazz);
             if (custom != null) {
@@ -174,10 +180,11 @@ public final class Serdes {
             }
 
             indexOrThrow(state.indexer, slice, indexes);
-            validateOrThrow(state.validator, slice, indexes);
             de.reset(
                 slice, 0, length, indexes,
                 state.indexer.hasBackslash());
+            validateRecordOrThrow(
+                state.validator, slice, indexes, metadata, de);
             return (T) de.readRecord(metadata);
         } finally {
             state.depth--;
@@ -195,12 +202,12 @@ public final class Serdes {
             String name = metadata.componentNames[i];
             byte typeCode = metadata.componentTypeCodes[i];
 
-            if (!obj.containsKey(name)) {
+            dev.cardigan.simdjson.ondemand.Value fieldVal =
+                obj.getOrNull(name);
+            if (fieldVal == null) {
                 args[i] = metadata.defaultArgs[i];
                 continue;
             }
-
-            dev.cardigan.simdjson.ondemand.Value fieldVal = obj.get(name);
             if (fieldVal.isNull()) {
                 args[i] = metadata.defaultArgs[i];
                 continue;
@@ -316,6 +323,26 @@ public final class Serdes {
         }
     }
 
+    private static void validateRecordOrThrow(
+            Stage2Validator validator, MemorySegment segment,
+            StructuralIndexes indexes,
+            dev.cardigan.json.RecordCache.RecordMetadata metadata,
+            SimdJsonDeserializer deserializer) {
+        int fieldCount = metadata.componentNames.length;
+        if (fieldCount > 0 && fieldCount <= 8
+                && indexes.size() == fieldCount * 2 + 1) {
+            SimdJsonError error = validator.validatePositionalRecord(
+                segment, indexes, fieldCount,
+                deserializer.positionalBounds());
+            if (error != SimdJsonError.SUCCESS) {
+                throw new SimdJsonException(error);
+            }
+            deserializer.useValidatedPositionalBounds();
+            return;
+        }
+        validateOrThrow(validator, segment, indexes);
+    }
+
     // =========================================================================
     // Serialization API
     // =========================================================================
@@ -336,15 +363,62 @@ public final class Serdes {
                 System.arraycopy(buf, 0, result, 0, (int) written);
                 return result;
             } catch (IndexOutOfBoundsException e) {
+                byte[] exact = retryWithExactSize(value);
+                if (exact != null) {
+                    return exact;
+                }
                 capacity *= 2;
             } catch (RuntimeException e) {
-                if (e.getCause() instanceof IndexOutOfBoundsException) {
+                if (isBufferOverflow(e)) {
+                    byte[] exact = retryWithExactSize(value);
+                    if (exact != null) {
+                        return exact;
+                    }
                     capacity *= 2;
                 } else {
                     throw e;
                 }
             }
         }
+    }
+
+    private static byte[] retryWithExactSize(Object value) {
+        int exactSize = exactSerializedSize(value);
+        if (exactSize < 0) {
+            return null;
+        }
+        byte[] result = new byte[exactSize];
+        long written = toJson(MemorySegment.ofArray(result), value);
+        if (written != exactSize) {
+            throw new IllegalStateException(
+                "JSON size mismatch: expected " + exactSize
+                    + " bytes, wrote " + written);
+        }
+        return result;
+    }
+
+    private static boolean isBufferOverflow(Throwable failure) {
+        Throwable cause = failure;
+        while (cause != null) {
+            if (cause instanceof IndexOutOfBoundsException) {
+                return true;
+            }
+            cause = cause.getCause();
+        }
+        return false;
+    }
+
+    private static int exactSerializedSize(Object value) {
+        if (value == null || value instanceof Record
+                || value instanceof String || value instanceof Utf8Slice
+                || value instanceof Integer || value instanceof Long
+                || value instanceof Double || value instanceof Boolean) {
+            return JsonWriter.encodedSize(value);
+        }
+        if (value instanceof dev.cardigan.simdjson.ondemand.Value onDemand) {
+            return Math.addExact(onDemand.getRawLength(), 2);
+        }
+        return -1;
     }
 
     @SuppressWarnings("unchecked")

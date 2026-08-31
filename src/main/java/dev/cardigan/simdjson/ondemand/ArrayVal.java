@@ -25,7 +25,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
 /**
- * On-Demand zero-allocation Array view.
+ * On-demand array view that indexes elements after repeated access.
  */
 public final class ArrayVal {
 
@@ -34,6 +34,8 @@ public final class ArrayVal {
     private final int heapOffset;
     private final StructuralIndexes indexes;
     private final int startIndexIdx;
+    private int[] elementIndexes;
+    private int lookups;
 
     public ArrayVal(MemorySegment segment, byte[] heapBytes, StructuralIndexes indexes, int startIndexIdx) {
         this.segment = segment;
@@ -49,6 +51,30 @@ public final class ArrayVal {
             throw new SimdJsonException(SimdJsonError.INDEX_OUT_OF_BOUNDS, "Negative index: " + targetIndex);
         }
 
+        int[] cached = elementIndexes;
+        if (cached != null) {
+            return valueAt(cached, targetIndex);
+        }
+        if (++lookups >= 2) {
+            cached = indexElements();
+            elementIndexes = cached;
+            return valueAt(cached, targetIndex);
+        }
+        return scanForElement(targetIndex);
+    }
+
+    private Value valueAt(int[] cached, int targetIndex) {
+        if (targetIndex >= cached.length) {
+            throw new SimdJsonException(
+                SimdJsonError.INDEX_OUT_OF_BOUNDS,
+                "Index out of bounds: " + targetIndex);
+        }
+        int index = cached[targetIndex];
+        return new Value(
+            segment, heapBytes, indexes, index, indexes.get(index));
+    }
+
+    private Value scanForElement(int targetIndex) {
         int numIndexes = indexes.size();
         int idx = startIndexIdx + 1;
         int depth = 1;
@@ -79,6 +105,57 @@ public final class ArrayVal {
         }
 
         throw new SimdJsonException(SimdJsonError.INDEX_OUT_OF_BOUNDS, "Index out of bounds: " + targetIndex);
+    }
+
+    private int[] indexElements() {
+        int count = countElements();
+        int[] elements = new int[count];
+        int numIndexes = indexes.size();
+        int idx = startIndexIdx + 1;
+        int depth = 1;
+        int element = 0;
+        while (idx < numIndexes && depth > 0) {
+            int offset = indexes.get(idx);
+            byte current = getByte(offset);
+            boolean containerStart = current == '{' || current == '[';
+            boolean scalarStart = current != ',' && current != ':'
+                && current != '}' && current != ']'
+                && !containerStart;
+            if (depth == 1 && (containerStart || scalarStart)) {
+                elements[element++] = idx;
+            }
+            if (containerStart) {
+                depth++;
+            } else if (current == '}' || current == ']') {
+                depth--;
+            }
+            idx++;
+        }
+        return elements;
+    }
+
+    private int countElements() {
+        int count = 0;
+        int numIndexes = indexes.size();
+        int idx = startIndexIdx + 1;
+        int depth = 1;
+        while (idx < numIndexes && depth > 0) {
+            byte current = getByte(indexes.get(idx));
+            boolean containerStart = current == '{' || current == '[';
+            boolean scalarStart = current != ',' && current != ':'
+                && current != '}' && current != ']'
+                && !containerStart;
+            if (depth == 1 && (containerStart || scalarStart)) {
+                count++;
+            }
+            if (containerStart) {
+                depth++;
+            } else if (current == '}' || current == ']') {
+                depth--;
+            }
+            idx++;
+        }
+        return count;
     }
 
     private byte getByte(int pos) {

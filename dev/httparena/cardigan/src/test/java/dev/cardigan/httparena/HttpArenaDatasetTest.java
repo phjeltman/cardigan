@@ -56,4 +56,39 @@ class HttpArenaDatasetTest {
         assertTrue(response.endsWith("],\"count\":2}"));
     }
 
+    @Test
+    void compactsFormattingWithoutChangingStringContents() throws Exception {
+        StringBuilder json = new StringBuilder("[\n");
+        for (int index = 1; index <= 50; index++) {
+            if (index != 1) json.append(",\n");
+            json.append("  {\n")
+                .append("    \"id\" : ").append(index).append(",\n")
+                .append("    \"name\" : \"item ").append(index)
+                .append(" with \\\"quotes\\\"\",\n")
+                .append("    \"price\" : 3,\n")
+                .append("    \"quantity\" : 4\n")
+                .append("  }");
+        }
+        json.append("\n]");
+        Path datasetFile = temporaryDirectory.resolve("pretty-dataset.json");
+        Files.writeString(datasetFile, json);
+
+        HttpArenaDataset dataset = HttpArenaDataset.load(datasetFile);
+        String response;
+        try (Arena arena = Arena.ofConfined()) {
+            var body = dataset.render(1, 2);
+            MemorySegment output = arena.allocate(body.length());
+            body.write(output);
+            response = new String(
+                output.toArray(ValueLayout.JAVA_BYTE),
+                StandardCharsets.UTF_8);
+        }
+
+        assertEquals(
+            "{\"items\":[{\"id\":1,\"name\":"
+                + "\"item 1 with \\\"quotes\\\"\",\"price\":3,"
+                + "\"quantity\":4,\"total\":24}],\"count\":1}",
+            response);
+    }
+
 }

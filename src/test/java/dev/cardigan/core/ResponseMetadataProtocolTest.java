@@ -129,6 +129,28 @@ class ResponseMetadataProtocolTest {
     }
 
     @Test
+    void writesAsciiLongBodyThroughHttp2() throws Exception {
+        try (Socket socket = connectHttp2()) {
+            OutputStream output = socket.getOutputStream();
+            output.write(frame(
+                Http2Frames.HEADERS,
+                Http2Frames.FLAG_END_HEADERS | Http2Frames.FLAG_END_STREAM,
+                1,
+                getBlock("/long")));
+            output.flush();
+
+            Frame headers = readFrame(socket.getInputStream());
+            Frame data = readFrame(socket.getInputStream());
+            assertEquals(Http2Frames.HEADERS, headers.type);
+            assertEquals(Http2Frames.DATA, data.type);
+            assertEquals(
+                Long.toString(Long.MIN_VALUE),
+                new String(data.payload, StandardCharsets.US_ASCII));
+            assertTrue((data.flags & Http2Frames.FLAG_END_STREAM) != 0);
+        }
+    }
+
+    @Test
     void writesEncodedBodyWithHttp2Metadata() throws Exception {
         try (Socket socket = connectHttp2()) {
             OutputStream output = socket.getOutputStream();
@@ -348,6 +370,11 @@ class ResponseMetadataProtocolTest {
         public Response encoded() {
             return Response.encoded(
                 "application/octet-stream", encodedBody());
+        }
+
+        @Get("/long")
+        public Response longBody() {
+            return Response.text(Long.MIN_VALUE);
         }
 
         @Get("/encoded-metadata")

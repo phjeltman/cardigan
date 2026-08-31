@@ -28,7 +28,7 @@ import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
 
 /**
- * On-Demand zero-allocation lazy JSON value view.
+ * Lazy on-demand JSON value view.
  */
 public final class Value {
 
@@ -38,6 +38,7 @@ public final class Value {
     private final StructuralIndexes indexes;
     private final int indexIdx;
     private final int valueOffset;
+    private ObjectVal objectView;
 
     public Value(MemorySegment segment, byte[] heapBytes, StructuralIndexes indexes, int indexIdx, int valueOffset) {
         this.segment = segment;
@@ -232,6 +233,10 @@ public final class Value {
     }
 
     public ObjectVal getObject() {
+        ObjectVal cached = objectView;
+        if (cached != null) {
+            return cached;
+        }
         int pos = skipWhitespace(valueOffset);
         if (getByte(pos) != '{') {
             throw new SimdJsonException(SimdJsonError.INCORRECT_TYPE, "Expected Object '{'");
@@ -241,7 +246,10 @@ public final class Value {
         while (braceIdx < max && indexes.get(braceIdx) != pos) {
             braceIdx++;
         }
-        return new ObjectVal(segment, heapBytes, indexes, braceIdx);
+        ObjectVal object = new ObjectVal(
+            segment, heapBytes, indexes, braceIdx);
+        objectView = object;
+        return object;
     }
 
     public ArrayVal getArray() {

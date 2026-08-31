@@ -79,6 +79,10 @@ final class Http2ResponseWriter {
             return sendMetadataResponse(
                 streamId, response, flowControl);
         }
+        if (response.hasAsciiLongBody()) {
+            return sendAsciiLongBody(
+                streamId, response, flowControl);
+        }
         Object body = response.body();
         if (body == null) {
             return sendFrames(
@@ -123,7 +127,8 @@ final class Http2ResponseWriter {
             int streamId,
             Response response,
             FlowControl flowControl) {
-        Object body = response.body();
+        boolean asciiLongBody = response.hasAsciiLongBody();
+        Object body = asciiLongBody ? null : response.body();
         if (body instanceof StreamingBody streamingBody) {
             return sendMetadataStreamingResponse(
                 streamId, response, streamingBody, flowControl);
@@ -132,7 +137,11 @@ final class Http2ResponseWriter {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment bytes;
             int length;
-            if (body == null) {
+            if (asciiLongBody) {
+                length = response.asciiLongBodyLength();
+                bytes = arena.allocate(length);
+                response.writeAsciiLongBody(bytes);
+            } else if (body == null) {
                 bytes = MemorySegment.NULL;
                 length = 0;
             } else if (body instanceof StaticBody staticBody) {
@@ -365,7 +374,7 @@ final class Http2ResponseWriter {
             throw failure;
         }
 
-        if (!writer.enqueue(egressId, totalLength)) {
+        if (!writer.enqueueOwned(egressId, totalLength)) {
             flowControl.refund(bodyLength);
             return COMPACT_FAILED;
         }
@@ -444,7 +453,7 @@ final class Http2ResponseWriter {
             Http2Frames.writeHeader(
                 output, 0, produced, Http2Frames.DATA,
                 produced == reserved ? flags : 0, streamId);
-            if (!writer.enqueue(
+            if (!writer.enqueueOwned(
                     egressId, Http2Frames.HEADER_SIZE + produced)) {
                 flowControl.refund(produced);
                 return -1;
@@ -496,7 +505,7 @@ final class Http2ResponseWriter {
                 : 0;
             Http2Frames.writeHeader(
                 output, 0, produced, Http2Frames.DATA, flags, streamId);
-            if (!writer.enqueue(
+            if (!writer.enqueueOwned(
                     egressId, Http2Frames.HEADER_SIZE + produced)) {
                 flowControl.refund(produced);
                 return STREAM_FAILURE;
@@ -548,7 +557,7 @@ final class Http2ResponseWriter {
             Http2Frames.writeHeader(
                 output, 0, blockLength, Http2Frames.HEADERS,
                 flags, streamId);
-            return writer.enqueue(
+            return writer.enqueueOwned(
                 egressId, Http2Frames.HEADER_SIZE + blockLength);
         }
 
@@ -585,7 +594,7 @@ final class Http2ResponseWriter {
                 output, 0, blockLength, Http2Frames.HEADERS,
                 Http2Frames.FLAG_END_HEADERS | Http2Frames.FLAG_END_STREAM,
                 streamId);
-            return writer.enqueue(
+            return writer.enqueueOwned(
                 egressId, Http2Frames.HEADER_SIZE + blockLength);
         }
 
@@ -618,7 +627,7 @@ final class Http2ResponseWriter {
             MemorySegment.copy(
                 body, bodyOffset,
                 output, Http2Frames.HEADER_SIZE, bodyLength);
-            return writer.enqueue(
+            return writer.enqueueOwned(
                 egressId, Http2Frames.HEADER_SIZE + bodyLength);
         }
 
@@ -778,7 +787,7 @@ final class Http2ResponseWriter {
                 : 0;
             Http2Frames.writeHeader(
                 output, 0, produced, Http2Frames.DATA, flags, streamId);
-            if (!writer.enqueue(
+            if (!writer.enqueueOwned(
                     egressId, Http2Frames.HEADER_SIZE + produced)) {
                 if (produced != 0) {
                     flowControl.refund(produced);
@@ -867,7 +876,7 @@ final class Http2ResponseWriter {
                 Http2Frames.FLAG_END_STREAM,
                 streamId
             );
-            return writer.enqueue(egressId, Http2Frames.HEADER_SIZE);
+            return writer.enqueueOwned(egressId, Http2Frames.HEADER_SIZE);
         }
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment output = arena.allocate(Http2Frames.HEADER_SIZE);
@@ -906,7 +915,7 @@ final class Http2ResponseWriter {
             Http2Frames.writeHeader(
                 output, 0, headerBlockLength, Http2Frames.HEADERS,
                 flags, streamId);
-            return writer.enqueue(
+            return writer.enqueueOwned(
                 egressId, Http2Frames.HEADER_SIZE + headerBlockLength);
         }
 
@@ -949,7 +958,7 @@ final class Http2ResponseWriter {
                 loop.releaseEgressBuffer(egressId);
                 return false;
             }
-            return writer.enqueue(
+            return writer.enqueueOwned(
                 egressId, Http2Frames.HEADER_SIZE + chunkLength);
         }
 
@@ -1036,7 +1045,7 @@ final class Http2ResponseWriter {
             outputLength += Http2Frames.HEADER_SIZE;
         }
 
-        if (!writer.enqueue(egressId, outputLength)) {
+        if (!writer.enqueueOwned(egressId, outputLength)) {
             return false;
         }
         if (chunkLength != 0) {
@@ -1141,7 +1150,7 @@ final class Http2ResponseWriter {
             flags,
             streamId
         );
-        if (!writer.enqueue(egressId, Http2Frames.HEADER_SIZE)) {
+        if (!writer.enqueueOwned(egressId, Http2Frames.HEADER_SIZE)) {
             return false;
         }
         return writer.enqueueBorrowed(
@@ -1172,6 +1181,87 @@ final class Http2ResponseWriter {
             return writer.writeFully(
                 output,
                 Http2Frames.HEADER_SIZE + chunkLength) > 0;
+        }
+    }
+
+    private boolean sendAsciiLongBody(
+            int streamId,
+            Response response,
+            FlowControl flowControl) {
+        int bodyLength = response.asciiLongBodyLength();
+        UringEventLoop loop = writer.eventLoop();
+        int egressId = response.contentType().length()
+                <= MAX_INLINE_CONTENT_TYPE_LENGTH
+            ? loop.acquireEgressBuffer()
+            : -1;
+        if (egressId < 0) {
+            return sendAsciiLongFallback(
+                streamId, response, flowControl);
+        }
+
+        MemorySegment output = loop.getEgressBufferSegment(egressId);
+        int headerBlockLength = HpackEncoder.writeResponseHeaders(
+            output,
+            Http2Frames.HEADER_SIZE,
+            response.statusCode(),
+            response.contentType(),
+            bodyLength
+        );
+        int outputLength = Http2Frames.HEADER_SIZE + headerBlockLength;
+        int available = UringEventLoop.EGRESS_FRAME_SIZE
+            - outputLength - Http2Frames.HEADER_SIZE;
+        if (bodyLength > peerMaxFrameSize || bodyLength > available) {
+            loop.releaseEgressBuffer(egressId);
+            return sendAsciiLongFallback(
+                streamId, response, flowControl);
+        }
+
+        int reserved = flowControl.reserve(bodyLength);
+        if (reserved != bodyLength) {
+            if (reserved > 0) {
+                flowControl.refund(reserved);
+            }
+            loop.releaseEgressBuffer(egressId);
+            return reserved <= 0 && flowControl.cancelled()
+                ? false
+                : sendAsciiLongFallback(
+                    streamId, response, flowControl);
+        }
+
+        int dataOffset = outputLength + Http2Frames.HEADER_SIZE;
+        try {
+            response.writeAsciiLongBody(
+                output.asSlice(dataOffset, bodyLength));
+        } catch (Throwable failure) {
+            flowControl.refund(bodyLength);
+            loop.releaseEgressBuffer(egressId);
+            return sendSerializationError(streamId, flowControl);
+        }
+        Http2Frames.writeHeader(
+            output, 0, headerBlockLength, Http2Frames.HEADERS,
+            Http2Frames.FLAG_END_HEADERS, streamId);
+        Http2Frames.writeHeader(
+            output, outputLength, bodyLength, Http2Frames.DATA,
+            Http2Frames.FLAG_END_STREAM, streamId);
+        if (!writer.enqueueOwned(egressId, dataOffset + bodyLength)) {
+            flowControl.refund(bodyLength);
+            return false;
+        }
+        return true;
+    }
+
+    private boolean sendAsciiLongFallback(
+            int streamId,
+            Response response,
+            FlowControl flowControl) {
+        int length = response.asciiLongBodyLength();
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment encoded = arena.allocate(length);
+            response.writeAsciiLongBody(encoded);
+            return sendFrames(
+                streamId, response, encoded, length, flowControl);
+        } catch (Throwable failure) {
+            return sendSerializationError(streamId, flowControl);
         }
     }
 
@@ -1211,7 +1301,7 @@ final class Http2ResponseWriter {
                 output, 0, headerBlockLength, Http2Frames.HEADERS,
                 Http2Frames.FLAG_END_HEADERS | Http2Frames.FLAG_END_STREAM,
                 streamId);
-            return writer.enqueue(egressId, outputLength);
+            return writer.enqueueOwned(egressId, outputLength);
         }
 
         int available = UringEventLoop.EGRESS_FRAME_SIZE
@@ -1248,7 +1338,7 @@ final class Http2ResponseWriter {
         Http2Frames.writeHeader(
             output, outputLength, bodyLength, Http2Frames.DATA,
             Http2Frames.FLAG_END_STREAM, streamId);
-        if (!writer.enqueue(
+        if (!writer.enqueueOwned(
                 egressId, dataOffset + bodyLength)) {
             flowControl.refund(bodyLength);
             return false;
@@ -1335,7 +1425,7 @@ final class Http2ResponseWriter {
                 output, 0, headerBlockLength, Http2Frames.HEADERS,
                 Http2Frames.FLAG_END_HEADERS | Http2Frames.FLAG_END_STREAM,
                 streamId);
-            return writer.enqueue(egressId, outputLength);
+            return writer.enqueueOwned(egressId, outputLength);
         }
 
         int maximumPayload = Math.min(
@@ -1359,7 +1449,7 @@ final class Http2ResponseWriter {
         if (chunkLength == bodyLength) {
             MemorySegment.copy(
                 output, RECORD_BODY_OFFSET, output, dataOffset, chunkLength);
-            return writer.enqueue(egressId, dataOffset + chunkLength);
+            return writer.enqueueOwned(egressId, dataOffset + chunkLength);
         }
 
         try (Arena arena = Arena.ofConfined()) {
@@ -1368,7 +1458,7 @@ final class Http2ResponseWriter {
                 output, RECORD_BODY_OFFSET, retainedBody, 0, bodyLength);
             MemorySegment.copy(
                 retainedBody, 0, output, dataOffset, chunkLength);
-            if (!writer.enqueue(egressId, dataOffset + chunkLength)) {
+            if (!writer.enqueueOwned(egressId, dataOffset + chunkLength)) {
                 return false;
             }
             return sendRemainingData(
@@ -1516,7 +1606,7 @@ final class Http2ResponseWriter {
             bodyOffset = chunkLength;
         }
 
-        if (!writer.enqueue(egressId, outputLength)) {
+        if (!writer.enqueueOwned(egressId, outputLength)) {
             return false;
         }
         return sendRemainingBytes(
@@ -1621,7 +1711,7 @@ final class Http2ResponseWriter {
             body, bodyOffset,
             output.address() + Http2Frames.HEADER_SIZE,
             chunkLength);
-        return writer.enqueue(
+        return writer.enqueueOwned(
             egressId, Http2Frames.HEADER_SIZE + chunkLength);
     }
 
@@ -1672,7 +1762,7 @@ final class Http2ResponseWriter {
             bodyOffset = chunkLength;
         }
 
-        if (!writer.enqueue(egressId, outputLength)) {
+        if (!writer.enqueueOwned(egressId, outputLength)) {
             return false;
         }
         return sendRemainingData(
@@ -1716,7 +1806,7 @@ final class Http2ResponseWriter {
                     output, 0, chunkLength, Http2Frames.DATA, flags, streamId);
                 MemorySegment.copy(
                     body, bodyOffset, output, Http2Frames.HEADER_SIZE, chunkLength);
-                if (!writer.enqueue(
+                if (!writer.enqueueOwned(
                     egressId, Http2Frames.HEADER_SIZE + chunkLength)) {
                     return false;
                 }

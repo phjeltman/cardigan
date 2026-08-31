@@ -28,6 +28,13 @@
 package dev.cardigan.pico;
 
 public class Request {
+    public static final int FRAMING_CONTENT_LENGTH_SHIFT = 0;
+    public static final int FRAMING_TRANSFER_ENCODING_SHIFT = 16;
+    public static final int FRAMING_EXPECT_SHIFT = 32;
+    public static final int FRAMING_CONNECTION_SHIFT = 48;
+    public static final long FRAMING_INDEX_MASK = 0x7fffL;
+    public static final long FRAMING_DUPLICATE_MASK = 0x8000L;
+
     public int methodCode = 0;
     public long methodOffset = -1;
     public long methodLen = 0;
@@ -39,6 +46,7 @@ public class Request {
     public int minorVersion = -1;
     public final Header[] headers;
     public int numHeaders = 0;
+    public long framingHeaders = 0;
 
     public Request(int maxHeaders) {
         this.headers = new Header[maxHeaders];
@@ -58,5 +66,6 @@ public class Request {
         queryLen = 0;
         minorVersion = -1;
         numHeaders = 0;
+        framingHeaders = 0;
     }
 }

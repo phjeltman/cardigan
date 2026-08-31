@@ -9,8 +9,6 @@ Everything under this directory is repository tooling, not part of the
 - `httparena` is the independent HttpArena consumer.
 - `verification` contains external conformance runners.
 - `tools` contains contributor-only build, profiling, and smoke-test helpers.
-- `EGRESS_BUFFER_POOL.md` records the planned hierarchical shared egress-pool
-  design.
 
 Build the framework and all Maven-based development consumers with:
 

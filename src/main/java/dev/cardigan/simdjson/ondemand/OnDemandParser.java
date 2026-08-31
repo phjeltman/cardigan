@@ -28,7 +28,7 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * On-Demand SIMD JSON Parser facade.
- * Executes Stage 1 SIMD indexing and returns zero-allocation lazy On-Demand Values.
+ * Executes Stage 1 SIMD indexing and returns lazy on-demand values.
  */
 public final class OnDemandParser {
 

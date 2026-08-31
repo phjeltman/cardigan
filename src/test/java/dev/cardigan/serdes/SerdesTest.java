@@ -46,6 +46,20 @@ public class SerdesTest {
     }
 
     @Test
+    public void testValidatedPositionalRecordFallsBackForFieldOrder() {
+        String json =
+            "{ \"name\" : \"Alice\", \"id\" : 1001, "
+                + "\"score\" : 98.5, \"active\" : true }";
+
+        SimpleUser user = Serdes.fromJson(json, SimpleUser.class);
+
+        assertEquals(1001L, user.id());
+        assertEquals("Alice", user.name());
+        assertTrue(user.active());
+        assertEquals(98.5, user.score(), 0.001);
+    }
+
+    @Test
     public void testRejectsUnclosedStringBeforeRecordMaterialization() {
         assertThrows(
             SimdJsonException.class,

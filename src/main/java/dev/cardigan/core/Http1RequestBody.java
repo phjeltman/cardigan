@@ -16,7 +16,7 @@ final class Http1RequestBody implements RequestBody {
     private final long maximumDecodedLength;
     private final int maximumMetadataLength;
     private final ChunkedDecoder decoder;
-    private final long[] decodeLength;
+    private final long[] decodeProgress;
     private InboundChunk chunk;
     private int offset;
     private long remaining;
@@ -47,7 +47,7 @@ final class Http1RequestBody implements RequestBody {
         this.maximumDecodedLength = length;
         this.maximumMetadataLength = 0;
         this.decoder = null;
-        this.decodeLength = null;
+        this.decodeProgress = null;
     }
 
     private Http1RequestBody(
@@ -70,7 +70,7 @@ final class Http1RequestBody implements RequestBody {
         this.maximumMetadataLength = maximumMetadataLength;
         this.decoder = new ChunkedDecoder();
         this.decoder.consumeTrailer = true;
-        this.decodeLength = new long[1];
+        this.decodeProgress = new long[2];
     }
 
     static Http1RequestBody chunked(
@@ -191,7 +191,7 @@ final class Http1RequestBody implements RequestBody {
     }
 
     private int readChunked(MemorySegment destination) {
-        if (complete && decodedRemaining == 0) {
+        if (complete) {
             return -1;
         }
         int capacity = Math.toIntExact(Math.min(
@@ -200,18 +200,69 @@ final class Http1RequestBody implements RequestBody {
             return 0;
         }
 
-        while (decodedRemaining == 0) {
+        int written = 0;
+        while (written < capacity) {
             if (complete) {
-                return -1;
+                return written == 0 ? -1 : written;
             }
-            decodeNextChunk();
-        }
+            if (!ensureReadableChunk()) {
+                RequestBodyException failure = truncated();
+                if (written == 0) {
+                    throw failure;
+                }
+                return written;
+            }
 
-        int count = Math.min(capacity, decodedRemaining);
-        MemorySegment.copy(chunk.segment(), offset, destination, 0, count);
-        offset += count;
-        decodedRemaining -= count;
-        return count;
+            int result = PicoHTTPParser.decodeChunkedTo(
+                decoder,
+                chunk.segment(),
+                offset,
+                chunk.length() - offset,
+                destination,
+                written,
+                capacity - written,
+                maximumDecodedLength - decodedLength,
+                maximumMetadataLength - metadataLength,
+                decodeProgress
+            );
+            int consumed = Math.toIntExact(decodeProgress[0]);
+            int produced = Math.toIntExact(decodeProgress[1]);
+            offset += consumed;
+            written += produced;
+            decodedLength += produced;
+            metadataLength += consumed - produced;
+
+            RequestBodyException failure = switch (result) {
+                case PicoHTTPParser.ERROR_PARSE -> fail(
+                    400, "Invalid HTTP/1 chunked body");
+                case PicoHTTPParser.ERROR_CHUNKED_PAYLOAD_LIMIT -> fail(
+                    413,
+                    "Decoded HTTP/1 request body exceeds the request limit");
+                case PicoHTTPParser.ERROR_CHUNKED_METADATA_LIMIT -> fail(
+                    431,
+                    "HTTP/1 chunk metadata exceeds the header limit");
+                default -> null;
+            };
+            if (failure != null) {
+                if (written == 0) {
+                    throw failure;
+                }
+                return written;
+            }
+            if (result == PicoHTTPParser.CHUNKED_COMPLETE) {
+                complete = true;
+                leftoverOffset = offset;
+            }
+            if (result == PicoHTTPParser.CHUNKED_OUTPUT_FULL) {
+                return written;
+            }
+            if (offset == chunk.length() && !complete) {
+                chunk.close();
+                chunk = null;
+                offset = 0;
+            }
+        }
+        return written;
     }
 
     private boolean discardChunked() {
@@ -232,9 +283,9 @@ final class Http1RequestBody implements RequestBody {
     }
 
     /**
-     * Decodes one owned receive buffer with phr_decode_chunked. Pico compacts
-     * decoded bytes to {@code offset}; if the terminal chunk is present, it
-     * places pipelined bytes immediately after them.
+     * Advances Pico framing until one contiguous payload span is available.
+     * Framing remains in place; only application reads and final pipelined
+     * request recovery copy bytes.
      */
     private void decodeNextChunk() {
         while (decodedRemaining == 0 && !complete) {
@@ -242,14 +293,20 @@ final class Http1RequestBody implements RequestBody {
                 throw truncated();
             }
 
-            int inputLength = chunk.length() - offset;
-            decodeLength[0] = inputLength;
-            long result = PicoHTTPParser.decodeChunked(
-                decoder, chunk.segment(), offset, decodeLength);
-            int produced = Math.toIntExact(decodeLength[0]);
-            int leftover = result >= 0 ? Math.toIntExact(result) : 0;
+            int inputOffset = offset;
+            int inputLength = chunk.length() - inputOffset;
+            int result = PicoHTTPParser.decodeChunkedSpan(
+                decoder,
+                chunk.segment(),
+                inputOffset,
+                inputLength,
+                decodeProgress
+            );
+            int consumed = Math.toIntExact(decodeProgress[0]);
+            int produced = Math.toIntExact(decodeProgress[1]);
+            int nextOffset = inputOffset + consumed;
 
-            metadataLength += inputLength - produced - leftover;
+            metadataLength += consumed - produced;
             if (metadataLength > maximumMetadataLength) {
                 throw fail(
                     431, "HTTP/1 chunk metadata exceeds the header limit");
@@ -271,15 +328,15 @@ final class Http1RequestBody implements RequestBody {
                 throw fail(400, "Invalid HTTP/1 chunked body");
             }
 
-            decodedRemaining = produced;
-            if (result >= 0) {
-                complete = true;
-                leftoverOffset = offset + produced;
-                chunk.length(leftoverOffset + leftover);
+            if (result == PicoHTTPParser.CHUNKED_SPAN_DATA) {
+                decodedRemaining = produced;
+                offset = nextOffset - produced;
             } else {
-                // The framing bytes have been removed in place. Once this
-                // decoded prefix is consumed, the buffer can be released.
-                chunk.length(offset + produced);
+                offset = nextOffset;
+            }
+            if (result == PicoHTTPParser.CHUNKED_COMPLETE) {
+                complete = true;
+                leftoverOffset = nextOffset;
             }
 
             if (decodedRemaining == 0 && !complete) {

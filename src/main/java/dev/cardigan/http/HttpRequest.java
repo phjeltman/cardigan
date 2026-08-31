@@ -5,6 +5,7 @@ package dev.cardigan.http;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.Arrays;
 import dev.cardigan.pico.Request;
 import dev.cardigan.ffi.RawSegment;
 
@@ -13,11 +14,17 @@ public class HttpRequest {
     private static final long QUESTION_MARKS = 0x3f3f_3f3f_3f3f_3f3fL;
     private static final long BYTE_ONES = 0x0101_0101_0101_0101L;
     private static final long BYTE_HIGH_BITS = 0x8080_8080_8080_8080L;
+    private static final int HEADER_INDEX_CAPACITY = 128;
+    private static final int HEADER_INDEX_MASK = HEADER_INDEX_CAPACITY - 1;
     private MemorySegment segment;
     private long address;
     private long messageOffset;
     private final Request picoRequest;
     private final long[] segPacked = new long[16];
+    private final byte[] headerIndex = new byte[HEADER_INDEX_CAPACITY];
+    /** Publishes the header index only after all indexed slots are complete. */
+    private volatile int indexedHeaderCount;
+    private int headerLookupCount;
 
     private long bodyOffset;
     private long bodyLength;
@@ -27,6 +34,7 @@ public class HttpRequest {
     private boolean routeResolved;
 
     private int keepAliveState = -1;
+    private int connectionHeaderIndex = -2;
 
     public HttpRequest() {
         this(DEFAULT_MAX_HEADERS);
@@ -52,6 +60,8 @@ public class HttpRequest {
         this.resolvedSegmentCount = -1;
         this.routeResolved = false;
         this.keepAliveState = -1;
+        resetHeaderLookupIndex();
+        connectionHeaderIndex = -2;
     }
 
     public void initHttp2(MemorySegment segment) {
@@ -236,15 +246,36 @@ public class HttpRequest {
     }
 
     public Utf8Slice getHeader(String name) {
-        int targetLen = name.length();
-        for (int i = 0; i < picoRequest.numHeaders; i++) {
-            if (picoRequest.headers[i].nameLen == targetLen) {
-                if (headerNameEquals(i, name)) {
-                    return headerValue(i);
-                }
-            }
+        if (indexedHeaderCount == picoRequest.numHeaders) {
+            return findIndexedHeader(name);
         }
-        return null;
+        return getHeaderBeforeIndex(name);
+    }
+
+    private Utf8Slice getHeaderBeforeIndex(String name) {
+        if (headerLookupCount++ == 0) {
+            int index = findHeaderLinear(name);
+            return index < 0 ? null : headerValue(index);
+        }
+        indexHeadersThrough(picoRequest.numHeaders - 1);
+        return findIndexedHeader(name);
+    }
+
+    private Utf8Slice findIndexedHeader(String name) {
+        int targetLength = name.length();
+        int slot = spread(headerNameHash(name)) & HEADER_INDEX_MASK;
+        while (true) {
+            int encoded = headerIndex[slot] & 0xff;
+            if (encoded == 0) {
+                return null;
+            }
+            int index = encoded - 1;
+            if (picoRequest.headers[index].nameLen == targetLength
+                    && headerNameEquals(index, name)) {
+                return headerValue(index);
+            }
+            slot = (slot + 1) & HEADER_INDEX_MASK;
+        }
     }
 
     public int version() {
@@ -261,10 +292,14 @@ public class HttpRequest {
     }
 
     private boolean computeKeepAlive() {
-        Utf8Slice connectionHeader = getHeader("Connection");
-        if (connectionHeader == null) {
+        int index = connectionHeaderIndex;
+        if (index == -2) {
+            index = findHeaderLinear("Connection");
+        }
+        if (index < 0) {
             return picoRequest.minorVersion == 1;
         }
+        Utf8Slice connectionHeader = headerValue(index);
         if (connectionHeader.equalsIgnoreCaseString("close")) {
             return false;
         }
@@ -274,7 +309,7 @@ public class HttpRequest {
         return picoRequest.minorVersion == 1;
     }
 
-    private boolean headerNameEquals(int index, String str) {
+    boolean headerNameEquals(int index, String str) {
         long len = picoRequest.headers[index].nameLen;
         int intLen = (int) len;
         if (str.length() != intLen) return false;
@@ -344,10 +379,18 @@ public class HttpRequest {
                 source.resolvedSegmentCount);
         }
         this.keepAliveState = source.keepAliveState;
+        this.connectionHeaderIndex = source.connectionHeaderIndex;
         copyRequestMetadata(source.picoRequest, this.picoRequest);
+        resetHeaderLookupIndex();
     }
 
     HttpRequest detachedCopy() {
+        long requestLength = detachedLength();
+        MemorySegment detachedSegment = Arena.ofAuto().allocate(requestLength);
+        return detachedCopyInto(null, detachedSegment, requestLength);
+    }
+
+    long detachedLength() {
         long requestEnd = bodyOffset + bodyLength;
         requestEnd = Math.max(
             requestEnd,
@@ -373,14 +416,45 @@ public class HttpRequest {
                 picoRequest.headers[i].valueOffset + picoRequest.headers[i].valueLen
             );
         }
-        long requestLength = requestEnd - messageOffset;
-        MemorySegment detachedSegment = Arena.ofAuto().allocate(requestLength);
+        return requestEnd - messageOffset;
+    }
+
+    HttpRequest detachedCopyInto(
+            HttpRequest reusable, MemorySegment detachedSegment) {
+        long requestLength = detachedLength();
+        if (detachedSegment.byteSize() < requestLength) {
+            throw new IllegalArgumentException(
+                "Detached request storage is too small");
+        }
+        return detachedCopyInto(reusable, detachedSegment, requestLength);
+    }
+
+    private HttpRequest detachedCopyInto(
+            HttpRequest reusable,
+            MemorySegment detachedSegment,
+            long requestLength) {
         MemorySegment.copy(
             segment, messageOffset, detachedSegment, 0, requestLength);
 
-        HttpRequest detached = new HttpRequest(picoRequest.numHeaders);
-        detached.segment = detachedSegment;
-        detached.address = detachedSegment.address();
+        HttpRequest detached = copyViewInto(reusable, detachedSegment);
+        detached.rebase(-messageOffset);
+        return detached;
+    }
+
+    HttpRequest retainedView(HttpRequest reusable) {
+        return copyViewInto(reusable, segment);
+    }
+
+    private HttpRequest copyViewInto(
+            HttpRequest reusable, MemorySegment targetSegment) {
+        HttpRequest detached = reusable;
+        if (detached == null
+                || detached.picoRequest.headers.length
+                    < picoRequest.numHeaders) {
+            detached = new HttpRequest(picoRequest.numHeaders);
+        }
+        detached.segment = targetSegment;
+        detached.address = targetSegment.address();
         detached.messageOffset = messageOffset;
         detached.bodyOffset = bodyOffset;
         detached.bodyLength = bodyLength;
@@ -395,8 +469,9 @@ public class HttpRequest {
                 resolvedSegmentCount);
         }
         detached.keepAliveState = keepAliveState;
+        detached.connectionHeaderIndex = connectionHeaderIndex;
         copyRequestMetadata(picoRequest, detached.picoRequest);
-        detached.rebase(-messageOffset);
+        detached.resetHeaderLookupIndex();
         return detached;
     }
 
@@ -434,12 +509,109 @@ public class HttpRequest {
         target.queryLen = source.queryLen;
         target.minorVersion = source.minorVersion;
         target.numHeaders = source.numHeaders;
+        target.framingHeaders = source.framingHeaders;
         for (int i = 0; i < source.numHeaders; i++) {
             target.headers[i].nameOffset = source.headers[i].nameOffset;
             target.headers[i].nameLen = source.headers[i].nameLen;
             target.headers[i].valueOffset = source.headers[i].valueOffset;
             target.headers[i].valueLen = source.headers[i].valueLen;
         }
+    }
+
+    private synchronized void indexHeadersThrough(int lastIndex) {
+        if (indexedHeaderCount > lastIndex) {
+            return;
+        }
+        int firstIndex = indexedHeaderCount;
+        for (int index = firstIndex; index <= lastIndex; index++) {
+            dev.cardigan.pico.Header header = picoRequest.headers[index];
+            if (header.nameLen == 0 || header.nameOffset < 0) {
+                continue;
+            }
+            int hash = headerNameHash(
+                address + header.nameOffset, header.nameLen);
+            int slot = spread(hash) & HEADER_INDEX_MASK;
+            while (headerIndex[slot] != 0) {
+                slot = (slot + 1) & HEADER_INDEX_MASK;
+            }
+            headerIndex[slot] = (byte) (index + 1);
+        }
+        indexedHeaderCount = lastIndex + 1;
+    }
+
+    private int findHeaderLinear(String name) {
+        int targetLength = name.length();
+        for (int index = 0; index < picoRequest.numHeaders; index++) {
+            if (picoRequest.headers[index].nameLen == targetLength
+                    && headerNameEquals(index, name)) {
+                return index;
+            }
+        }
+        return -1;
+    }
+
+    public void cacheConnectionHeader(int index) {
+        if (index < -1 || index >= picoRequest.numHeaders) {
+            throw new IndexOutOfBoundsException(index);
+        }
+        connectionHeaderIndex = index;
+    }
+
+    private void resetHeaderLookupIndex() {
+        if (indexedHeaderCount != 0) {
+            Arrays.fill(headerIndex, (byte) 0);
+            indexedHeaderCount = 0;
+        }
+        headerLookupCount = 0;
+    }
+
+    private static int headerNameHash(long pointer, long length) {
+        int hash = 0x811c9dc5;
+        long prefixLength = Math.min(length, 4);
+        for (long index = 0; index < prefixLength; index++) {
+            int value = RawSegment.getByte(pointer, index) & 0xff;
+            if (value >= 'A' && value <= 'Z') {
+                value += 'a' - 'A';
+            }
+            hash = (hash ^ value) * 0x01000193;
+        }
+        long suffixStart = Math.max(prefixLength, length - 4);
+        for (long index = suffixStart; index < length; index++) {
+            int value = RawSegment.getByte(pointer, index) & 0xff;
+            if (value >= 'A' && value <= 'Z') {
+                value += 'a' - 'A';
+            }
+            hash = (hash ^ value) * 0x01000193;
+        }
+        hash = (hash ^ (int) length) * 0x01000193;
+        return hash;
+    }
+
+    private static int headerNameHash(String name) {
+        int hash = 0x811c9dc5;
+        int length = name.length();
+        int prefixLength = Math.min(length, 4);
+        for (int index = 0; index < prefixLength; index++) {
+            int value = name.charAt(index);
+            if (value >= 'A' && value <= 'Z') {
+                value += 'a' - 'A';
+            }
+            hash = (hash ^ value) * 0x01000193;
+        }
+        int suffixStart = Math.max(prefixLength, length - 4);
+        for (int index = suffixStart; index < length; index++) {
+            int value = name.charAt(index);
+            if (value >= 'A' && value <= 'Z') {
+                value += 'a' - 'A';
+            }
+            hash = (hash ^ value) * 0x01000193;
+        }
+        hash = (hash ^ length) * 0x01000193;
+        return hash;
+    }
+
+    private static int spread(int hash) {
+        return hash ^ (hash >>> 16);
     }
 
 }

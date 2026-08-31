@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import dev.cardigan.json.JsonWriter;
 
@@ -38,6 +39,28 @@ public class RouterTest {
         @Post("/stream/{id}")
         public Response stream(long id, RequestBody body) {
             return Response.text(id + ":" + body.length());
+        }
+    }
+
+    public static class TrieController {
+        @Get("/catalog/known/detail")
+        public Response known() {
+            return Response.text("known");
+        }
+
+        @Post("/catalog/known/detail")
+        public Response knownPost() {
+            return Response.text("post");
+        }
+
+        @Get("/catalog/static/other")
+        public Response staticBranch() {
+            return Response.text("static");
+        }
+
+        @Get("/catalog/{name}/fallback")
+        public Response parameterFallback() {
+            return Response.text("fallback");
         }
     }
 
@@ -94,6 +117,111 @@ public class RouterTest {
                 }
                 return Response.text("received:" + received);
             }
+        }
+    }
+
+    public static class GenericBindingController {
+        @Get("/binding/name/{name}")
+        public Response name(String name) {
+            return Response.text("name=" + name);
+        }
+
+        @Get("/binding/boxed/{id}")
+        public Response boxed(Long id) {
+            return Response.text("boxed=" + id);
+        }
+
+        @Get("/binding/pair/{left}/{right}")
+        public Response pair(long left, long right) {
+            return Response.text("pair=" + (left + right));
+        }
+
+        @Get("/binding/mixed/{name}")
+        public Response mixed(String name, HttpRequest request) {
+            return Response.text(
+                "mixed=" + name + ':' + request.getHeader("X-Test"));
+        }
+
+        @Get("/binding/query/{name}")
+        public Response query(
+                String name,
+                @QueryParam(value = "limit", defaultValue = 7)
+                Integer limit) {
+            return Response.text("query=" + name + ':' + limit);
+        }
+
+        @Get("/binding/isolated/{name}")
+        @Isolated
+        public Response isolated(String name) {
+            return Response.text("isolated=" + name);
+        }
+    }
+
+    public static class ShortPathController {
+        @Get("/a/b/{id}")
+        public Response firstWordSeparators(Long id) {
+            return Response.text("control=" + id);
+        }
+
+        @Get("/box/item/{id}")
+        public Response laterSeparator(long id) {
+            return Response.text("later=" + id);
+        }
+
+        @Get("/box/./{id}")
+        public Response delimiterMaskCarry(String id) {
+            return Response.text("dot=" + id);
+        }
+    }
+
+    public static class FastPrefixController {
+        @Get("/solo/{id}")
+        public Response solo(long id) {
+            return Response.text("solo=" + id);
+        }
+
+        @Post("/solo/{id}")
+        public Response soloPost(long id) {
+            return Response.text("post=" + id);
+        }
+
+        @Get("/fast/{id}")
+        public Response parameter(long id) {
+            return Response.text("parameter=" + id);
+        }
+
+        @Get("/fast/me")
+        public Response staticRoute() {
+            return Response.text("static");
+        }
+
+        @Get("/fast/{id}/detail")
+        public Response detail(long id) {
+            return Response.text("detail=" + id);
+        }
+
+        @Get("/api/{id}")
+        public Response broad(long id) {
+            return Response.text("broad=" + id);
+        }
+
+        @Get("/api/v/{id}")
+        public Response specific(long id) {
+            return Response.text("specific=" + id);
+        }
+    }
+
+    public static class LateParameterController {
+        @Get("/late/{id}")
+        public Response parameter(long id) {
+            return Response.text("late=" + id);
+        }
+    }
+
+    public static class LateStaticController {
+        @Get("/late/me")
+        public Response staticRoute() {
+            return Response.text("late-static");
         }
     }
 
@@ -180,6 +308,193 @@ public class RouterTest {
             assertEquals(1, materializations[0]);
             assertEquals("present", invocation.invoke().body());
         }
+    }
+
+    @Test
+    void preparedInvocationOwnsTransferredRequestStorageUntilInvoke() {
+        Router router = new Router();
+        router.registerController(new TestController());
+
+        try (Arena arena = Arena.ofConfined()) {
+            HttpRequest requestAware = new HttpRequest();
+            MemorySegment requestSegment = arena.allocateFrom(
+                "GET /request HTTP/1.1\r\nX-Test: retained\r\n\r\n");
+            assertTrue(HttpRequestParser.parse(
+                requestSegment, (int) requestSegment.byteSize() - 1,
+                requestAware));
+            AtomicInteger releases = new AtomicInteger();
+            PreparedInvocation target = new PreparedInvocation();
+
+            PreparedInvocation invocation = router.prepare(
+                requestAware,
+                target,
+                null,
+                releases::incrementAndGet);
+            assertEquals(0, releases.get());
+            requestAware.init(arena.allocateFrom(
+                "GET /reused HTTP/1.1\r\n\r\n"));
+
+            assertEquals("retained", invocation.invoke().body());
+            assertEquals(1, releases.get());
+
+            HttpRequest ordinary = new HttpRequest();
+            MemorySegment ordinarySegment = arena.allocateFrom(
+                "GET /users/427 HTTP/1.1\r\n\r\n");
+            assertTrue(HttpRequestParser.parse(
+                ordinarySegment, (int) ordinarySegment.byteSize() - 1,
+                ordinary));
+            router.prepare(
+                ordinary,
+                target,
+                null,
+                releases::incrementAndGet);
+            assertEquals(2, releases.get(),
+                "routes without request arguments must release immediately");
+        }
+    }
+
+    @Test
+    void compiledRouteTreeMatchesStaticMethodsAndParameterFallbacks() {
+        Router router = new Router();
+        router.registerController(new TrieController());
+
+        assertEquals("known", dispatch(router,
+            "GET /catalog/known/detail HTTP/1.1\r\n\r\n").body());
+        assertEquals("post", dispatch(router,
+            "POST /catalog/known/detail HTTP/1.1\r\n"
+                + "Content-Length: 0\r\n\r\n").body());
+        assertEquals("fallback", dispatch(router,
+            "GET /catalog/static/fallback HTTP/1.1\r\n\r\n").body());
+        assertEquals(404, dispatch(router,
+            "GET /catalog/absent/detail HTTP/1.1\r\n\r\n").statusCode());
+    }
+
+    @Test
+    void splitsEverySegmentOfShortPaths() {
+        Router router = new Router();
+        router.registerController(new ShortPathController());
+
+        assertEquals("control=427", dispatch(router,
+            "GET /a/b/427 HTTP/1.1\r\n\r\n").body());
+        assertEquals("later=427", dispatch(router,
+            "GET /box/item/427 HTTP/1.1\r\n\r\n").body());
+        assertEquals("dot=427", dispatch(router,
+            "GET /box/./427 HTTP/1.1\r\n\r\n").body());
+    }
+
+    @Test
+    void fastPrefixesPreserveFullRouteSemantics() {
+        Router router = new Router();
+        router.registerController(new FastPrefixController());
+
+        assertEquals("solo=42", dispatch(router,
+            "GET /solo/42 HTTP/1.1\r\n\r\n").body());
+        assertEquals("post=42", dispatch(router,
+            "POST /solo/42 HTTP/1.1\r\n"
+                + "Content-Length: 0\r\n\r\n").body());
+        assertEquals("static", dispatch(router,
+            "GET /fast/me HTTP/1.1\r\n\r\n").body());
+        assertEquals("parameter=42", dispatch(router,
+            "GET /fast/42 HTTP/1.1\r\n\r\n").body());
+        assertEquals("detail=42", dispatch(router,
+            "GET /fast/42/detail HTTP/1.1\r\n\r\n").body());
+        assertEquals("broad=42", dispatch(router,
+            "GET /api/42 HTTP/1.1\r\n\r\n").body());
+        assertEquals("specific=42", dispatch(router,
+            "GET /api/v/42 HTTP/1.1\r\n\r\n").body());
+        assertEquals(404, dispatch(router,
+            "GET /solo/42/extra HTTP/1.1\r\n\r\n").statusCode());
+
+        Router dynamicallyUpdated = new Router();
+        dynamicallyUpdated.registerController(
+            new LateParameterController());
+        assertEquals("late=1", dispatch(dynamicallyUpdated,
+            "GET /late/1 HTTP/1.1\r\n\r\n").body());
+        dynamicallyUpdated.registerController(new LateStaticController());
+        assertEquals("late-static", dispatch(dynamicallyUpdated,
+            "GET /late/me HTTP/1.1\r\n\r\n").body());
+    }
+
+    @Test
+    void bindsGenericSignaturesForDirectDispatch() {
+        Router router = new Router();
+        router.registerController(new GenericBindingController());
+
+        assertEquals("name=cardigan", dispatch(router,
+            "GET /binding/name/cardigan HTTP/1.1\r\n\r\n").body());
+        assertEquals("boxed=427", dispatch(router,
+            "GET /binding/boxed/427 HTTP/1.1\r\n\r\n").body());
+        assertEquals("pair=427", dispatch(router,
+            "GET /binding/pair/41/386 HTTP/1.1\r\n\r\n").body());
+        assertEquals("mixed=cardigan:present", dispatch(router,
+            "GET /binding/mixed/cardigan HTTP/1.1\r\n"
+                + "X-Test: present\r\n\r\n").body());
+        assertEquals("query=cardigan:19", dispatch(router,
+            "GET /binding/query/cardigan?limit=19 HTTP/1.1\r\n\r\n")
+                .body());
+    }
+
+    @Test
+    void preparedGenericSignaturesReuseBindingStorageSafely() {
+        Router router = new Router();
+        router.registerController(new GenericBindingController());
+        PreparedInvocation target = new PreparedInvocation();
+        int[] materializations = {0};
+
+        assertEquals("name=first", prepare(
+            router,
+            target,
+            "GET /binding/name/first HTTP/1.1\r\n\r\n",
+            materializations).invoke().body());
+        assertEquals("pair=9", prepare(
+            router,
+            target,
+            "GET /binding/pair/4/5 HTTP/1.1\r\n\r\n",
+            materializations).invoke().body());
+        assertEquals("isolated=worker", prepare(
+            router,
+            target,
+            "GET /binding/isolated/worker HTTP/1.1\r\n\r\n",
+            materializations).invoke().body());
+        assertEquals(0, materializations[0]);
+
+        assertEquals("mixed=stored:retained", prepare(
+            router,
+            target,
+            "GET /binding/mixed/stored HTTP/1.1\r\n"
+                + "X-Test: retained\r\n\r\n",
+            materializations).invoke().body());
+        assertEquals(1, materializations[0]);
+    }
+
+    private static Response dispatch(Router router, String encoded) {
+        byte[] bytes = encoded.getBytes(
+            java.nio.charset.StandardCharsets.US_ASCII);
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment segment = arena.allocate(bytes.length);
+            MemorySegment.copy(
+                bytes, 0, segment, ValueLayout.JAVA_BYTE, 0, bytes.length);
+            HttpRequest request = new HttpRequest();
+            assertTrue(HttpRequestParser.parse(
+                segment, bytes.length, request));
+            return router.dispatch(request);
+        }
+    }
+
+    private static PreparedInvocation prepare(
+            Router router,
+            PreparedInvocation target,
+            String encoded,
+            int[] materializations) {
+        byte[] bytes = encoded.getBytes(
+            java.nio.charset.StandardCharsets.US_ASCII);
+        MemorySegment segment = Arena.global().allocate(bytes.length);
+        MemorySegment.copy(
+            bytes, 0, segment, ValueLayout.JAVA_BYTE, 0, bytes.length);
+        HttpRequest request = new HttpRequest();
+        assertTrue(HttpRequestParser.parse(segment, bytes.length, request));
+        return router.prepare(
+            request, target, () -> materializations[0]++);
     }
 
     @Test

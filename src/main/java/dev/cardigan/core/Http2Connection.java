@@ -73,7 +73,6 @@ final class Http2Connection {
         ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
     private static final ValueLayout.OfLong LONG_BE =
         ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
-
     private final InboundChunkStream inbound;
     private final ConnectionWriter writer;
     private final Router router;
@@ -778,7 +777,8 @@ final class Http2Connection {
 
         detachPendingStream(pending);
         try {
-            return submit(streamId, pending.request, pending.sendWindow);
+            return submit(
+                streamId, pending.request, pending.sendWindow);
         } finally {
             releasePendingStream(pending);
         }
@@ -986,7 +986,7 @@ final class Http2Connection {
     }
 
     private void releasePendingStream(PendingStream pending) {
-        pending.release();
+        pending.reset();
         freePendingStreams[freePendingStreamCount++] = pending;
     }
 
@@ -1040,6 +1040,7 @@ final class Http2Connection {
             }
             setTaskActive(task, false);
             task.requestBodyOwner = null;
+            task.invocation.discard();
             releaseTask(task);
             if (requestBodyOwner != null) {
                 requestBodyOwner.exchangeEnded = true;
@@ -1079,8 +1080,7 @@ final class Http2Connection {
     private void complete(Http2Task task, Response response) {
         boolean sent = taskCancelled(task);
         if (!sent && !failed) {
-            StreamingBody streamingBody = response.body()
-                instanceof StreamingBody body ? body : null;
+            StreamingBody streamingBody = response.streamingBody();
             setTaskResponseBody(task, streamingBody);
             try {
                 sent = responseWriter.send(task.streamId, response, task);
@@ -1089,9 +1089,11 @@ final class Http2Connection {
             } finally {
                 setTaskResponseBody(task, null);
             }
-        } else if (response != null
-            && response.body() instanceof StreamingBody streamingBody) {
-            streamingBody.close();
+        } else if (response != null) {
+            StreamingBody streamingBody = response.streamingBody();
+            if (streamingBody != null) {
+                streamingBody.close();
+            }
         }
         if (!sent && taskCancelled(task)) {
             sent = true;
@@ -1374,7 +1376,7 @@ final class Http2Connection {
         if (egressId >= 0) {
             MemorySegment output = loop.getEgressBufferSegment(egressId);
             int length = writeControl(output, type, flags, streamId, opaqueData, error);
-            if (writer.enqueue(egressId, length)) {
+            if (writer.enqueueOwned(egressId, length)) {
                 return true;
             }
             return false;
@@ -1563,6 +1565,7 @@ final class Http2Connection {
         private Arena arena;
         private MemorySegment storage;
         private int capacity;
+        private boolean arenaRetirementPending;
         private int bodyLength;
         private int receiveWindow;
         private int consumedBytes;
@@ -1578,6 +1581,7 @@ final class Http2Connection {
                           int expectedContentLength, int sendWindow,
                           boolean streaming,
                           boolean isolatedStreaming) {
+            retirePendingArena();
             this.streamId = streamId;
             this.headerLength = headerLength;
             this.expectedContentLength = expectedContentLength;
@@ -1673,7 +1677,7 @@ final class Http2Connection {
             }
         }
 
-        private void release() {
+        private void reset() {
             if (streamingBody != null) {
                 streamingBody.dispose();
                 streamingBody = null;
@@ -1696,11 +1700,19 @@ final class Http2Connection {
             inputEnded = false;
             exchangeEnded = false;
             if (capacity > MAX_RETAINED_PENDING_CAPACITY) {
-                arena.close();
-                arena = null;
                 storage = null;
                 capacity = 0;
+                arenaRetirementPending = true;
             }
+        }
+
+        private void retirePendingArena() {
+            if (!arenaRetirementPending) {
+                return;
+            }
+            arena.close();
+            arena = null;
+            arenaRetirementPending = false;
         }
 
         private void dispose() {
@@ -1720,6 +1732,7 @@ final class Http2Connection {
                 arena = null;
                 storage = null;
                 capacity = 0;
+                arenaRetirementPending = false;
             }
         }
     }

@@ -13,6 +13,17 @@ REQUEST_PARSERS_ONLY=false
 HPACK_HUFFMAN_ONLY=false
 HTTP2_RESPONSE_ONLY=false
 HTTP1_CHUNKED_ONLY=false
+OPTIMIZATION_ROUTING_ONLY=false
+OPTIMIZATION_JSON_FIELDS_ONLY=false
+OPTIMIZATION_JSON_WRITER_ONLY=false
+OPTIMIZATION_QUADRATIC_ONLY=false
+OPTIMIZATION_SCHEDULER_ONLY=false
+OPTIMIZATION_REQUEST_STORAGE_ONLY=false
+OPTIMIZATION_HEADERS_ONLY=false
+OPTIMIZATION_ROUTE_BINDING_ONLY=false
+OPTIMIZATION_HTTP1_PARSE_ONLY=false
+OPTIMIZATION_JSON_RECORD_ONLY=false
+OPTIMIZATION_HTTP1_SEQUENCER_ONLY=false
 CHUNKED_UPLOAD=false
 CHUNK_SIZES="64,1024,16384"
 CHUNK_SIZE=""
@@ -27,8 +38,11 @@ TLS_CERTIFICATE=""
 TLS_PRIVATE_KEY=""
 TLS_STATS=false
 HTTP2_RESOURCE_STATS=false
-EGRESS_POOL_STATS=false
 SCHEDULER_STATS=false
+HTTP1_CQE_DRIVER=true
+HTTP1_CQE_DRIVER_STATS=false
+HTTP1_DIRECT_BATCH=true
+VIRTUAL_THREAD_STATS=false
 FIXED_FILE_STATS=false
 FIXED_FILES_MODE="auto"
 FIXED_FILES_CAPACITY=8192
@@ -87,8 +101,13 @@ Options:
   --tls-private-key=PATH     PEM private key (default: generated test key)
   --tls-stats                Print opt-in TLS transport counters at shutdown
   --http2-resource-stats     Print opt-in HTTP/2 resource high-water marks
-  --egress-pool-stats        Print shared egress-pool occupancy and batching
   --scheduler-stats          Print per-loop epoch/lane/range counters
+  --http1-cqe-driver         Enable the HTTP/1 CQE driver (default)
+  --no-http1-cqe-driver      Disable the HTTP/1 CQE driver
+  --http1-cqe-driver-stats   Enable the driver and print fallback counters
+  --http1-direct-batch       Encode pipelined responses into queued buffers (default)
+  --no-http1-direct-batch    Disable direct HTTP/1 batch encoding
+  --virtual-thread-stats     Count virtual-thread mounts and unmounts
   --fixed-file-stats         Print fixed-file capacity and admission counters
   --fixed-files=MODE         auto, legacy, async-explicit, async-alloc, direct
   --fixed-files-capacity=N   Registered socket slots per event loop (default: 8192)
@@ -127,6 +146,24 @@ Options:
   --hpack-huffman            Benchmark production HPACK Huffman paths only
   --http2-response           Benchmark small HTTP/2 response framing only
   --http1-chunked            Benchmark Pico HTTP/1 chunk decoding only
+  --optimization-routing     Benchmark route-table lookup scaling only
+  --optimization-json-fields
+                             Benchmark repeated on-demand JSON field access
+  --optimization-json-writer
+                             Benchmark record JSON writing and materialization
+  --optimization-quadratic  Benchmark collection and helper API scaling
+  --optimization-scheduler  Benchmark external-ready queue snapshot draining
+  --optimization-request-storage
+                             Benchmark request-aware handler storage
+  --optimization-headers    Benchmark request-header lookup and metadata access
+  --optimization-route-binding
+                             Benchmark generic route argument binding
+  --optimization-http1-parse
+                             Benchmark HTTP/1 parsing and framing validation
+  --optimization-json-record
+                             Benchmark validated positional record decoding
+  --optimization-http1-sequencer
+                             Benchmark ordered HTTP/1 exchange lifecycle
   --jvmti                    Build with debug symbols and load perf-jvmti
   -h, --help                 Show this help
 
@@ -151,6 +188,17 @@ Examples:
   ./dev/benchmarks/benchmark.sh --hpack-huffman
   ./dev/benchmarks/benchmark.sh --http2-response
   ./dev/benchmarks/benchmark.sh --http1-chunked
+  ./dev/benchmarks/benchmark.sh --optimization-routing
+  ./dev/benchmarks/benchmark.sh --optimization-json-fields
+  ./dev/benchmarks/benchmark.sh --optimization-json-writer
+  ./dev/benchmarks/benchmark.sh --optimization-quadratic
+  ./dev/benchmarks/benchmark.sh --optimization-scheduler
+  ./dev/benchmarks/benchmark.sh --optimization-request-storage
+  ./dev/benchmarks/benchmark.sh --optimization-headers
+  ./dev/benchmarks/benchmark.sh --optimization-route-binding
+  ./dev/benchmarks/benchmark.sh --optimization-http1-parse
+  ./dev/benchmarks/benchmark.sh --optimization-json-record
+  ./dev/benchmarks/benchmark.sh --optimization-http1-sequencer
 EOF
 }
 
@@ -203,12 +251,99 @@ while [ "$#" -gt 0 ]; do
             HTTP1_CHUNKED_ONLY=true
             shift
             ;;
+        --optimization-routing)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_ROUTING_ONLY=true
+            shift
+            ;;
+        --optimization-json-fields)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_JSON_FIELDS_ONLY=true
+            shift
+            ;;
+        --optimization-json-writer)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_JSON_WRITER_ONLY=true
+            shift
+            ;;
+        --optimization-quadratic)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_QUADRATIC_ONLY=true
+            shift
+            ;;
+        --optimization-scheduler)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_SCHEDULER_ONLY=true
+            shift
+            ;;
+        --optimization-request-storage)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_REQUEST_STORAGE_ONLY=true
+            shift
+            ;;
+        --optimization-headers)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_HEADERS_ONLY=true
+            shift
+            ;;
+        --optimization-route-binding)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_ROUTE_BINDING_ONLY=true
+            shift
+            ;;
+        --optimization-http1-parse)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_HTTP1_PARSE_ONLY=true
+            shift
+            ;;
+        --optimization-json-record)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_JSON_RECORD_ONLY=true
+            shift
+            ;;
+        --optimization-http1-sequencer)
+            RUN_MICROBENCHMARKS=true
+            MICRO_ONLY=true
+            OPTIMIZATION_HTTP1_SEQUENCER_ONLY=true
+            shift
+            ;;
         --scheduler-stats)
             SCHEDULER_STATS=true
             shift
             ;;
-        --egress-pool-stats)
-            EGRESS_POOL_STATS=true
+        --http1-cqe-driver)
+            HTTP1_CQE_DRIVER=true
+            shift
+            ;;
+        --no-http1-cqe-driver)
+            HTTP1_CQE_DRIVER=false
+            shift
+            ;;
+        --http1-cqe-driver-stats)
+            HTTP1_CQE_DRIVER=true
+            HTTP1_CQE_DRIVER_STATS=true
+            shift
+            ;;
+        --http1-direct-batch)
+            HTTP1_DIRECT_BATCH=true
+            shift
+            ;;
+        --no-http1-direct-batch)
+            HTTP1_DIRECT_BATCH=false
+            shift
+            ;;
+        --virtual-thread-stats)
+            VIRTUAL_THREAD_STATS=true
             shift
             ;;
         --scheduler-mode|--scheduler-mode=*)
@@ -980,6 +1115,28 @@ if [ "$RUN_MICROBENCHMARKS" = true ]; then
     MICROBENCHMARK_ARGS=()
     if [ "$REQUEST_PARSERS_ONLY" = true ]; then
         MICROBENCHMARK_ARGS+=(--request-parsers)
+    elif [ "$OPTIMIZATION_ROUTING_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-routing)
+    elif [ "$OPTIMIZATION_JSON_FIELDS_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-json-fields)
+    elif [ "$OPTIMIZATION_JSON_WRITER_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-json-writer)
+    elif [ "$OPTIMIZATION_QUADRATIC_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-quadratic)
+    elif [ "$OPTIMIZATION_SCHEDULER_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-scheduler)
+    elif [ "$OPTIMIZATION_REQUEST_STORAGE_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-request-storage)
+    elif [ "$OPTIMIZATION_HEADERS_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-headers)
+    elif [ "$OPTIMIZATION_ROUTE_BINDING_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-route-binding)
+    elif [ "$OPTIMIZATION_HTTP1_PARSE_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-http1-parse)
+    elif [ "$OPTIMIZATION_JSON_RECORD_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-json-record)
+    elif [ "$OPTIMIZATION_HTTP1_SEQUENCER_ONLY" = true ]; then
+        MICROBENCHMARK_ARGS+=(--optimization-http1-sequencer)
     elif [ "$HPACK_HUFFMAN_ONLY" = true ]; then
         MICROBENCHMARK_ARGS+=(--hpack-huffman)
     elif [ "$HTTP2_RESPONSE_ONLY" = true ]; then
@@ -1281,7 +1438,9 @@ print_runtime_configuration() {
         echo "io_uring task pool: runtime-derived from fixed-file capacity and SQ entries"
     fi
     echo "Scheduler: topological causal epochs, stats=$SCHEDULER_STATS"
-    echo "Egress pool stats: $EGRESS_POOL_STATS"
+    echo "HTTP/1 CQE driver: enabled=$HTTP1_CQE_DRIVER, stats=$HTTP1_CQE_DRIVER_STATS"
+    echo "HTTP/1 direct batch encoding: $HTTP1_DIRECT_BATCH"
+    echo "Virtual-thread mount stats: $VIRTUAL_THREAD_STATS"
     echo "Server event-loop CPUs: $SERVER_CPU_LIST"
     if [ "$CLIENT_AFFINITY" = true ]; then
         if [ "$CLIENT_USES_SERVER_SMT" = true ]; then
@@ -1429,7 +1588,7 @@ run_case() {
     fi
 
     if command -v pidstat >/dev/null 2>&1; then
-        pidstat -p "$server_pid" 1 > "$cpu_log" &
+        pidstat -u -r -p "$server_pid" 1 > "$cpu_log" &
         PIDSTAT_PID=$!
     else
         PIDSTAT_PID=""
@@ -1481,6 +1640,11 @@ CARDIGAN_FIXED_FILE_ARGS=(
 CARDIGAN_SCHEDULER_ARGS=(
     -Dcardigan.scheduler.stats="$SCHEDULER_STATS"
 )
+CARDIGAN_HTTP1_ARGS=(
+    -Dcardigan.http1.cqeDriver="$HTTP1_CQE_DRIVER"
+    -Dcardigan.http1.cqeDriver.stats="$HTTP1_CQE_DRIVER_STATS"
+    -Dcardigan.virtual.thread.stats="$VIRTUAL_THREAD_STATS"
+)
 if [ -n "$URING_MAX_TASKS" ]; then
     CARDIGAN_FIXED_FILE_ARGS+=(
         -Dcardigan.max.tasks="$URING_MAX_TASKS"
@@ -1512,10 +1676,11 @@ java "${JAVA_ARGS[@]}" \
         "${CARDIGAN_DIAGNOSTIC_ARGS[@]}" \
         "${CARDIGAN_FIXED_FILE_ARGS[@]}" \
         "${CARDIGAN_SCHEDULER_ARGS[@]}" \
+        "${CARDIGAN_HTTP1_ARGS[@]}" \
         -Dcardigan.benchmark.payloadSize="$PAYLOAD_SIZE" \
         -Dcardigan.benchmark.sleepMillis="$SLEEP_MILLIS" \
         -Dcardigan.benchmark.heavyIterations="$HEAVY_ITERATIONS" \
-        -Dcardigan.egress.pool.stats="$EGRESS_POOL_STATS" \
+        -Dcardigan.http1.directBatch="$HTTP1_DIRECT_BATCH" \
         -Dcardigan.http2.resource.stats="$HTTP2_RESOURCE_STATS" \
         -Dcardigan.http2.max.parked.senders.per.loop="$HTTP2_MAX_PARKED_SENDERS" \
         -Dcardigan.isolated.carriers="$ISOLATED_CARRIERS" \

@@ -4,6 +4,7 @@ package dev.cardigan.http;
 
 import java.lang.foreign.MemorySegment;
 import dev.cardigan.pico.PicoHTTPParser;
+import dev.cardigan.pico.Request;
 import dev.cardigan.ffi.RawSegment;
 
 public class HttpRequestParser {
@@ -20,9 +21,16 @@ public class HttpRequestParser {
         long bodyStart = res;
         long bodyLen = 0;
 
-        Utf8Slice contentLengthSlice = request.getHeader("Content-Length");
-        if (contentLengthSlice != null) {
-            long contentLength = parseDecimal(contentLengthSlice);
+        long framingHeaders = request.picoRequest().framingHeaders;
+        int contentLengthIndex = (int) (framingHeaders
+            & Request.FRAMING_INDEX_MASK) - 1;
+        int connectionHeaderIndex = (int) ((framingHeaders
+            >>> Request.FRAMING_CONNECTION_SHIFT)
+            & Request.FRAMING_INDEX_MASK) - 1;
+        request.cacheConnectionHeader(connectionHeaderIndex);
+        if (contentLengthIndex >= 0) {
+            long contentLength = parseDecimal(
+                request.headerValue(contentLengthIndex));
             if (contentLength > 0) {
                 bodyLen = contentLength;
                 if (bodyStart + bodyLen > limit) {

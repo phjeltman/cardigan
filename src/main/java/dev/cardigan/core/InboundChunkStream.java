@@ -47,6 +47,36 @@ final class InboundChunkStream implements AutoCloseable {
         return chunk;
     }
 
+    /** Returns immediately when the asynchronous receiver has no queued data. */
+    InboundChunk nextAvailableChunk() {
+        if (pending != null) {
+            InboundChunk chunk = pending;
+            int remaining = chunk.length() - pendingOffset;
+            if (pendingOffset != 0) {
+                MemorySegment.copy(
+                    chunk.segment(), pendingOffset,
+                    chunk.segment(), 0, remaining);
+                chunk.length(remaining);
+            }
+            pending = null;
+            pendingOffset = 0;
+            return chunk;
+        }
+        return receiver.tryReceive();
+    }
+
+    boolean registerAvailabilityListener(Runnable listener) {
+        return receiver.registerAvailabilityListener(listener);
+    }
+
+    void clearAvailabilityListener(Runnable listener) {
+        receiver.clearAvailabilityListener(listener);
+    }
+
+    boolean inputTerminated() {
+        return receiver.inputTerminated();
+    }
+
     int appendOnce(InboundChunk destination, int destinationLength, int maximumLength) {
         if (destinationLength >= maximumLength) {
             return destinationLength;

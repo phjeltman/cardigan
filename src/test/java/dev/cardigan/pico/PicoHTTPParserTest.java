@@ -911,6 +911,52 @@ public class PicoHTTPParserTest {
         assertBufIs(ms, bufsz[0], ret, nextReq);
     }
 
+    @Test
+    public void testChunkedSpansDoNotCompactInput() {
+        String body = "6;source=test\r\nhello \r\n5\r\nworld\r\n0\r\n"
+            + "X-Checksum: accepted\r\n\r\n";
+        String nextRequest = "GET /next HTTP/1.1\r\n\r\n";
+        byte[] input = (body + nextRequest)
+            .getBytes(StandardCharsets.ISO_8859_1);
+
+        for (int receiveLength : new int[]{1, 7, input.length}) {
+            byte[] bytes = input.clone();
+            MemorySegment ms = MemorySegment.ofArray(bytes);
+            ChunkedDecoder decoder = new ChunkedDecoder();
+            decoder.consumeTrailer = true;
+            long[] span = new long[2];
+            StringBuilder decoded = new StringBuilder();
+            int offset = 0;
+            int revealed = 0;
+            int result = PicoHTTPParser.ERROR_PARTIAL;
+
+            while (result != PicoHTTPParser.CHUNKED_COMPLETE) {
+                revealed = Math.min(
+                    input.length, Math.max(revealed, offset + receiveLength));
+                result = PicoHTTPParser.decodeChunkedSpan(
+                    decoder, ms, offset, revealed - offset, span);
+                int consumed = Math.toIntExact(span[0]);
+                int produced = Math.toIntExact(span[1]);
+                int payloadOffset = offset + consumed - produced;
+                for (int i = 0; i < produced; i++) {
+                    decoded.append((char) Byte.toUnsignedInt(ms.get(
+                        ValueLayout.JAVA_BYTE, payloadOffset + i)));
+                }
+                offset += consumed;
+
+                assertNotEquals(PicoHTTPParser.ERROR_PARSE, result);
+                assertTrue(consumed != 0 || revealed != input.length,
+                    "Chunked span decoder stalled at end of input");
+            }
+
+            assertEquals("hello world", decoded.toString());
+            assertEquals(body.length(), offset);
+            assertArrayEquals(input, bytes);
+            assertBufIs(
+                ms, offset, nextRequest.length(), nextRequest);
+        }
+    }
+
     private int doTestChunkedOverhead(int chunkLen, int chunkCount, String extra) {
         ChunkedDecoder dec = new ChunkedDecoder();
         byte[] buf = new byte[1024];

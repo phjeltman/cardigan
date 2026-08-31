@@ -27,8 +27,8 @@ public final class Http1ChunkedBenchmark {
         System.out.println(
             "\n--- HTTP/1 phr_decode_chunked Microbenchmarks ---");
         System.out.println(
-            "Native buffers; fixture restoration and decoder reset are "
-                + "outside timed regions");
+            "Native buffers; decoding plus application copy are timed; "
+                + "fixture restoration and decoder reset are not");
 
         runCase("1 KiB, one chunk", 1 * 1024, 1 * 1024,
             Integer.MAX_VALUE, "", "");
@@ -72,6 +72,9 @@ public final class Http1ChunkedBenchmark {
                 Math.min(MAX_FIXTURES, TARGET_WORKING_SET / stride));
             MemorySegment work = arena.allocate(
                 (long) stride * fixtureCount, 64);
+            int outputStride = (payloadLength + 63) & ~63;
+            MemorySegment output = arena.allocate(
+                (long) outputStride * fixtureCount, 64);
             ChunkedDecoder[] decoders = new ChunkedDecoder[fixtureCount];
             for (int i = 0; i < fixtureCount; i++) {
                 decoders[i] = new ChunkedDecoder();
@@ -80,19 +83,27 @@ public final class Http1ChunkedBenchmark {
             Scenario scenario = new Scenario(
                 pristine,
                 work,
+                output,
                 decoders,
-                new long[1],
+                new long[2],
                 encoded.length,
                 payloadLength,
                 effectiveReceiveLength,
-                stride
+                stride,
+                outputStride
             );
-            scenario.prepare();
-            long validation = scenario.decodeBatch(true);
+            scenario.prepare(true);
+            long validation = scenario.decodeBatch(true, false);
+            scenario.prepare(true);
+            validation ^= scenario.decodeBatch(true, true);
             blackhole ^= validation;
 
-            measureFor(scenario, WARMUP_NANOS);
-            Measurement result = measureFor(scenario, RUN_NANOS);
+            measureFor(scenario, false, WARMUP_NANOS);
+            Measurement compact = measureFor(
+                scenario, false, RUN_NANOS);
+            scenario.prepare(true);
+            measureFor(scenario, true, WARMUP_NANOS);
+            Measurement direct = measureFor(scenario, true, RUN_NANOS);
             int callsPerMessage =
                 (encoded.length + effectiveReceiveLength - 1)
                     / effectiveReceiveLength;
@@ -100,27 +111,38 @@ public final class Http1ChunkedBenchmark {
             System.out.printf(
                 "%-43s %8.2f ns/msg  %6.2f GiB/s payload  "
                     + "%6.2f GiB/s input  (%d decode call%s/msg)%n",
-                label + ":",
-                result.nanosecondsPerMessage(),
-                result.decodedGiBPerSecond(payloadLength),
-                result.encodedGiBPerSecond(encoded.length),
+                label + " compact:",
+                compact.nanosecondsPerMessage(),
+                compact.decodedGiBPerSecond(payloadLength),
+                compact.encodedGiBPerSecond(encoded.length),
                 callsPerMessage,
                 callsPerMessage == 1 ? "" : "s"
+            );
+            System.out.printf(
+                "%-43s %8.2f ns/msg  %6.2f GiB/s payload  "
+                    + "%6.2f GiB/s input  (%+.1f%%)%n",
+                label + " direct:",
+                direct.nanosecondsPerMessage(),
+                direct.decodedGiBPerSecond(payloadLength),
+                direct.encodedGiBPerSecond(encoded.length),
+                (compact.nanosecondsPerMessage()
+                    / direct.nanosecondsPerMessage() - 1.0) * 100.0
             );
         }
     }
 
     private static Measurement measureFor(
         Scenario scenario,
+        boolean direct,
         long targetMeasuredNanos
     ) {
         long messages = 0;
         long measuredNanos = 0;
         long checksum = 0;
         while (measuredNanos < targetMeasuredNanos) {
-            scenario.prepare();
+            scenario.prepare(!direct);
             long start = System.nanoTime();
-            checksum ^= scenario.decodeBatch(false);
+            checksum ^= scenario.decodeBatch(false, direct);
             measuredNanos += System.nanoTime() - start;
             messages += scenario.fixtureCount();
         }
@@ -181,65 +203,79 @@ public final class Http1ChunkedBenchmark {
     private static final class Scenario {
         private final MemorySegment pristine;
         private final MemorySegment work;
+        private final MemorySegment output;
         private final ChunkedDecoder[] decoders;
-        private final long[] decodeLength;
+        private final long[] decodeOutput;
         private final int encodedLength;
         private final int payloadLength;
         private final int receiveLength;
         private final int stride;
+        private final int outputStride;
 
         private Scenario(
             MemorySegment pristine,
             MemorySegment work,
+            MemorySegment output,
             ChunkedDecoder[] decoders,
-            long[] decodeLength,
+            long[] decodeOutput,
             int encodedLength,
             int payloadLength,
             int receiveLength,
-            int stride
+            int stride,
+            int outputStride
         ) {
             this.pristine = pristine;
             this.work = work;
+            this.output = output;
             this.decoders = decoders;
-            this.decodeLength = decodeLength;
+            this.decodeOutput = decodeOutput;
             this.encodedLength = encodedLength;
             this.payloadLength = payloadLength;
             this.receiveLength = receiveLength;
             this.stride = stride;
+            this.outputStride = outputStride;
         }
 
         int fixtureCount() {
             return decoders.length;
         }
 
-        void prepare() {
+        void prepare(boolean restoreInput) {
             for (int i = 0; i < decoders.length; i++) {
-                MemorySegment.copy(
-                    pristine, 0, work, (long) i * stride, encodedLength);
+                if (restoreInput) {
+                    MemorySegment.copy(
+                        pristine, 0, work, (long) i * stride, encodedLength);
+                }
                 ChunkedDecoder decoder = decoders[i];
                 decoder.reset();
                 decoder.consumeTrailer = true;
             }
         }
 
-        long decodeBatch(boolean validate) {
+        long decodeBatch(boolean validate, boolean direct) {
+            return direct
+                ? decodeDirectBatch(validate) : decodeCompactBatch(validate);
+        }
+
+        private long decodeCompactBatch(boolean validate) {
             long checksum = 0;
             for (int fixture = 0; fixture < decoders.length; fixture++) {
                 long base = (long) fixture * stride;
+                long outputBase = (long) fixture * outputStride;
                 int encodedOffset = 0;
                 int decoded = 0;
                 long result = PicoHTTPParser.ERROR_PARTIAL;
                 while (encodedOffset < encodedLength) {
                     int count = Math.min(
                         receiveLength, encodedLength - encodedOffset);
-                    decodeLength[0] = count;
+                    decodeOutput[0] = count;
                     result = PicoHTTPParser.decodeChunked(
                         decoders[fixture],
                         work,
                         base + encodedOffset,
-                        decodeLength
+                        decodeOutput
                     );
-                    int produced = Math.toIntExact(decodeLength[0]);
+                    int produced = Math.toIntExact(decodeOutput[0]);
                     if (validate) {
                         for (int i = 0; i < produced; i++) {
                             byte expected = (byte) (
@@ -255,6 +291,11 @@ public final class Http1ChunkedBenchmark {
                             }
                         }
                     }
+                    MemorySegment.copy(
+                        work, base + encodedOffset,
+                        output, outputBase + decoded,
+                        produced
+                    );
                     decoded += produced;
                     encodedOffset += count;
                 }
@@ -263,6 +304,75 @@ public final class Http1ChunkedBenchmark {
                         "Invalid benchmark fixture: result=" + result
                             + ", decoded=" + decoded
                             + ", expected=" + payloadLength);
+                }
+                checksum += decoded * 31L + result;
+            }
+            return checksum;
+        }
+
+        private long decodeDirectBatch(boolean validate) {
+            long checksum = 0;
+            for (int fixture = 0; fixture < decoders.length; fixture++) {
+                long base = (long) fixture * stride;
+                long outputBase = (long) fixture * outputStride;
+                int encodedOffset = 0;
+                int decoded = 0;
+                int result = PicoHTTPParser.ERROR_PARTIAL;
+                while (encodedOffset < encodedLength
+                        && result != PicoHTTPParser.CHUNKED_COMPLETE) {
+                    int receiveEnd = Math.min(
+                        encodedLength, encodedOffset + receiveLength);
+                    while (encodedOffset < receiveEnd
+                            && result
+                                != PicoHTTPParser.CHUNKED_COMPLETE) {
+                        int callOffset = encodedOffset;
+                        result = PicoHTTPParser.decodeChunkedTo(
+                            decoders[fixture],
+                            work,
+                            base + callOffset,
+                            receiveEnd - callOffset,
+                            output,
+                            outputBase + decoded,
+                            payloadLength - decoded,
+                            payloadLength - decoded,
+                            Long.MAX_VALUE,
+                            decodeOutput
+                        );
+                        int consumed = Math.toIntExact(decodeOutput[0]);
+                        int produced = Math.toIntExact(decodeOutput[1]);
+                        decoded += produced;
+                        encodedOffset += consumed;
+                        if (result < 0
+                                && result != PicoHTTPParser.ERROR_PARTIAL) {
+                            throw new IllegalStateException(
+                                "Direct fixture failed to decode: " + result);
+                        }
+                        if (consumed == 0) {
+                            throw new IllegalStateException(
+                                "Span fixture decoder stalled");
+                        }
+                    }
+                }
+                if (validate && (result
+                        != PicoHTTPParser.CHUNKED_COMPLETE
+                        || decoded != payloadLength
+                        || encodedOffset != encodedLength)) {
+                    throw new IllegalStateException(
+                        "Invalid direct fixture: result=" + result
+                            + ", consumed=" + encodedOffset
+                            + ", decoded=" + decoded
+                            + ", expected=" + payloadLength);
+                }
+                if (validate) {
+                    for (int i = 0; i < decoded; i++) {
+                        byte expected = (byte) ('A' + (i & 15));
+                        byte actual = output.get(
+                            ValueLayout.JAVA_BYTE, outputBase + i);
+                        if (actual != expected) {
+                            throw new IllegalStateException(
+                                "Direct fixture mismatch at " + i);
+                        }
+                    }
                 }
                 checksum += decoded * 31L + result;
             }

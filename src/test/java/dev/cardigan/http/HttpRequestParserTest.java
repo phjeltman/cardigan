@@ -44,7 +44,7 @@ public class HttpRequestParserTest {
         String body = "{\"name\":\"Alice\",\"age\":30}";
         String raw = "POST /api/users HTTP/1.1\r\n" +
                      "Content-Type: application/json\r\n" +
-                     "Content-Length: " + body.length() + "\r\n\r\n" +
+                     "cOnTeNt-LeNgTh: " + body.length() + "\r\n\r\n" +
                      body;
 
         try (Arena arena = Arena.ofConfined()) {
@@ -73,6 +73,44 @@ public class HttpRequestParserTest {
             boolean success = HttpRequestParser.parse(segment, (int) segment.byteSize() - 1, request);
             
             assertFalse(success, "Should fail to parse incomplete request");
+        }
+    }
+
+    @Test
+    void indexedHeaderLookupPreservesCaseDuplicatesAndRequestReuse() {
+        StringBuilder raw = new StringBuilder(2_048);
+        raw.append("GET /headers HTTP/1.1\r\nHost: localhost\r\n");
+        for (int index = 0; index < 60; index++) {
+            raw.append("X-Fill-").append(index)
+                .append(": value-").append(index).append("\r\n");
+        }
+        raw.append("X-Duplicate: first\r\n")
+            .append("x-duplicate: second\r\n")
+            .append("cOnNeCtIoN: keep-alive\r\n\r\n");
+
+        try (Arena arena = Arena.ofConfined()) {
+            HttpRequest request = new HttpRequest();
+            MemorySegment first = arena.allocateFrom(raw.toString());
+            assertTrue(HttpRequestParser.parse(
+                first, (int) first.byteSize() - 1, request));
+            assertEquals(64, request.headerCount());
+            assertEquals("localhost", request.getHeader("host").toString());
+            assertEquals("value-59",
+                request.getHeader("X-FILL-59").toString());
+            assertEquals("first",
+                request.getHeader("x-duplicate").toString());
+            assertNull(request.getHeader("x-absent"));
+            assertTrue(request.isKeepAlive());
+
+            MemorySegment second = arena.allocateFrom(
+                "GET /next HTTP/1.0\r\n"
+                    + "X-New: replacement\r\n\r\n");
+            assertTrue(HttpRequestParser.parse(
+                second, (int) second.byteSize() - 1, request));
+            assertNull(request.getHeader("x-fill-59"));
+            assertEquals("replacement",
+                request.getHeader("X-NEW").toString());
+            assertFalse(request.isKeepAlive());
         }
     }
 }
