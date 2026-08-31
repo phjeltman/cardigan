@@ -46,6 +46,9 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
     private MemorySegment[] references;
     private int queueHead;
     private int queueSize;
+    private int appendReservationIndex = -1;
+    private int appendReservationOffset;
+    private int appendReservationCapacity;
 
     private boolean startScheduled;
     private boolean sendInFlight;
@@ -110,6 +113,74 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
             throw new IllegalArgumentException("Invalid borrowed send segment");
         }
         return enqueue(-1, segment.address() + offset, length, segment);
+    }
+
+    /**
+     * Reserves the unused tail of the final queued owned buffer. The returned
+     * slice remains exclusively mutable until it is committed or aborted.
+     */
+    MemorySegment beginOwnedAppend(int maximumLength) {
+        if (maximumLength <= 0
+                || maximumLength > UringEventLoop.EGRESS_FRAME_SIZE) {
+            throw new IllegalArgumentException(
+                "Invalid append reservation length: " + maximumLength);
+        }
+        if (!loop.inCarrierDomain()) {
+            throw new IllegalStateException(
+                "Owned appends must run on the writer's event loop");
+        }
+        if (appendReservationIndex >= 0) {
+            throw new IllegalStateException(
+                "An owned append reservation is already active");
+        }
+        if (failure != 0 || queueSize == 0) {
+            return null;
+        }
+
+        int index = (queueHead + queueSize - 1) & (bufferIds.length - 1);
+        int bufferId = bufferIds[index];
+        int offset = lengths[index];
+        int capacity = UringEventLoop.EGRESS_FRAME_SIZE - offset;
+        if (bufferId < 0 || references[index] != null
+                || maximumLength > capacity) {
+            return null;
+        }
+
+        appendReservationIndex = index;
+        appendReservationOffset = offset;
+        appendReservationCapacity = maximumLength;
+        return loop.getEgressBufferSegment(bufferId)
+            .asSlice(offset, maximumLength);
+    }
+
+    void commitOwnedAppend(int length) {
+        int index = appendReservationIndex;
+        if (index < 0) {
+            throw new IllegalStateException(
+                "No owned append reservation is active");
+        }
+        if (length <= 0 || length > appendReservationCapacity) {
+            throw new IllegalArgumentException(
+                "Invalid committed append length: " + length);
+        }
+        if (lengths[index] != appendReservationOffset) {
+            throw new IllegalStateException(
+                "The queued append target changed during encoding");
+        }
+        lengths[index] = appendReservationOffset + length;
+        clearAppendReservation();
+    }
+
+    void abortOwnedAppend() {
+        if (appendReservationIndex >= 0) {
+            clearAppendReservation();
+        }
+    }
+
+    private void clearAppendReservation() {
+        appendReservationIndex = -1;
+        appendReservationOffset = 0;
+        appendReservationCapacity = 0;
     }
 
     private boolean enqueue(int bufferId, long address, int length,

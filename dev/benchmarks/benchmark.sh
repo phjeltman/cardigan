@@ -41,6 +41,7 @@ HTTP2_RESOURCE_STATS=false
 SCHEDULER_STATS=false
 HTTP1_CQE_DRIVER=true
 HTTP1_CQE_DRIVER_STATS=false
+HTTP1_DIRECT_BATCH=true
 VIRTUAL_THREAD_STATS=false
 FIXED_FILE_STATS=false
 FIXED_FILES_MODE="auto"
@@ -104,6 +105,8 @@ Options:
   --http1-cqe-driver         Enable the HTTP/1 CQE driver (default)
   --no-http1-cqe-driver      Disable the HTTP/1 CQE driver
   --http1-cqe-driver-stats   Enable the driver and print fallback counters
+  --http1-direct-batch       Encode pipelined responses into queued buffers (default)
+  --no-http1-direct-batch    Disable direct HTTP/1 batch encoding
   --virtual-thread-stats     Count virtual-thread mounts and unmounts
   --fixed-file-stats         Print fixed-file capacity and admission counters
   --fixed-files=MODE         auto, legacy, async-explicit, async-alloc, direct
@@ -329,6 +332,14 @@ while [ "$#" -gt 0 ]; do
         --http1-cqe-driver-stats)
             HTTP1_CQE_DRIVER=true
             HTTP1_CQE_DRIVER_STATS=true
+            shift
+            ;;
+        --http1-direct-batch)
+            HTTP1_DIRECT_BATCH=true
+            shift
+            ;;
+        --no-http1-direct-batch)
+            HTTP1_DIRECT_BATCH=false
             shift
             ;;
         --virtual-thread-stats)
@@ -1428,6 +1439,7 @@ print_runtime_configuration() {
     fi
     echo "Scheduler: topological causal epochs, stats=$SCHEDULER_STATS"
     echo "HTTP/1 CQE driver: enabled=$HTTP1_CQE_DRIVER, stats=$HTTP1_CQE_DRIVER_STATS"
+    echo "HTTP/1 direct batch encoding: $HTTP1_DIRECT_BATCH"
     echo "Virtual-thread mount stats: $VIRTUAL_THREAD_STATS"
     echo "Server event-loop CPUs: $SERVER_CPU_LIST"
     if [ "$CLIENT_AFFINITY" = true ]; then
@@ -1668,6 +1680,7 @@ java "${JAVA_ARGS[@]}" \
         -Dcardigan.benchmark.payloadSize="$PAYLOAD_SIZE" \
         -Dcardigan.benchmark.sleepMillis="$SLEEP_MILLIS" \
         -Dcardigan.benchmark.heavyIterations="$HEAVY_ITERATIONS" \
+        -Dcardigan.http1.directBatch="$HTTP1_DIRECT_BATCH" \
         -Dcardigan.http2.resource.stats="$HTTP2_RESOURCE_STATS" \
         -Dcardigan.http2.max.parked.senders.per.loop="$HTTP2_MAX_PARKED_SENDERS" \
         -Dcardigan.isolated.carriers="$ISOLATED_CARRIERS" \

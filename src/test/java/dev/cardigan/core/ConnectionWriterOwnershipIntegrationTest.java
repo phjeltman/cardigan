@@ -2,6 +2,8 @@
 
 package dev.cardigan.core;
 
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
@@ -11,6 +13,8 @@ import org.junit.jupiter.api.Timeout;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @Tag("integration")
@@ -55,6 +59,57 @@ class ConnectionWriterOwnershipIntegrationTest {
                     && writer.enqueueOwned(
                         second, UringEventLoop.EGRESS_FRAME_SIZE);
             }));
+            assertFalse(awaitDrain(loop, writer));
+            assertEquals(
+                capacity,
+                onLoop(loop, loop::availableEgressBuffers));
+        }
+    }
+
+    @Test
+    void queuedOwnedBufferSupportsCommittedAndAbortedAppends()
+            throws Exception {
+        try (UringEventLoop loop = new UringEventLoop(0, 64)) {
+            ConnectionWriter writer = new ConnectionWriter(loop, -1, -1);
+            int capacity = onLoop(loop, loop::egressBufferCapacity);
+
+            assertTrue(onLoop(loop, () -> {
+                int bufferId = loop.acquireEgressBuffer();
+                MemorySegment buffer =
+                    loop.getEgressBufferSegment(bufferId);
+                buffer.set(ValueLayout.JAVA_BYTE, 0, (byte) 'A');
+                assertTrue(writer.enqueueOwned(bufferId, 1));
+
+                MemorySegment aborted = writer.beginOwnedAppend(3);
+                assertNotNull(aborted);
+                aborted.set(ValueLayout.JAVA_BYTE, 0, (byte) 'B');
+                writer.abortOwnedAppend();
+
+                MemorySegment fullTail = writer.beginOwnedAppend(
+                    UringEventLoop.EGRESS_FRAME_SIZE - 1);
+                assertNotNull(fullTail);
+                writer.abortOwnedAppend();
+
+                MemorySegment committed = writer.beginOwnedAppend(8);
+                assertNotNull(committed);
+                committed.set(ValueLayout.JAVA_BYTE, 0, (byte) 'C');
+                committed.set(ValueLayout.JAVA_BYTE, 1, (byte) 'D');
+                committed.set(ValueLayout.JAVA_BYTE, 2, (byte) 'E');
+                writer.commitOwnedAppend(3);
+
+                assertEquals(
+                    (byte) 'A', buffer.get(ValueLayout.JAVA_BYTE, 0));
+                assertEquals(
+                    (byte) 'C', buffer.get(ValueLayout.JAVA_BYTE, 1));
+                assertEquals(
+                    (byte) 'D', buffer.get(ValueLayout.JAVA_BYTE, 2));
+                assertEquals(
+                    (byte) 'E', buffer.get(ValueLayout.JAVA_BYTE, 3));
+                assertNull(writer.beginOwnedAppend(
+                    UringEventLoop.EGRESS_FRAME_SIZE - 3));
+                return true;
+            }));
+
             assertFalse(awaitDrain(loop, writer));
             assertEquals(
                 capacity,

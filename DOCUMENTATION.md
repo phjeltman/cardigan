@@ -135,6 +135,7 @@ they are not dynamically reloadable. Defaults remain experimental.
 | `cardigan.max.header.size` | 8 KiB | Maximum HTTP/1 header block |
 | `cardigan.http1.max.inflight` | 128 | Exchanges admitted per connection |
 | `cardigan.http1.cqeDriver` | `true` | Drive eligible HTTP/1 requests from receive completions |
+| `cardigan.http1.directBatch` | `true` | Encode ordered pipelined responses into available queued-buffer capacity |
 | `cardigan.http2.max.concurrent.streams` | 128 | Concurrent streams per connection |
 | `cardigan.http2.max.header.list.size` | 16 KiB | Decoded header-list limit |
 | `cardigan.http2.max.streaming.bodies.per.connection` | 16 | Streaming request bodies per connection |

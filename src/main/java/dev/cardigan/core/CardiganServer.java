@@ -106,6 +106,8 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
     public static final int MAX_HTTP1_IN_FLIGHT = Integer.getInteger("cardigan.http1.max.inflight", 128);
     private static final boolean HTTP1_CQE_DRIVER = Boolean.parseBoolean(
         System.getProperty("cardigan.http1.cqeDriver", "true"));
+    private static final boolean HTTP1_DIRECT_BATCH = Boolean.parseBoolean(
+        System.getProperty("cardigan.http1.directBatch", "true"));
 
     static boolean http1CqeDriverEnabled() {
         return HTTP1_CQE_DRIVER;
@@ -2068,6 +2070,70 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 }
             }
 
+            int appendBodyLength = -1;
+            if (asciiLongBody) {
+                appendBodyLength = response.asciiLongBodyLength();
+            } else if (body == null) {
+                appendBodyLength = 0;
+            } else if (body instanceof EncodedBody encodedBody) {
+                appendBodyLength = encodedBody.length();
+            } else if (materializedBytes != null) {
+                appendBodyLength = materializedBytes.length;
+            }
+            int appendHeaderLength = HTTP1_DIRECT_BATCH
+                && hasPipelinedBytes
+                ? fastHttp1HeaderLength(
+                    statusCode,
+                    contentTypeCode,
+                    appendBodyLength,
+                    keepAlive,
+                    keepAliveHeader)
+                : -1;
+            if (appendHeaderLength >= 0) {
+                int appendLength = Math.addExact(
+                    appendHeaderLength, appendBodyLength);
+                if (appendLength <= UringEventLoop.EGRESS_FRAME_SIZE) {
+                    MemorySegment append =
+                        writer.beginOwnedAppend(appendLength);
+                    if (append != null) {
+                        try {
+                            int headersLen = writeHeaders(
+                                append,
+                                statusCode,
+                                contentTypeCode,
+                                contentType,
+                                appendBodyLength,
+                                keepAlive,
+                                keepAliveHeader);
+                            if (headersLen != appendHeaderLength) {
+                                throw new IllegalStateException(
+                                    "HTTP/1 batch header length changed");
+                            }
+                            if (asciiLongBody) {
+                                response.writeAsciiLongBody(
+                                    append.asSlice(
+                                        headersLen, appendBodyLength));
+                            } else if (body instanceof EncodedBody encodedBody) {
+                                encodedBody.write(
+                                    append.asSlice(
+                                        headersLen, appendBodyLength));
+                            } else if (materializedBytes != null) {
+                                RawSegment.copy(
+                                    materializedBytes,
+                                    0,
+                                    append.address() + headersLen,
+                                    appendBodyLength);
+                            }
+                            writer.commitOwnedAppend(appendLength);
+                            return true;
+                        } catch (Throwable failure) {
+                            writer.abortOwnedAppend();
+                            throw failure;
+                        }
+                    }
+                }
+            }
+
             int res = 0;
             int egressId = loop.acquireEgressBuffer();
             MemorySegment respSeg = null;
@@ -2924,6 +2990,60 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
 
         return writeConnectionTerminator(
             baseAddr, offset, keepAlive, keepAliveHeader);
+    }
+
+    private static int fastHttp1HeaderLength(
+            int statusCode,
+            int contentTypeCode,
+            int bodyLength,
+            boolean keepAlive,
+            boolean keepAliveHeader) {
+        if (statusCode != 200 || !keepAlive || bodyLength < 0) {
+            return -1;
+        }
+        int prefixLength = switch (contentTypeCode) {
+            case Response.CT_TEXT -> LEN_HDR_200_TEXT;
+            case Response.CT_JSON -> LEN_HDR_200_JSON;
+            default -> -1;
+        };
+        if (prefixLength < 0) {
+            return -1;
+        }
+        int suffixLength = keepAliveHeader
+            ? LEN_POST_LENGTH_KA
+            : LEN_POST_LENGTH_DEFAULT;
+        return prefixLength + decimalLength(bodyLength) + suffixLength;
+    }
+
+    private static int decimalLength(int value) {
+        if (value < 10) {
+            return 1;
+        }
+        if (value < 100) {
+            return 2;
+        }
+        if (value < 1_000) {
+            return 3;
+        }
+        if (value < 10_000) {
+            return 4;
+        }
+        if (value < 100_000) {
+            return 5;
+        }
+        if (value < 1_000_000) {
+            return 6;
+        }
+        if (value < 10_000_000) {
+            return 7;
+        }
+        if (value < 100_000_000) {
+            return 8;
+        }
+        if (value < 1_000_000_000) {
+            return 9;
+        }
+        return 10;
     }
 
     private static int writeConnectionTerminator(

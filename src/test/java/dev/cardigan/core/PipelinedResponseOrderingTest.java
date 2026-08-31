@@ -14,8 +14,9 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @Tag("integration")
 @ResourceLock(Resources.SYSTEM_PROPERTIES)
@@ -76,5 +77,50 @@ public class PipelinedResponseOrderingTest {
                 }
             }
         });
+    }
+
+    @Test
+    void directBatchPreservesKnownLengthResponseShapes() throws Exception {
+        String responses;
+        try (Socket socket = new Socket("127.0.0.1", PORT)) {
+            socket.setSoTimeout(5_000);
+            socket.getOutputStream().write((
+                "GET /users/7 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                    + "GET /direct/long/12345 HTTP/1.1\r\n"
+                    + "Host: localhost\r\n\r\n"
+                    + "GET /direct/empty HTTP/1.1\r\n"
+                    + "Host: localhost\r\n\r\n"
+                    + "GET /direct/encoded HTTP/1.1\r\n"
+                    + "Host: localhost\r\n\r\n"
+                    + "GET /users/8 HTTP/1.1\r\nHost: localhost\r\n"
+                    + "Connection: close\r\n\r\n")
+                .getBytes(StandardCharsets.US_ASCII));
+            socket.getOutputStream().flush();
+            responses = new String(
+                socket.getInputStream().readAllBytes(),
+                StandardCharsets.US_ASCII);
+        }
+
+        String[] expectedBodies = {
+            "User details for ID: 7 parsed directly off-heap!",
+            "12345",
+            "",
+            "encoded",
+            "User details for ID: 8 parsed directly off-heap!"
+        };
+        int offset = 0;
+        for (String expectedBody : expectedBodies) {
+            int headerEnd = responses.indexOf("\r\n\r\n", offset);
+            assertTrue(headerEnd >= offset, "Missing response header");
+            String headers = responses.substring(offset, headerEnd);
+            assertTrue(headers.startsWith("HTTP/1.1 200 OK\r\n"));
+            assertTrue(headers.contains(
+                "Content-Length: " + expectedBody.length()));
+            int bodyStart = headerEnd + 4;
+            int bodyEnd = bodyStart + expectedBody.length();
+            assertEquals(expectedBody, responses.substring(bodyStart, bodyEnd));
+            offset = bodyEnd;
+        }
+        assertEquals(responses.length(), offset);
     }
 }
