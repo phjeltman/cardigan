@@ -29,7 +29,6 @@ public class PipelinedResponseOrderingTest {
     @BeforeEach
     void setUp() throws Exception {
         System.setProperty("cardigan.socket.send.buffer", "4096");
-        System.setProperty("cardigan.egress.buffers.max", "64");
         server = TestServers.example(PORT, 1);
         server.start();
         Thread.sleep(100);
@@ -41,7 +40,6 @@ public class PipelinedResponseOrderingTest {
             server.close();
         }
         System.clearProperty("cardigan.socket.send.buffer");
-        System.clearProperty("cardigan.egress.buffers.max");
     }
 
     @Test

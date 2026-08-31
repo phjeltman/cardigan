@@ -49,6 +49,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
 
     private boolean startScheduled;
     private boolean sendInFlight;
+    private int inFlightBufferId = -1;
     private int inFlightFrameCount;
     private int inFlightBufferCount;
     private int[] inFlightBufferIds;
@@ -87,7 +88,11 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         return loop;
     }
 
-    boolean enqueue(int bufferId, int length) {
+    /**
+     * Consumes an owned reactor buffer whether the frame is accepted or the
+     * writer has already failed.
+     */
+    boolean enqueueOwned(int bufferId, int length) {
         return enqueue(
             bufferId,
             loop.getEgressBufferSegment(bufferId).address(),
@@ -120,7 +125,13 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         addQueued(bufferId, address, length, reference);
         if (!sendInFlight && !startScheduled) {
             startScheduled = true;
-            loop.executeEgress(this);
+            try {
+                loop.executeEgress(this);
+            } catch (Throwable failure) {
+                startScheduled = false;
+                fail(-5);
+                return false;
+            }
         }
         return true;
     }
@@ -192,7 +203,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
             return;
         }
 
-        releaseInFlightVectorBuffers();
+        retireInFlightBuffers();
         inFlightReference = null;
         sendInFlight = false;
         setPendingFrames(pendingFrames() - inFlightFrameCount);
@@ -224,7 +235,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
                            MemorySegment reference) {
         if (tls != null && !directKtlsSend) {
             ensureVectorStorage();
-            inFlightBufferIds[0] = bufferId;
+            inFlightBufferIds[0] = -1;
             inFlightAddresses[0] = address;
             inFlightLengths[0] = length;
             inFlightReferences[0] = reference;
@@ -244,7 +255,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
             : reference.asSlice(address - reference.address(), length);
         inFlightReference = reference;
         boolean submitted = loop.writeAsync(
-            clientFd, buffer, length, fixedSlot, bufferId, this);
+            clientFd, buffer, length, fixedSlot, this);
         if (submitted && directKtlsSend && TlsStats.ENABLED) {
             TlsStats.directSend(1);
         }
@@ -369,6 +380,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         inFlightFrameCount = frameCount;
         boolean submitted;
         if (vectorCount == 1) {
+            inFlightBufferId = bufferId;
             submitted = submit(bufferId, address, length, reference);
         } else {
             inFlightBufferCount = vectorCount;
@@ -377,14 +389,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         if (!submitted) {
             sendInFlight = false;
             inFlightFrameCount = 0;
-            if (vectorCount == 1) {
-                inFlightReference = null;
-                if (bufferId >= 0) {
-                    loop.releaseEgressBuffer(bufferId);
-                }
-            } else {
-                releaseInFlightVectorBuffers();
-            }
+            retireInFlightBuffers();
             setPendingFrames(pendingFrames() - frameCount);
             fail(-5);
         }
@@ -400,7 +405,11 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         }
     }
 
-    private void releaseInFlightVectorBuffers() {
+    private void retireInFlightBuffers() {
+        if (inFlightBufferId >= 0) {
+            loop.releaseEgressBuffer(inFlightBufferId);
+            inFlightBufferId = -1;
+        }
         for (int i = 0; i < inFlightBufferCount; i++) {
             int bufferId = inFlightBufferIds[i];
             if (bufferId >= 0) {
@@ -409,6 +418,9 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
             inFlightReferences[i] = null;
         }
         inFlightBufferCount = 0;
+        if (inFlightReferences != null) {
+            inFlightReferences[0] = null;
+        }
     }
 
     private void addQueued(int bufferId, long address, int length,

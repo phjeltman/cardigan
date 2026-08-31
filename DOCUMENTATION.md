@@ -134,14 +134,13 @@ they are not dynamically reloadable. Defaults remain experimental.
 | `cardigan.max.request.size` | 10 MiB | Maximum retained request |
 | `cardigan.max.header.size` | 8 KiB | Maximum HTTP/1 header block |
 | `cardigan.http1.max.inflight` | 128 | Exchanges admitted per connection |
+| `cardigan.http1.cqeDriver` | `true` | Drive eligible HTTP/1 requests from receive completions |
 | `cardigan.http2.max.concurrent.streams` | 128 | Concurrent streams per connection |
 | `cardigan.http2.max.header.list.size` | 16 KiB | Decoded header-list limit |
 | `cardigan.http2.max.streaming.bodies.per.connection` | 16 | Streaming request bodies per connection |
 | `cardigan.http2.max.streaming.buffer.bytes` | 256 MiB | Process-wide streaming-buffer budget |
 | `cardigan.ingress.buffers.per.loop` | 128 | 16 KiB provided receive buffers per event loop; power of two |
-| `cardigan.egress.buffers.per.loop` | 4096 | Private 16 KiB response buffers per event loop; power of two from 128 to 32768 and never below ingress capacity |
-| `cardigan.egress.buffers.max` | max(4096, 256 x event loops) | Process-wide lazily allocated egress-buffer limit |
-| `cardigan.egress.pool.stats` | `false` | Report shared egress-pool occupancy and batch counters |
+| `cardigan.egress.buffers.per.loop` | 4096 | Logical per-loop response-buffer limit; power of two from 128 to 32768 and never below ingress capacity |
 | `cardigan.fixed.files.mode` | `auto` | `auto`, `legacy`, `async-explicit`, `async-alloc`, or `direct`; auto uses direct plaintext accept and async allocation for TLS |
 | `cardigan.fixed.files.capacity` | 8192 | Registered socket slots per event loop |
 | `cardigan.max.tasks` | 2 x fixed-file capacity + SQ entries | io_uring task slots per event loop |
@@ -164,11 +163,15 @@ they are not dynamically reloadable. Defaults remain experimental.
 | `cardigan.tls.handshake.timeout.millis` | 10000 | TLS handshake deadline |
 | `cardigan.openssl.libraryDir` | empty | Optional system OpenSSL library directory |
 | `cardigan.tls.stats` | `false` | Report TLS counters at shutdown |
-| `cardigan.http2.resource.stats` | `false` | Report HTTP/2 resource high-water marks |
+| `cardigan.http2.resource.stats` | `false` | Report transport and HTTP/2 resource high-water marks |
 
-The egress pool, fixed-file table, io_uring task pool, exchange queue, and
-retained-worker limit are resource capacities. They bound admission and
-storage; they do not select or tune the scheduler's epoch policy.
+The per-loop egress buffers, fixed-file table, io_uring task pool, exchange
+queue, and retained-worker limit are resource capacities. They bound admission
+and storage; they do not select or tune the scheduler's epoch policy.
+
+Egress capacity is a logical per-loop limit backed by native memory in
+grow-only 64-buffer slabs. Each event loop allocates slabs on demand and
+retains them until the loop closes.
 
 ## Validation
 

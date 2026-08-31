@@ -6,7 +6,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * Opt-in process-wide resource accounting for HTTP/2 flow-control studies.
+ * Opt-in process-wide resource accounting for transport and HTTP/2
+ * flow-control studies.
  * Static-final guards let the JIT eliminate the instrumentation when disabled.
  */
 public record Http2ResourceStats(
@@ -20,6 +21,8 @@ public record Http2ResourceStats(
         int peakExchangeWorkers,
         int egressBuffersInUse,
         int peakEgressBuffersInUse,
+        long egressSlabsAllocated,
+        long egressBytesAllocated,
         long sendWindowWaits,
         long rejectedSendWindowWaits,
         long egressBufferMisses) {
@@ -35,6 +38,8 @@ public record Http2ResourceStats(
     private static final AtomicInteger PEAK_EXCHANGE_WORKERS = new AtomicInteger();
     private static final AtomicInteger EGRESS_BUFFERS = new AtomicInteger();
     private static final AtomicInteger PEAK_EGRESS_BUFFERS = new AtomicInteger();
+    private static final LongAdder EGRESS_SLABS_ALLOCATED = new LongAdder();
+    private static final LongAdder EGRESS_BYTES_ALLOCATED = new LongAdder();
     private static final LongAdder SEND_WINDOW_WAITS = new LongAdder();
     private static final LongAdder REJECTED_SEND_WINDOW_WAITS = new LongAdder();
     private static final LongAdder EGRESS_BUFFER_MISSES = new LongAdder();
@@ -51,6 +56,8 @@ public record Http2ResourceStats(
             PEAK_EXCHANGE_WORKERS.get(),
             EGRESS_BUFFERS.get(),
             PEAK_EGRESS_BUFFERS.get(),
+            EGRESS_SLABS_ALLOCATED.sum(),
+            EGRESS_BYTES_ALLOCATED.sum(),
             SEND_WINDOW_WAITS.sum(),
             REJECTED_SEND_WINDOW_WAITS.sum(),
             EGRESS_BUFFER_MISSES.sum()
@@ -67,6 +74,8 @@ public record Http2ResourceStats(
             + ", peak-exchange-workers=" + peakExchangeWorkers
             + ", egress-buffers=" + egressBuffersInUse
             + ", peak-egress-buffers=" + peakEgressBuffersInUse
+            + ", egress-slabs-allocated=" + egressSlabsAllocated
+            + ", egress-bytes-allocated=" + egressBytesAllocated
             + ", send-window-waits=" + sendWindowWaits
             + ", rejected-send-window-waits=" + rejectedSendWindowWaits
             + ", egress-buffer-misses=" + egressBufferMisses;
@@ -117,6 +126,11 @@ public record Http2ResourceStats(
 
     static void egressBufferMissed() {
         EGRESS_BUFFER_MISSES.increment();
+    }
+
+    static void egressSlabAllocated(long bytes) {
+        EGRESS_SLABS_ALLOCATED.increment();
+        EGRESS_BYTES_ALLOCATED.add(bytes);
     }
 
     private static void updatePeak(int value, AtomicInteger peak) {

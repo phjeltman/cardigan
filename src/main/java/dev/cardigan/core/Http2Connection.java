@@ -1411,7 +1411,7 @@ final class Http2Connection {
         if (egressId >= 0) {
             MemorySegment output = loop.getEgressBufferSegment(egressId);
             int length = writeControl(output, type, flags, streamId, opaqueData, error);
-            if (writer.enqueue(egressId, length)) {
+            if (writer.enqueueOwned(egressId, length)) {
                 return true;
             }
             return false;

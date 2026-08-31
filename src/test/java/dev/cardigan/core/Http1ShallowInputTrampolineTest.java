@@ -248,7 +248,7 @@ class Http1ShallowInputTrampolineTest {
             if (owner != null) {
                 last = owner.getStackTrace();
                 boolean cqeDriver =
-                    Boolean.getBoolean("cardigan.http1.cqeDriver");
+                    CardiganServer.http1CqeDriverEnabled();
                 if (cqeDriver && hasFrame(last, "awaitOutcome")) {
                     return last;
                 }

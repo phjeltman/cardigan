@@ -38,9 +38,8 @@ TLS_CERTIFICATE=""
 TLS_PRIVATE_KEY=""
 TLS_STATS=false
 HTTP2_RESOURCE_STATS=false
-EGRESS_POOL_STATS=false
 SCHEDULER_STATS=false
-HTTP1_CQE_DRIVER=false
+HTTP1_CQE_DRIVER=true
 HTTP1_CQE_DRIVER_STATS=false
 VIRTUAL_THREAD_STATS=false
 FIXED_FILE_STATS=false
@@ -101,9 +100,9 @@ Options:
   --tls-private-key=PATH     PEM private key (default: generated test key)
   --tls-stats                Print opt-in TLS transport counters at shutdown
   --http2-resource-stats     Print opt-in HTTP/2 resource high-water marks
-  --egress-pool-stats        Print shared egress-pool occupancy and batching
   --scheduler-stats          Print per-loop epoch/lane/range counters
-  --http1-cqe-driver         Drive eligible HTTP/1 requests from receive CQEs
+  --http1-cqe-driver         Enable the HTTP/1 CQE driver (default)
+  --no-http1-cqe-driver      Disable the HTTP/1 CQE driver
   --http1-cqe-driver-stats   Enable the driver and print fallback counters
   --virtual-thread-stats     Count virtual-thread mounts and unmounts
   --fixed-file-stats         Print fixed-file capacity and admission counters
@@ -323,6 +322,10 @@ while [ "$#" -gt 0 ]; do
             HTTP1_CQE_DRIVER=true
             shift
             ;;
+        --no-http1-cqe-driver)
+            HTTP1_CQE_DRIVER=false
+            shift
+            ;;
         --http1-cqe-driver-stats)
             HTTP1_CQE_DRIVER=true
             HTTP1_CQE_DRIVER_STATS=true
@@ -330,10 +333,6 @@ while [ "$#" -gt 0 ]; do
             ;;
         --virtual-thread-stats)
             VIRTUAL_THREAD_STATS=true
-            shift
-            ;;
-        --egress-pool-stats)
-            EGRESS_POOL_STATS=true
             shift
             ;;
         --scheduler-mode|--scheduler-mode=*)
@@ -1430,7 +1429,6 @@ print_runtime_configuration() {
     echo "Scheduler: topological causal epochs, stats=$SCHEDULER_STATS"
     echo "HTTP/1 CQE driver: enabled=$HTTP1_CQE_DRIVER, stats=$HTTP1_CQE_DRIVER_STATS"
     echo "Virtual-thread mount stats: $VIRTUAL_THREAD_STATS"
-    echo "Egress pool stats: $EGRESS_POOL_STATS"
     echo "Server event-loop CPUs: $SERVER_CPU_LIST"
     if [ "$CLIENT_AFFINITY" = true ]; then
         if [ "$CLIENT_USES_SERVER_SMT" = true ]; then
@@ -1578,7 +1576,7 @@ run_case() {
     fi
 
     if command -v pidstat >/dev/null 2>&1; then
-        pidstat -p "$server_pid" 1 > "$cpu_log" &
+        pidstat -u -r -p "$server_pid" 1 > "$cpu_log" &
         PIDSTAT_PID=$!
     else
         PIDSTAT_PID=""
@@ -1670,7 +1668,6 @@ java "${JAVA_ARGS[@]}" \
         -Dcardigan.benchmark.payloadSize="$PAYLOAD_SIZE" \
         -Dcardigan.benchmark.sleepMillis="$SLEEP_MILLIS" \
         -Dcardigan.benchmark.heavyIterations="$HEAVY_ITERATIONS" \
-        -Dcardigan.egress.pool.stats="$EGRESS_POOL_STATS" \
         -Dcardigan.http2.resource.stats="$HTTP2_RESOURCE_STATS" \
         -Dcardigan.http2.max.parked.senders.per.loop="$HTTP2_MAX_PARKED_SENDERS" \
         -Dcardigan.isolated.carriers="$ISOLATED_CARRIERS" \

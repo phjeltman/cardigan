@@ -12,7 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @ResourceLock(Resources.SYSTEM_PROPERTIES)
-class EgressBufferPoolSizingTest {
+class ReactorEgressBufferSizingTest {
     private static final String PROPERTY =
         "cardigan.egress.buffers.per.loop";
     private String previous;

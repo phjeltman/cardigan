@@ -22,7 +22,8 @@ public class HttpRequest {
     private final Request picoRequest;
     private final long[] segPacked = new long[16];
     private final byte[] headerIndex = new byte[HEADER_INDEX_CAPACITY];
-    private int indexedHeaderCount;
+    /** Publishes the header index only after all indexed slots are complete. */
+    private volatile int indexedHeaderCount;
     private int headerLookupCount;
 
     private long bodyOffset;
@@ -59,11 +60,7 @@ public class HttpRequest {
         this.resolvedSegmentCount = -1;
         this.routeResolved = false;
         this.keepAliveState = -1;
-        if (indexedHeaderCount != 0) {
-            Arrays.fill(headerIndex, (byte) 0);
-        }
-        indexedHeaderCount = 0;
-        headerLookupCount = 0;
+        resetHeaderLookupIndex();
         connectionHeaderIndex = -2;
     }
 
@@ -249,13 +246,18 @@ public class HttpRequest {
     }
 
     public Utf8Slice getHeader(String name) {
-        if (indexedHeaderCount != picoRequest.numHeaders) {
-            if (headerLookupCount++ == 0) {
-                int index = findHeaderLinear(name);
-                return index < 0 ? null : headerValue(index);
-            }
-            indexHeadersThrough(picoRequest.numHeaders - 1);
+        if (indexedHeaderCount == picoRequest.numHeaders) {
+            return findIndexedHeader(name);
         }
+        return getHeaderBeforeIndex(name);
+    }
+
+    private Utf8Slice getHeaderBeforeIndex(String name) {
+        if (headerLookupCount++ == 0) {
+            int index = findHeaderLinear(name);
+            return index < 0 ? null : headerValue(index);
+        }
+        indexHeadersThrough(picoRequest.numHeaders - 1);
         return findIndexedHeader(name);
     }
 
@@ -516,9 +518,12 @@ public class HttpRequest {
         }
     }
 
-    private void indexHeadersThrough(int lastIndex) {
-        while (indexedHeaderCount <= lastIndex) {
-            int index = indexedHeaderCount++;
+    private synchronized void indexHeadersThrough(int lastIndex) {
+        if (indexedHeaderCount > lastIndex) {
+            return;
+        }
+        int firstIndex = indexedHeaderCount;
+        for (int index = firstIndex; index <= lastIndex; index++) {
             dev.cardigan.pico.Header header = picoRequest.headers[index];
             if (header.nameLen == 0 || header.nameOffset < 0) {
                 continue;
@@ -531,6 +536,7 @@ public class HttpRequest {
             }
             headerIndex[slot] = (byte) (index + 1);
         }
+        indexedHeaderCount = lastIndex + 1;
     }
 
     private int findHeaderLinear(String name) {
@@ -554,8 +560,8 @@ public class HttpRequest {
     private void resetHeaderLookupIndex() {
         if (indexedHeaderCount != 0) {
             Arrays.fill(headerIndex, (byte) 0);
+            indexedHeaderCount = 0;
         }
-        indexedHeaderCount = 0;
         headerLookupCount = 0;
     }
 
