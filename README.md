@@ -21,7 +21,7 @@ asynchronous APIs, Futures, Promises, Mono/Flux chains, or async function
 coloring. Cardigan asks you to write the straight-line code you already wanted
 to write, with asynchronous coordination handled by the runtime.
 
-The machinery lives in the runtime so handlers can stay boring—in the good way:
+The machinery lives in the runtime, so handlers can stay simple:
 
 ```java
 @Get("/hello")
