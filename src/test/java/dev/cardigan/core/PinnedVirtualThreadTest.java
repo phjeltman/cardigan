@@ -26,7 +26,7 @@ public class PinnedVirtualThreadTest {
             AtomicReference<String> carrierAfter = new AtomicReference<>();
             AtomicReference<Thread> vtRef = new AtomicReference<>();
 
-            Thread vt = loop.loomRuntime().startVirtualThread(() -> {
+            ApplicationRuntime.RuntimeTask vt = loop.applicationRuntime().startTask(() -> {
                 vtRef.set(Thread.currentThread());
                 String initialThreadStr = Thread.currentThread().toString();
                 carrierBefore.set(initialThreadStr);
@@ -62,7 +62,7 @@ public class PinnedVirtualThreadTest {
             AtomicBoolean enterNop = new AtomicBoolean();
             AtomicReference<Integer> result = new AtomicReference<>();
 
-            Thread virtualThread = loop.loomRuntime().startVirtualThread(() -> {
+            ApplicationRuntime.RuntimeTask virtualThread = loop.applicationRuntime().startTask(() -> {
                 ready.countDown();
                 while (!enterNop.get()) {
                     Thread.onSpinWait();
@@ -74,7 +74,7 @@ public class PinnedVirtualThreadTest {
 
             // Seed a LockSupport permit before submitOp parks. A one-shot park
             // would consume it and recycle the task ID before its CQE arrives.
-            LockSupport.unpark(virtualThread);
+            virtualThread.wake();
             enterNop.set(true);
 
             virtualThread.join(2_000);
@@ -93,7 +93,7 @@ public class PinnedVirtualThreadTest {
             AtomicInteger resumedPhase = new AtomicInteger();
             AtomicReference<String> carrier = new AtomicReference<>();
 
-            Thread virtualThread = loop.loomRuntime().startVirtualThread(() -> {
+            ApplicationRuntime.RuntimeTask virtualThread = loop.applicationRuntime().startTask(() -> {
                 parked.countDown();
                 LockSupport.park();
                 resumedPhase.set(phase.get());
@@ -104,7 +104,7 @@ public class PinnedVirtualThreadTest {
             assertTrue(parked.await(2, TimeUnit.SECONDS));
             loop.executeProtocol(() -> {
                 phase.set(1);
-                LockSupport.unpark(virtualThread);
+                virtualThread.wake();
                 phase.set(2);
                 unparkTaskDone.countDown();
             });
@@ -123,7 +123,7 @@ public class PinnedVirtualThreadTest {
     public void testRepeatedCompletionsResumeVirtualThread() throws Exception {
         try (UringEventLoop loop = new UringEventLoop(0, 64)) {
             AtomicReference<Throwable> failure = new AtomicReference<>();
-            Thread virtualThread = loop.loomRuntime().startVirtualThread(() -> {
+            ApplicationRuntime.RuntimeTask virtualThread = loop.applicationRuntime().startTask(() -> {
                 try {
                     for (int i = 0; i < 1_000; i++) {
                         int result = loop.nop();

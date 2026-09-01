@@ -7,14 +7,12 @@ import dev.cardigan.tls.TlsStats;
 import java.lang.foreign.MemorySegment;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.util.concurrent.locks.LockSupport;
 
 /**
  * Serializes asynchronous response frames for a single stream socket.
  *
  * Queue mutation is confined to the owning {@link UringEventLoop}.
- * Acquire/release state publishes drain progress to a parked virtual thread;
- * it does not protect the queue itself.
+ * Acquire/release state publishes drain progress to blocking callers.
  */
 final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         UringEventLoop.EgressTask {
@@ -62,7 +60,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
     private MemorySegment inFlightReference;
     private int pendingFrames;
     private volatile int failure;
-    private Thread[] drainWaiters;
+    private Runnable[] drainWaiters;
     private int drainWaiterHead;
     private int drainWaiterCount;
     private Runnable drainHandoff;
@@ -212,23 +210,13 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
             return failure == 0;
         }
 
-        Thread current = Thread.currentThread();
-        boolean interrupted = false;
-        boolean waited = false;
-        while (pendingFrames() != 0 && failure == 0) {
-            addDrainWaiter(current);
-            try {
-                waited = true;
-                LockSupport.park(this);
-                if (pendingFrames() != 0 && failure == 0
-                    && Thread.interrupted()) {
-                    interrupted = true;
-                }
-            } finally {
-                removeDrainWaiter(current);
-            }
-        }
-        if (waited && failure == 0 && drainWaiterCount != 0) {
+        loop.blockingSupport().await(
+            this,
+            () -> pendingFrames() != 0 && failure == 0,
+            this::addDrainWaiter,
+            this::removeDrainWaiter
+        );
+        if (failure == 0 && drainWaiterCount != 0) {
             // A resumed producer normally queues a burst whose completion
             // advances the FIFO. If cancellation returns without writing,
             // this deferred check transfers the idle writer to the next
@@ -238,9 +226,6 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
                 drainHandoff = handoff = this::signalIfDrained;
             }
             loop.executeProtocol(handoff);
-        }
-        if (interrupted) {
-            current.interrupt();
         }
         return failure == 0;
     }
@@ -357,7 +342,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
             if (TlsStats.ENABLED) {
                 TlsStats.sendTask(count);
             }
-            loop.loomRuntime().startVirtualThread(() -> {
+            loop.applicationRuntime().executeTask(() -> {
                 int result = 0;
                 try {
                     for (int i = 0; i < count; i++) {
@@ -572,9 +557,9 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
 
     private void signalIfDrained() {
         if (pendingFrames() == 0 || failure != 0) {
-            Thread waiter;
+            Runnable waiter;
             while ((waiter = pollDrainWaiter()) != null) {
-                LockSupport.unpark(waiter);
+                waiter.run();
                 if (failure == 0) {
                     break;
                 }
@@ -582,11 +567,11 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         }
     }
 
-    private void addDrainWaiter(Thread waiter) {
+    private void addDrainWaiter(Runnable waiter) {
         if (drainWaiters == null) {
-            drainWaiters = new Thread[INITIAL_DRAIN_WAITER_CAPACITY];
+            drainWaiters = new Runnable[INITIAL_DRAIN_WAITER_CAPACITY];
         } else if (drainWaiterCount == drainWaiters.length) {
-            Thread[] expanded = new Thread[drainWaiters.length << 1];
+            Runnable[] expanded = new Runnable[drainWaiters.length << 1];
             for (int i = 0; i < drainWaiterCount; i++) {
                 expanded[i] = drainWaiters[
                     (drainWaiterHead + i) & (drainWaiters.length - 1)];
@@ -600,7 +585,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         drainWaiterCount++;
     }
 
-    private void removeDrainWaiter(Thread waiter) {
+    private void removeDrainWaiter(Runnable waiter) {
         for (int i = 0; i < drainWaiterCount; i++) {
             int index = (drainWaiterHead + i)
                 & (drainWaiters.length - 1);
@@ -625,11 +610,11 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
         }
     }
 
-    private Thread pollDrainWaiter() {
+    private Runnable pollDrainWaiter() {
         if (drainWaiterCount == 0) {
             return null;
         }
-        Thread waiter = drainWaiters[drainWaiterHead];
+        Runnable waiter = drainWaiters[drainWaiterHead];
         drainWaiters[drainWaiterHead] = null;
         drainWaiterHead = (drainWaiterHead + 1)
             & (drainWaiters.length - 1);

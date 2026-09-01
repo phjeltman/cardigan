@@ -69,6 +69,10 @@ resources, and runs application exchanges on virtual threads. Physical cores
 are selected before SMT siblings. Exact placement can be supplied with
 `eventLoopCpus("0,2,4,6")` or `cardigan.eventloop.cpus`.
 
+The transport and protocol core is a core-local callback reactor. Its Loom
+runtime maps completion and progress callbacks onto blocking operations and
+handler virtual threads.
+
 The server requires `IORING_SETUP_SINGLE_ISSUER`, `IORING_SETUP_SUBMIT_ALL`,
 `IORING_SETUP_DEFER_TASKRUN`, `IORING_SETUP_TASKRUN_FLAG`, registered files,
 provided-buffer rings, and multishot accept and receive. Cardigan does not

@@ -40,7 +40,7 @@ final class Http1ExchangeSequencerCleanupTest {
                 router.registerController(controller);
                 Http1ExchangeSequencer sequencer =
                     new Http1ExchangeSequencer(
-                        loop.exchangeExecutor(), 2,
+                        loop.applicationLane(), 2,
                         (response, keepAlive, keepAliveHeader) -> true);
 
                 AtomicReference<Throwable> submitFailure =

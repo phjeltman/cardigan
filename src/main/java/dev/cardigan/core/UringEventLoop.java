@@ -89,7 +89,7 @@ public class UringEventLoop implements AutoCloseable {
     private long taskPoolExhaustions;
 
     private final ReactorRunner runner;
-    private final LoomRuntime loomRuntime;
+    private final ApplicationRuntime applicationRuntime;
     private final ApplicationLane applicationLane;
     private final SchedulerMode schedulerMode;
 
@@ -414,8 +414,8 @@ public class UringEventLoop implements AutoCloseable {
 
         this.runner = new ReactorRunner(this, entries, cpuId);
         try {
-            this.loomRuntime = new LoomRuntime(this, runner, cpuId);
-            this.applicationLane = loomRuntime.applicationLane();
+            this.applicationRuntime = runner.applicationRuntime(this, cpuId);
+            this.applicationLane = applicationRuntime.applicationLane();
         } catch (Throwable failure) {
             arena.close();
             throw failure;
@@ -1421,8 +1421,8 @@ public class UringEventLoop implements AutoCloseable {
 
         UringTask task = tasks[taskId];
         prepareTask(task);
-        LoomRuntime.CompletionWaiter waiter =
-            loomRuntime.beginCompletionWait();
+        ApplicationRuntime.CompletionWait waiter =
+            applicationRuntime.beginCompletionWait();
         task.completionHandler = waiter;
         task.retainOnCompletion = true;
         task.opcode = opcode;
@@ -1475,8 +1475,8 @@ public class UringEventLoop implements AutoCloseable {
         }
         UringTask task = tasks[taskId];
         prepareTask(task);
-        LoomRuntime.CompletionWaiter waiter =
-            loomRuntime.beginCompletionWait();
+        ApplicationRuntime.CompletionWait waiter =
+            applicationRuntime.beginCompletionWait();
         task.completionHandler = waiter;
         task.retainOnCompletion = true;
 
@@ -1538,8 +1538,8 @@ public class UringEventLoop implements AutoCloseable {
         }
         UringTask task = tasks[taskId];
         prepareTask(task);
-        LoomRuntime.CompletionWaiter waiter =
-            loomRuntime.beginCompletionWait();
+        ApplicationRuntime.CompletionWait waiter =
+            applicationRuntime.beginCompletionWait();
         task.completionHandler = waiter;
         task.retainOnCompletion = true;
         long valueOffset = (long) taskId * 4;
@@ -1677,8 +1677,8 @@ public class UringEventLoop implements AutoCloseable {
         }
         UringTask task = tasks[taskId];
         prepareTask(task);
-        LoomRuntime.CompletionWaiter waiter =
-            loomRuntime.beginCompletionWait();
+        ApplicationRuntime.CompletionWait waiter =
+            applicationRuntime.beginCompletionWait();
         task.completionHandler = waiter;
         task.retainOnCompletion = true;
         try {
@@ -1842,8 +1842,8 @@ public class UringEventLoop implements AutoCloseable {
 
         UringTask task = tasks[taskId];
         prepareTask(task);
-        LoomRuntime.CompletionWaiter waiter =
-            loomRuntime.beginCompletionWait();
+        ApplicationRuntime.CompletionWait waiter =
+            applicationRuntime.beginCompletionWait();
         task.completionHandler = waiter;
         task.retainOnCompletion = true;
 
@@ -2429,7 +2429,7 @@ public class UringEventLoop implements AutoCloseable {
     }
 
     boolean inCarrierDomain() {
-        return loomRuntime.inCarrierDomain();
+        return applicationRuntime.inCarrierDomain();
     }
 
     boolean usesEpochScheduler() {
@@ -2440,20 +2440,24 @@ public class UringEventLoop implements AutoCloseable {
         return schedulerEpoch;
     }
 
-    ExchangeExecutor exchangeExecutor() {
-        return loomRuntime.exchanges();
+    ApplicationLane applicationLane() {
+        return applicationLane;
     }
 
     ApplicationDispatcher applicationDispatcher() {
         return applicationLane;
     }
 
-    int exchangeWorkerCount() {
-        return loomRuntime.exchangeWorkerCount();
+    BlockingSupport blockingSupport() {
+        return applicationRuntime;
     }
 
-    LoomRuntime loomRuntime() {
-        return loomRuntime;
+    int exchangeWorkerCount() {
+        return applicationRuntime.workerCount();
+    }
+
+    ApplicationRuntime applicationRuntime() {
+        return applicationRuntime;
     }
 
     static int configuredMaxHttp2ParkedSenders() {
@@ -2572,8 +2576,8 @@ public class UringEventLoop implements AutoCloseable {
         );
     }
 
-    LoomRuntime.VirtualThreadStats virtualThreadStats() {
-        return loomRuntime.stats();
+    ApplicationRuntime.VirtualThreadStats virtualThreadStats() {
+        return applicationRuntime.stats();
     }
 
     boolean tryAcquireHttp2ParkedSender() {
@@ -2709,9 +2713,9 @@ public class UringEventLoop implements AutoCloseable {
     public synchronized void close() {
         if (resourcesClosed) return;
         if (!closed) {
-            loomRuntime.close();
+            applicationRuntime.close();
             boolean workersStopped =
-                loomRuntime.awaitTermination(2_000);
+                applicationRuntime.awaitTermination(2_000);
             if (!workersStopped) {
                 throw new IllegalStateException(
                     "Exchange workers for CPU " + cpuId

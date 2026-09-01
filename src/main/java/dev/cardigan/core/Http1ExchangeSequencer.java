@@ -9,7 +9,6 @@ import dev.cardigan.http.StreamingBody;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.util.concurrent.locks.LockSupport;
 
 /**
  * Applies HTTP/1 response ordering to otherwise independent exchanges.
@@ -42,6 +41,7 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
     }
 
     private final ApplicationDispatcher dispatcher;
+    private final BlockingSupport blockingSupport;
     private final ResponseSender responseSender;
     private final int maxInFlight;
     private final int mask;
@@ -59,14 +59,28 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
     private boolean sending;
     private volatile boolean failed;
     private volatile boolean draining;
-    private volatile Thread waiter;
+    private volatile Runnable waiter;
     private volatile StreamingBody activeResponseBody;
 
     Http1ExchangeSequencer(
             ApplicationDispatcher dispatcher,
             int requestedMaxInFlight,
-                           ResponseSender responseSender) {
+            ResponseSender responseSender) {
+        this(
+            dispatcher,
+            BlockingSupport.nonBlocking(),
+            requestedMaxInFlight,
+            responseSender
+        );
+    }
+
+    Http1ExchangeSequencer(
+            ApplicationDispatcher dispatcher,
+            BlockingSupport blockingSupport,
+            int requestedMaxInFlight,
+            ResponseSender responseSender) {
         this.dispatcher = dispatcher;
+        this.blockingSupport = blockingSupport;
         this.responseSender = responseSender;
 
         int capacity = 1;
@@ -217,19 +231,12 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
             return !failed;
         }
 
-        Thread current = Thread.currentThread();
-        boolean interrupted = false;
-        waiter = current;
-        while (inFlight() != 0 && !failed) {
-            LockSupport.park(this);
-            if (inFlight() != 0 && !failed && Thread.interrupted()) {
-                interrupted = true;
-            }
-        }
-        waiter = null;
-        if (interrupted) {
-            current.interrupt();
-        }
+        blockingSupport.await(
+            this,
+            () -> inFlight() != 0 && !failed,
+            wakeup -> waiter = wakeup,
+            wakeup -> waiter = null
+        );
         return !failed;
     }
 
@@ -273,20 +280,13 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
             return false;
         }
 
-        Thread current = Thread.currentThread();
-        boolean interrupted = false;
-        waiter = current;
-        while ((currentInFlight = inFlight()) >= maxInFlight
-                && !failed) {
-            LockSupport.park(this);
-            if (inFlight() >= maxInFlight && !failed && Thread.interrupted()) {
-                interrupted = true;
-            }
-        }
-        waiter = null;
-        if (interrupted) {
-            current.interrupt();
-        }
+        blockingSupport.await(
+            this,
+            () -> inFlight() >= maxInFlight && !failed,
+            wakeup -> waiter = wakeup,
+            wakeup -> waiter = null
+        );
+        currentInFlight = inFlight();
         if (failed) {
             return false;
         }
@@ -419,9 +419,9 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
     }
 
     private void signalWaiter() {
-        Thread waitingThread = waiter;
-        if (waitingThread != null) {
-            LockSupport.unpark(waitingThread);
+        Runnable wakeup = waiter;
+        if (wakeup != null) {
+            wakeup.run();
         }
     }
 

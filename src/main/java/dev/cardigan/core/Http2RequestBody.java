@@ -8,7 +8,6 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.util.concurrent.locks.LockSupport;
 import java.util.function.IntConsumer;
 
 /** Bounded SPSC body ring between the HTTP/2 frame pump and one handler. */
@@ -36,6 +35,7 @@ final class Http2RequestBody implements RequestBody {
     private final int capacity;
     private final long length;
     private final IntConsumer consumed;
+    private final BlockingSupport blockingSupport;
     private long head;
     private long tail;
     private long delivered;
@@ -43,12 +43,26 @@ final class Http2RequestBody implements RequestBody {
     private volatile boolean ended;
     private volatile boolean failed;
     private volatile boolean discarding;
-    private volatile Thread waiter;
+    private volatile Runnable waiter;
 
     Http2RequestBody(long length, int capacity, IntConsumer consumed) {
+        this(
+            length,
+            capacity,
+            consumed,
+            BlockingSupport.nonBlocking()
+        );
+    }
+
+    Http2RequestBody(
+            long length,
+            int capacity,
+            IntConsumer consumed,
+            BlockingSupport blockingSupport) {
         this.length = length;
         this.capacity = capacity;
         this.consumed = consumed;
+        this.blockingSupport = blockingSupport;
         this.buffer = arena.allocate(capacity, 64);
     }
 
@@ -172,39 +186,35 @@ final class Http2RequestBody implements RequestBody {
     }
 
     private long awaitAvailable() {
-        Thread current = Thread.currentThread();
-        waiter = current;
-        VarHandle.fullFence();
-        try {
-            while (true) {
-                if (failed) {
-                    throw new RequestBodyException(
-                        "HTTP/2 request body aborted");
-                }
-                long available = (long) TAIL.getAcquire(this)
-                    - (long) HEAD.getAcquire(this);
-                if (available != 0) {
-                    return available;
-                }
-                if (ended || discarding) {
-                    return 0;
-                }
-                LockSupport.park(this);
-                if (Thread.interrupted()) {
-                    Thread.currentThread().interrupt();
-                    throw new RequestBodyException(
-                        "Interrupted while reading HTTP/2 request body");
-                }
-            }
-        } finally {
-            waiter = null;
+        if (failed) {
+            throw new RequestBodyException(
+                "HTTP/2 request body aborted");
         }
+        try {
+            blockingSupport.awaitInterruptibly(
+                this,
+                () -> !failed && !ended && !discarding
+                    && (long) TAIL.getAcquire(this)
+                        == (long) HEAD.getAcquire(this),
+                wakeup -> waiter = wakeup,
+                wakeup -> waiter = null
+            );
+        } catch (InterruptedException failure) {
+            throw new RequestBodyException(
+                "Interrupted while reading HTTP/2 request body");
+        }
+        if (failed) {
+            throw new RequestBodyException(
+                "HTTP/2 request body aborted");
+        }
+        return (long) TAIL.getAcquire(this)
+            - (long) HEAD.getAcquire(this);
     }
 
     private void signalWaiter() {
-        Thread waiting = waiter;
+        Runnable waiting = waiter;
         if (waiting != null) {
-            LockSupport.unpark(waiting);
+            waiting.run();
         }
     }
 

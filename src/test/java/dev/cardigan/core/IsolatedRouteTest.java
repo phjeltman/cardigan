@@ -105,7 +105,7 @@ public class IsolatedRouteTest {
             AtomicReference<Response> response = new AtomicReference<>();
             AtomicReference<Throwable> failure = new AtomicReference<>();
             CountDownLatch completed = new CountDownLatch(1);
-            loop.loomRuntime().startVirtualThread(() -> {
+            loop.applicationRuntime().startTask(() -> {
                 try {
                     response.set(router.dispatch(request));
                 } catch (Throwable error) {

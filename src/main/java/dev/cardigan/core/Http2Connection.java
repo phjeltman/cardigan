@@ -18,7 +18,6 @@ import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
-import java.util.concurrent.locks.LockSupport;
 
 /**
  * Connection-scoped HTTP/2 frame pump. Stream dispatch is deliberately kept
@@ -59,7 +58,7 @@ final class Http2Connection {
             TASK_CANCELLED =
                 lookup.findVarHandle(Http2Task.class, "cancelled", boolean.class);
             TASK_SEND_WAITER =
-                lookup.findVarHandle(Http2Task.class, "sendWaiter", Thread.class);
+                lookup.findVarHandle(Http2Task.class, "sendWaiter", Runnable.class);
             TASK_RESPONSE_BODY = lookup.findVarHandle(
                 Http2Task.class, "responseBody", StreamingBody.class);
         } catch (ReflectiveOperationException e) {
@@ -117,7 +116,7 @@ final class Http2Connection {
     private volatile boolean open = true;
     private volatile boolean failed;
     private volatile boolean draining;
-    private volatile Thread waiter;
+    private volatile Runnable waiter;
     private boolean drainInputScheduled;
     private Runnable drainInputShutdown;
     private MemorySegment decodedHeaders;
@@ -1185,8 +1184,6 @@ final class Http2Connection {
     }
 
     private int awaitSendWindow(Http2Task task, int desiredBytes) {
-        Thread current = Thread.currentThread();
-        boolean interrupted = false;
         boolean parked = !failed && !taskCancelled(task)
             && (connectionSendWindow <= 0 || task.sendWindow <= 0);
         UringEventLoop loop = writer.eventLoop();
@@ -1202,20 +1199,17 @@ final class Http2Connection {
             }
             return 0;
         }
-        setTaskSendWaiter(task, current);
         if (parked && Http2ResourceStats.ENABLED) {
             Http2ResourceStats.senderParked();
         }
         try {
-            while (!failed && !taskCancelled(task)
-                   && (connectionSendWindow <= 0 || task.sendWindow <= 0)) {
-                LockSupport.park(this);
-                if (!failed && !taskCancelled(task)
-                    && (connectionSendWindow <= 0 || task.sendWindow <= 0)
-                    && Thread.interrupted()) {
-                    interrupted = true;
-                }
-            }
+            loop.blockingSupport().await(
+                this,
+                () -> !failed && !taskCancelled(task)
+                    && (connectionSendWindow <= 0 || task.sendWindow <= 0),
+                wakeup -> setTaskSendWaiter(task, wakeup),
+                wakeup -> setTaskSendWaiter(task, null)
+            );
         } finally {
             if (parked && Http2ResourceStats.ENABLED) {
                 Http2ResourceStats.senderResumed();
@@ -1223,10 +1217,6 @@ final class Http2Connection {
             if (parked) {
                 loop.releaseHttp2ParkedSender();
             }
-        }
-        setTaskSendWaiter(task, null);
-        if (interrupted) {
-            current.interrupt();
         }
         if (failed || taskCancelled(task)) {
             return 0;
@@ -1246,9 +1236,9 @@ final class Http2Connection {
     }
 
     private static void signalSendWaiter(Http2Task task) {
-        Thread waiting = taskSendWaiter(task);
+        Runnable waiting = taskSendWaiter(task);
         if (waiting != null) {
-            LockSupport.unpark(waiting);
+            waiting.run();
         }
     }
 
@@ -1256,25 +1246,18 @@ final class Http2Connection {
         if (inFlight() == 0) {
             return;
         }
-        Thread current = Thread.currentThread();
-        boolean interrupted = false;
-        waiter = current;
-        while (inFlight() != 0) {
-            LockSupport.park(this);
-            if (inFlight() != 0 && Thread.interrupted()) {
-                interrupted = true;
-            }
-        }
-        waiter = null;
-        if (interrupted) {
-            current.interrupt();
-        }
+        writer.eventLoop().blockingSupport().await(
+            this,
+            () -> inFlight() != 0,
+            wakeup -> waiter = wakeup,
+            wakeup -> waiter = null
+        );
     }
 
     private void signalWaiter() {
-        Thread waiting = waiter;
+        Runnable waiting = waiter;
         if (waiting != null) {
-            LockSupport.unpark(waiting);
+            waiting.run();
         }
     }
 
@@ -1310,11 +1293,11 @@ final class Http2Connection {
         TASK_CANCELLED.setRelease(task, cancelled);
     }
 
-    private static Thread taskSendWaiter(Http2Task task) {
-        return (Thread) TASK_SEND_WAITER.getAcquire(task);
+    private static Runnable taskSendWaiter(Http2Task task) {
+        return (Runnable) TASK_SEND_WAITER.getAcquire(task);
     }
 
-    private static void setTaskSendWaiter(Http2Task task, Thread waiter) {
+    private static void setTaskSendWaiter(Http2Task task, Runnable waiter) {
         TASK_SEND_WAITER.setRelease(task, waiter);
     }
 
@@ -1491,12 +1474,12 @@ final class Http2Connection {
         private int sendWindow;
         private PendingStream requestBodyOwner;
         // Access only through the acquire/release helpers above. These fields
-        // cross between the connection and exchange virtual threads, but do
+        // cross between connection and application execution, but do
         // not require the StoreLoad ordering of sequentially consistent
         // volatile writes.
         private boolean active;
         private boolean cancelled;
-        private Thread sendWaiter;
+        private Runnable sendWaiter;
         private StreamingBody responseBody;
 
         @Override
@@ -1611,7 +1594,8 @@ final class Http2Connection {
                     isolatedStreaming
                         ? consumed -> isolatedStreamingBytesConsumed(
                             this, streamId, consumed)
-                        : consumed -> streamingBytesConsumed(this, consumed)
+                        : consumed -> streamingBytesConsumed(this, consumed),
+                    writer.eventLoop().blockingSupport()
                 );
                 request.setBodyStream(streamingBody);
             }

@@ -10,7 +10,6 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.LockSupport;
 
 /**
  * Bounded SPSC handoff between an HTTP/1 connection continuation and an
@@ -48,6 +47,7 @@ final class Http1IsolatedRequestBody implements RequestBody {
     private final MemorySegment buffer;
     private final long length;
     private final AtomicInteger owners = new AtomicInteger(2);
+    private final BlockingSupport blockingSupport;
 
     private long head;
     private long tail;
@@ -56,15 +56,17 @@ final class Http1IsolatedRequestBody implements RequestBody {
     private volatile boolean failed;
     private volatile boolean discarding;
     private volatile String failureMessage;
-    private volatile Thread readerWaiter;
-    private volatile Thread writerWaiter;
+    private volatile Runnable readerWaiter;
+    private volatile Runnable writerWaiter;
 
-    static Http1IsolatedRequestBody acquire(long length) {
+    static Http1IsolatedRequestBody acquire(
+            long length, BlockingSupport blockingSupport) {
         long active = ACTIVE_BYTES.get();
         while (active <= MAX_ACTIVE_BYTES - CAPACITY) {
             if (ACTIVE_BYTES.compareAndSet(active, active + CAPACITY)) {
                 try {
-                    return new Http1IsolatedRequestBody(length);
+                    return new Http1IsolatedRequestBody(
+                        length, blockingSupport);
                 } catch (Throwable failure) {
                     ACTIVE_BYTES.addAndGet(-CAPACITY);
                     throw failure;
@@ -75,8 +77,10 @@ final class Http1IsolatedRequestBody implements RequestBody {
         return null;
     }
 
-    private Http1IsolatedRequestBody(long length) {
+    private Http1IsolatedRequestBody(
+            long length, BlockingSupport blockingSupport) {
         this.length = length;
+        this.blockingSupport = blockingSupport;
         this.arena = Arena.ofShared();
         this.buffer = arena.allocate(CAPACITY, 64);
     }
@@ -120,7 +124,6 @@ final class Http1IsolatedRequestBody implements RequestBody {
     /** Writes all bytes unless the handler has discarded or failed the body. */
     boolean write(MemorySegment source, int sourceOffset, int length) {
         int written = 0;
-        Thread current = Thread.currentThread();
         while (written < length) {
             if (discarding || failed) {
                 return false;
@@ -131,18 +134,16 @@ final class Http1IsolatedRequestBody implements RequestBody {
             int available = Math.toIntExact(
                 CAPACITY - (currentTail - currentHead));
             if (available == 0) {
-                writerWaiter = current;
-                VarHandle.fullFence();
-                if ((long) TAIL.getAcquire(this)
-                        - (long) HEAD.getAcquire(this) < CAPACITY
-                    || discarding || failed) {
-                    writerWaiter = null;
-                    continue;
-                }
-                LockSupport.park(this);
-                writerWaiter = null;
-                if (Thread.interrupted()) {
-                    Thread.currentThread().interrupt();
+                try {
+                    blockingSupport.awaitInterruptibly(
+                        this,
+                        () -> (long) TAIL.getAcquire(this)
+                                - (long) HEAD.getAcquire(this) >= CAPACITY
+                            && !discarding && !failed,
+                        wakeup -> writerWaiter = wakeup,
+                        wakeup -> writerWaiter = null
+                    );
+                } catch (InterruptedException failure) {
                     fail("HTTP/1 body handoff interrupted");
                     return false;
                 }
@@ -199,7 +200,6 @@ final class Http1IsolatedRequestBody implements RequestBody {
     }
 
     private long awaitReadable() {
-        Thread current = Thread.currentThread();
         while (true) {
             if (failed) {
                 throw new RequestBodyException(failureMessage != null
@@ -215,18 +215,16 @@ final class Http1IsolatedRequestBody implements RequestBody {
                 return 0;
             }
 
-            readerWaiter = current;
-            VarHandle.fullFence();
-            if ((long) TAIL.getAcquire(this)
-                    != (long) HEAD.getAcquire(this)
-                || ended || discarding || failed) {
-                readerWaiter = null;
-                continue;
-            }
-            LockSupport.park(this);
-            readerWaiter = null;
-            if (Thread.interrupted()) {
-                Thread.currentThread().interrupt();
+            try {
+                blockingSupport.awaitInterruptibly(
+                    this,
+                    () -> (long) TAIL.getAcquire(this)
+                            == (long) HEAD.getAcquire(this)
+                        && !ended && !discarding && !failed,
+                    wakeup -> readerWaiter = wakeup,
+                    wakeup -> readerWaiter = null
+                );
+            } catch (InterruptedException failure) {
                 throw new RequestBodyException(
                     "Interrupted while reading HTTP/1 request body");
             }
@@ -234,16 +232,16 @@ final class Http1IsolatedRequestBody implements RequestBody {
     }
 
     private void signalReader() {
-        Thread waiter = readerWaiter;
+        Runnable waiter = readerWaiter;
         if (waiter != null) {
-            LockSupport.unpark(waiter);
+            waiter.run();
         }
     }
 
     private void signalWriter() {
-        Thread waiter = writerWaiter;
+        Runnable waiter = writerWaiter;
         if (waiter != null) {
-            LockSupport.unpark(waiter);
+            waiter.run();
         }
     }
 

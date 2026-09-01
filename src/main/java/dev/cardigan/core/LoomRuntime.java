@@ -6,13 +6,15 @@ import java.lang.reflect.Constructor;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 /**
  * Owns the virtual-thread machinery attached to one event-loop carrier.
  * Transport scheduling enters this layer through the application lane and
  * receives opaque continuations back through the event loop.
  */
-final class LoomRuntime implements AutoCloseable {
+final class LoomRuntime implements ApplicationRuntime {
     static final boolean STATS_ENABLED =
         Boolean.getBoolean("cardigan.virtual.thread.stats");
 
@@ -22,6 +24,8 @@ final class LoomRuntime implements AutoCloseable {
     private final ExchangeExecutor exchanges;
     private final ThreadLocal<CompletionWaiter> completionWaiter =
         ThreadLocal.withInitial(CompletionWaiter::new);
+    private final ThreadLocal<ParkingWaiter> parkingWaiter =
+        ThreadLocal.withInitial(ParkingWaiter::new);
 
     private long coreMounts;
     private long coreUnmounts;
@@ -41,7 +45,17 @@ final class LoomRuntime implements AutoCloseable {
         this.exchanges = new ExchangeExecutor(loop, this);
     }
 
-    Thread startVirtualThread(Runnable task) {
+    @Override
+    public RuntimeTask startTask(Runnable task) {
+        return new LoomTask(start(task));
+    }
+
+    @Override
+    public void executeTask(Runnable task) {
+        start(task);
+    }
+
+    private Thread start(Runnable task) {
         Thread thread = coreThreadFactory.newThread(task);
         thread.start();
         return thread;
@@ -52,7 +66,8 @@ final class LoomRuntime implements AutoCloseable {
         return newBuilder(scheduler).name(name).unstarted(task);
     }
 
-    boolean inCarrierDomain() {
+    @Override
+    public boolean inCarrierDomain() {
         return carrierDomain.containsCurrentThread();
     }
 
@@ -60,18 +75,93 @@ final class LoomRuntime implements AutoCloseable {
         return exchanges;
     }
 
-    ApplicationLane applicationLane() {
+    @Override
+    public ApplicationLane applicationLane() {
         return exchanges;
     }
 
-    int exchangeWorkerCount() {
+    @Override
+    public int workerCount() {
         return exchanges.workerCount();
     }
 
-    CompletionWaiter beginCompletionWait() {
+    @Override
+    public CompletionWaiter beginCompletionWait() {
         CompletionWaiter waiter = completionWaiter.get();
         waiter.prepare();
         return waiter;
+    }
+
+    @Override
+    public void await(
+            Object blocker,
+            BooleanSupplier blocked,
+            Consumer<Runnable> registerWakeup,
+            Consumer<Runnable> unregisterWakeup) {
+        try {
+            await(
+                blocker,
+                blocked,
+                registerWakeup,
+                unregisterWakeup,
+                false
+            );
+        } catch (InterruptedException impossible) {
+            throw new AssertionError(impossible);
+        }
+    }
+
+    @Override
+    public void awaitInterruptibly(
+            Object blocker,
+            BooleanSupplier blocked,
+            Consumer<Runnable> registerWakeup,
+            Consumer<Runnable> unregisterWakeup)
+            throws InterruptedException {
+        await(
+            blocker,
+            blocked,
+            registerWakeup,
+            unregisterWakeup,
+            true
+        );
+    }
+
+    private void await(
+            Object blocker,
+            BooleanSupplier blocked,
+            Consumer<Runnable> registerWakeup,
+            Consumer<Runnable> unregisterWakeup,
+            boolean interruptible) throws InterruptedException {
+        ParkingWaiter waiter = parkingWaiter.get();
+        boolean interrupted = false;
+        boolean registered = false;
+        try {
+            while (blocked.getAsBoolean()) {
+                waiter.prepare();
+                registerWakeup.accept(waiter);
+                registered = true;
+                if (blocked.getAsBoolean()) {
+                    interrupted |= waiter.awaitWakeup(
+                        blocker, interruptible);
+                    if (interrupted && interruptible) {
+                        throw new InterruptedException();
+                    }
+                } else {
+                    waiter.abandon();
+                }
+                unregisterWakeup.accept(waiter);
+                registered = false;
+            }
+        } finally {
+            waiter.abandon();
+            if (registered) {
+                unregisterWakeup.accept(waiter);
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     void runCountedApplicationTask(Runnable continuation) {
@@ -83,8 +173,9 @@ final class LoomRuntime implements AutoCloseable {
         }
     }
 
-    VirtualThreadStats stats() {
-        return new VirtualThreadStats(
+    @Override
+    public ApplicationRuntime.VirtualThreadStats stats() {
+        return new ApplicationRuntime.VirtualThreadStats(
             coreMounts,
             coreUnmounts,
             handlerMounts,
@@ -97,7 +188,8 @@ final class LoomRuntime implements AutoCloseable {
         exchanges.close();
     }
 
-    boolean awaitTermination(long timeoutMillis) {
+    @Override
+    public boolean awaitTermination(long timeoutMillis) {
         return exchanges.awaitTermination(timeoutMillis);
     }
 
@@ -125,7 +217,7 @@ final class LoomRuntime implements AutoCloseable {
     }
 
     static final class CompletionWaiter
-            implements UringEventLoop.CompletionHandler {
+            implements ApplicationRuntime.CompletionWait {
         private volatile Thread thread;
         private int result;
         private int flags;
@@ -152,16 +244,19 @@ final class LoomRuntime implements AutoCloseable {
             LockSupport.unpark(waitingThread);
         }
 
-        int awaitResult() {
+        @Override
+        public int awaitResult() {
             awaitCompletion();
             return result;
         }
 
-        int flags() {
+        @Override
+        public int flags() {
             return flags;
         }
 
-        void abandon() {
+        @Override
+        public void abandon() {
             thread = null;
         }
 
@@ -179,18 +274,42 @@ final class LoomRuntime implements AutoCloseable {
         }
     }
 
-    record VirtualThreadStats(
-        long coreMounts,
-        long coreUnmounts,
-        long handlerMounts,
-        long handlerUnmounts
-    ) {
-        long mounts() {
-            return coreMounts + handlerMounts;
+    private static final class ParkingWaiter implements Runnable {
+        private volatile Thread thread;
+
+        private void prepare() {
+            if (thread != null) {
+                throw new IllegalStateException(
+                    "A protocol wait is already active on this thread");
+            }
+            thread = Thread.currentThread();
         }
 
-        long unmounts() {
-            return coreUnmounts + handlerUnmounts;
+        @Override
+        public void run() {
+            Thread waitingThread = thread;
+            thread = null;
+            LockSupport.unpark(waitingThread);
+        }
+
+        private boolean awaitWakeup(
+                Object blocker, boolean interruptible) {
+            boolean interrupted = false;
+            while (thread != null) {
+                LockSupport.park(blocker);
+                if (thread != null && Thread.interrupted()) {
+                    interrupted = true;
+                    if (interruptible) {
+                        thread = null;
+                        break;
+                    }
+                }
+            }
+            return interrupted;
+        }
+
+        private void abandon() {
+            thread = null;
         }
     }
 
@@ -209,6 +328,45 @@ final class LoomRuntime implements AutoCloseable {
             } finally {
                 coreUnmounts++;
             }
+        }
+    }
+
+    private record LoomTask(Thread thread) implements RuntimeTask {
+        @Override
+        public void join(long timeoutMillis) {
+            boolean interrupted = false;
+            long deadline = timeoutMillis <= 0
+                ? Long.MAX_VALUE
+                : System.nanoTime() + timeoutMillis * 1_000_000L;
+            while (thread.isAlive()) {
+                long remainingNanos = deadline - System.nanoTime();
+                if (remainingNanos <= 0) {
+                    break;
+                }
+                try {
+                    if (timeoutMillis <= 0) {
+                        thread.join();
+                    } else {
+                        thread.join(Math.max(
+                            1, remainingNanos / 1_000_000L));
+                    }
+                } catch (InterruptedException ignored) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        @Override
+        public boolean isAlive() {
+            return thread.isAlive();
+        }
+
+        @Override
+        public void wake() {
+            LockSupport.unpark(thread);
         }
     }
 }

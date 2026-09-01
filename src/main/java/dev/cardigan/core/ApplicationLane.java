@@ -16,4 +16,6 @@ interface ApplicationLane extends ApplicationDispatcher {
     void beginEpoch();
 
     boolean hasDeferredWork();
+
+    int pendingRanges();
 }

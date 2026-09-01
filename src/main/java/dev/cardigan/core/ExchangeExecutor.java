@@ -156,6 +156,11 @@ final class ExchangeExecutor implements ApplicationLane, AutoCloseable {
             + handlerRangeTail - handlerRangeHead;
     }
 
+    @Override
+    public int pendingRanges() {
+        return pendingHandlerRanges();
+    }
+
     private void appendHandlerRange(long cutoff) {
         if (cutoff <= lastSealedHandlerTail) {
             return;

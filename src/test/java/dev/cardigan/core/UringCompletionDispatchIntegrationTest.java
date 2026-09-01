@@ -60,8 +60,8 @@ class UringCompletionDispatchIntegrationTest {
         assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
             try (UringEventLoop loop = new UringEventLoop(0, 64)) {
                 UringTask task = task(loop);
-                LoomRuntime.CompletionWaiter waiter =
-                    loop.loomRuntime().beginCompletionWait();
+                ApplicationRuntime.CompletionWait waiter =
+                    loop.applicationRuntime().beginCompletionWait();
                 task.completionHandler = waiter;
 
                 DISPATCH_COMPLETION.invoke(loop, task.userData, -123, 7);

@@ -25,7 +25,7 @@ final class CarrierDomainIntegrationTest {
 
             CompletableFuture<Boolean> ringVirtualResult =
                 new CompletableFuture<>();
-            Thread ringVirtual = loop.loomRuntime().startVirtualThread(
+            ApplicationRuntime.RuntimeTask ringVirtual = loop.applicationRuntime().startTask(
                 () -> ringVirtualResult.complete(loop.inCarrierDomain()));
             assertTrue(ringVirtualResult.get(5, TimeUnit.SECONDS));
             ringVirtual.join(5_000);

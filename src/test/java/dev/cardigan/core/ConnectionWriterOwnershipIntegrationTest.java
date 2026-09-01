@@ -121,7 +121,7 @@ class ConnectionWriterOwnershipIntegrationTest {
             UringEventLoop loop,
             ConnectionWriter writer) throws Exception {
         CompletableFuture<Boolean> result = new CompletableFuture<>();
-        loop.loomRuntime().startVirtualThread(
+        loop.applicationRuntime().startTask(
             () -> result.complete(writer.awaitDrained()));
         return result.get(5, TimeUnit.SECONDS);
     }

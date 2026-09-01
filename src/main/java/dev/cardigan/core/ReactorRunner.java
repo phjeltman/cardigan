@@ -30,6 +30,11 @@ final class ReactorRunner {
         return carrier;
     }
 
+    ApplicationRuntime applicationRuntime(
+            UringEventLoop loop, int cpuId) {
+        return new LoomRuntime(loop, this, cpuId);
+    }
+
     void startAndAwaitInitialization() {
         carrier.start();
         try {
