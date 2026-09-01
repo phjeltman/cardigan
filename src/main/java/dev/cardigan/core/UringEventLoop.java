@@ -5,14 +5,11 @@ package dev.cardigan.core;
 import dev.cardigan.ffi.Libc;
 import dev.cardigan.ffi.RawUring;
 import dev.cardigan.ffi.ThreadAffinity;
-import dev.cardigan.ffi.UnsupportedKernelException;
 import dev.cardigan.http2.Http2Frames;
 import java.lang.foreign.*;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.ArrayDeque;
 import java.util.Objects;
@@ -91,7 +88,7 @@ public class UringEventLoop implements AutoCloseable {
     private int peakActiveTasks;
     private long taskPoolExhaustions;
 
-    private final Thread loopThread;
+    private final ReactorRunner runner;
     private final LoomRuntime loomRuntime;
     private final ApplicationLane applicationLane;
     private final SchedulerMode schedulerMode;
@@ -190,7 +187,7 @@ public class UringEventLoop implements AutoCloseable {
                     SEQUENCE_HANDLE.setRelease(sequences, index, t + 1);
                     return true;
                 }
-                Thread.onSpinWait();
+                ReactorRunner.onSpinWait();
             }
         }
 
@@ -415,14 +412,9 @@ public class UringEventLoop implements AutoCloseable {
         this.freeVectorSlots = new IntIdPool(numVectorSlots);
         this.maxHttp2ParkedSenders = configuredMaxHttp2ParkedSenders();
 
-        CountDownLatch initLatch = new CountDownLatch(1);
-        AtomicReference<Throwable> initError = new AtomicReference<>();
-        this.loopThread = Thread.ofPlatform()
-            .daemon(true)
-            .name("cardigan-loop-" + cpuId)
-            .unstarted(() -> runLoop(entries, initLatch, initError));
+        this.runner = new ReactorRunner(this, entries, cpuId);
         try {
-            this.loomRuntime = new LoomRuntime(this, loopThread, cpuId);
+            this.loomRuntime = new LoomRuntime(this, runner, cpuId);
             this.applicationLane = loomRuntime.applicationLane();
         } catch (Throwable failure) {
             arena.close();
@@ -445,94 +437,69 @@ public class UringEventLoop implements AutoCloseable {
         this.emptyFdSegment = arena.allocate(4);
         this.emptyFdSegment.set(ValueLayout.JAVA_INT, 0, -1);
         try {
-            loopThread.start();
+            runner.startAndAwaitInitialization();
         } catch (RuntimeException | Error failure) {
             arena.close();
             throw failure;
         }
+    }
 
-        try {
-            initLatch.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            arena.close();
-            throw new RuntimeException("Interrupted initializing UringEventLoop for CPU " + cpuId, e);
+    void initialize(int entries) throws Throwable {
+        int affinityResult = ThreadAffinity.pinCurrentThread(cpuId);
+        if (affinityResult != 0) {
+            throw new IllegalStateException(
+                "Failed to pin cardigan-loop-" + cpuId
+                    + " to Linux CPU " + cpuId + ": error "
+                    + affinityResult
+                    + ". Cardigan requires pinned event loops; check the "
+                    + "process cpuset and cardigan.eventloop.cpus");
+        }
+        System.out.println(
+            "Pinned cardigan-loop-" + cpuId + " to Linux CPU " + cpuId);
+
+        this.ring = new RawUring(arena, entries, ringSetupFlags());
+
+        this.evfd = (int) Libc.eventfd.invokeExact(0, 0);
+        if (this.evfd < 0) {
+            throw new RuntimeException("eventfd creation failed: " + this.evfd);
         }
 
-        if (initError.get() != null) {
-            arena.close();
-            Throwable failure = initError.get();
-            if (failure instanceof UnsupportedKernelException unsupported) {
-                throw unsupported;
+        this.kheadSegment = ring.cqHead();
+        this.ktailSegment = ring.cqTail();
+        this.kmask = ring.cqMask();
+        this.cqesSegment = ring.cqes();
+
+        int registerResult = ring.registerFiles(
+            registeredFds, MAX_FIXED_FILES);
+        if (registerResult < 0) {
+            throw new IllegalStateException(
+                "IORING_REGISTER_FILES is required but failed for CPU "
+                    + cpuId + " with error " + registerResult
+                    + ". Check kernel support and process resource limits");
+        }
+        this.useFixedFiles = true;
+
+        submitEvfdRead();
+        initProvidedBuffers();
+    }
+
+    void abortInitialization() {
+        if (evfd >= 0) {
+            try {
+                int unused = (int) Libc.close.invokeExact(evfd);
+            } catch (Throwable ignored) {
             }
-            throw new RuntimeException(
-                "Failed to initialize UringEventLoop for CPU " + cpuId
-                    + ": " + failure.getMessage(),
-                failure);
+            evfd = -1;
+        }
+        if (ring != null) {
+            try {
+                ring.close();
+            } catch (Throwable ignored) {
+            }
         }
     }
 
-    private void runLoop(int entries, CountDownLatch initLatch, AtomicReference<Throwable> initError) {
-        try {
-            int affinityResult = ThreadAffinity.pinCurrentThread(cpuId);
-            if (affinityResult != 0) {
-                throw new IllegalStateException(
-                    "Failed to pin cardigan-loop-" + cpuId
-                        + " to Linux CPU " + cpuId + ": error "
-                        + affinityResult
-                        + ". Cardigan requires pinned event loops; check the "
-                        + "process cpuset and cardigan.eventloop.cpus");
-            }
-            System.out.println(
-                "Pinned cardigan-loop-" + cpuId + " to Linux CPU " + cpuId);
-
-            this.ring = new RawUring(
-                arena, entries, ringSetupFlags());
-
-            this.evfd = (int) Libc.eventfd.invokeExact(0, 0);
-            if (this.evfd < 0) {
-                throw new RuntimeException("eventfd creation failed: " + this.evfd);
-            }
-
-            this.kheadSegment = ring.cqHead();
-            this.ktailSegment = ring.cqTail();
-            this.kmask = ring.cqMask();
-            this.cqesSegment = ring.cqes();
-
-            int registerResult = ring.registerFiles(
-                registeredFds, MAX_FIXED_FILES);
-            if (registerResult < 0) {
-                throw new IllegalStateException(
-                    "IORING_REGISTER_FILES is required but failed for CPU "
-                        + cpuId + " with error " + registerResult
-                        + ". Check kernel support and process resource limits");
-            }
-            this.useFixedFiles = true;
-
-            submitEvfdRead();
-            initProvidedBuffers();
-
-        } catch (Throwable t) {
-            if (evfd >= 0) {
-                try {
-                    int unused = (int) Libc.close.invokeExact(evfd);
-                } catch (Throwable ignored) {
-                }
-                evfd = -1;
-            }
-            if (ring != null) {
-                try {
-                    ring.close();
-                } catch (Throwable ignored) {
-                }
-            }
-            initError.set(t);
-            initLatch.countDown();
-            return;
-        }
-
-        initLatch.countDown();
-
+    void runLoop() {
         while (!closed && wakeupFailure == null) {
             try {
                 if (!usesEpochScheduler()) {
@@ -886,7 +853,7 @@ public class UringEventLoop implements AutoCloseable {
         }
         if (hasEpochSourceExcludingPendingSq()
                 || sqePending || ring.hasPendingSubmissions()) {
-            Thread.yield();
+            ReactorRunner.yieldCarrier();
         }
     }
 
@@ -2660,7 +2627,7 @@ public class UringEventLoop implements AutoCloseable {
         // A permanent eventfd failure leaves no normal way to interrupt the
         // blocking enter. Mark the loop failed first, then make a best-effort
         // attempt to break the carrier out of the syscall.
-        loopThread.interrupt();
+        runner.interrupt();
         return new RejectedExecutionException(
             "Event loop wakeup channel failed", failure);
     }
@@ -2755,23 +2722,7 @@ public class UringEventLoop implements AutoCloseable {
             writeWakeupEvent();
         }
 
-        try {
-            loopThread.join(2000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-
-        if (loopThread.isAlive()) {
-            StackTraceElement[] carrierStack = loopThread.getStackTrace();
-            String carrierLocation = carrierStack.length == 0
-                ? "unknown"
-                : carrierStack[0].toString();
-            throw new IllegalStateException(
-                "Event-loop carrier for CPU " + cpuId
-                    + " did not terminate; retaining its live io_uring "
-                    + "and native memory (state=" + loopThread.getState()
-                    + ", at=" + carrierLocation + ")");
-        }
+        runner.awaitTermination();
 
         if (TASK_POOL_STATS_ENABLED) {
             TaskPoolStats stats = taskPoolStats();

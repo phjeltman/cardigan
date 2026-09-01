@@ -28,9 +28,9 @@ final class LoomRuntime implements AutoCloseable {
     private long handlerMounts;
     private long handlerUnmounts;
 
-    LoomRuntime(UringEventLoop loop, Thread carrier, int cpuId) {
+    LoomRuntime(UringEventLoop loop, ReactorRunner runner, int cpuId) {
         this.loop = loop;
-        this.carrierDomain = new CarrierDomain(carrier);
+        this.carrierDomain = new CarrierDomain(runner.carrier());
         Executor scheduler = STATS_ENABLED
             ? this::executeCountedCoreContinuation
             : loop::enqueueCoreContinuation;
