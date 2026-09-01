@@ -2,10 +2,7 @@
 
 package dev.cardigan.core;
 
-/**
- * Connects reactor epochs to an application runtime without exposing how its
- * work is represented or suspended.
- */
+/** Carries reactor epochs through an application-runtime scheduler lane. */
 interface ApplicationLane extends ApplicationDispatcher {
     long tailSnapshot();
 

@@ -1473,10 +1473,8 @@ final class Http2Connection {
         private int streamId;
         private int sendWindow;
         private PendingStream requestBodyOwner;
-        // Access only through the acquire/release helpers above. These fields
-        // cross between connection and application execution, but do
-        // not require the StoreLoad ordering of sequentially consistent
-        // volatile writes.
+        // The acquire/release helpers above publish these fields between
+        // connection and application execution.
         private boolean active;
         private boolean cancelled;
         private Runnable sendWaiter;

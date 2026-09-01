@@ -99,7 +99,7 @@ public class UringEventLoop implements AutoCloseable {
     /** Connection/protocol and generic owner-domain continuations. */
     private final ArrayDeque<Runnable> protocolReadyTasks =
         new ArrayDeque<>(1024);
-    /** Application-runtime work, separate from protocol progress. */
+    /** Application-runtime work in its causal scheduler lane. */
     private final ArrayDeque<Runnable> applicationReadyTasks =
         new ArrayDeque<>(256);
     /** Connections with newly publishable output. */
