@@ -5,6 +5,7 @@ package dev.cardigan.core;
 import java.lang.reflect.Constructor;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * Owns the virtual-thread machinery attached to one event-loop carrier.
@@ -19,6 +20,8 @@ final class LoomRuntime implements AutoCloseable {
     private final CarrierDomain carrierDomain;
     private final ThreadFactory coreThreadFactory;
     private final ExchangeExecutor exchanges;
+    private final ThreadLocal<CompletionWaiter> completionWaiter =
+        ThreadLocal.withInitial(CompletionWaiter::new);
 
     private long coreMounts;
     private long coreUnmounts;
@@ -63,6 +66,12 @@ final class LoomRuntime implements AutoCloseable {
 
     int exchangeWorkerCount() {
         return exchanges.workerCount();
+    }
+
+    CompletionWaiter beginCompletionWait() {
+        CompletionWaiter waiter = completionWaiter.get();
+        waiter.prepare();
+        return waiter;
     }
 
     void runCountedApplicationTask(Runnable continuation) {
@@ -112,6 +121,61 @@ final class LoomRuntime implements AutoCloseable {
                     + "--add-opens java.base/java.lang=ALL-UNNAMED",
                 failure
             );
+        }
+    }
+
+    static final class CompletionWaiter
+            implements UringEventLoop.CompletionHandler {
+        private volatile Thread thread;
+        private int result;
+        private int flags;
+
+        private void prepare() {
+            if (thread != null) {
+                throw new IllegalStateException(
+                    "A completion wait is already active on this thread");
+            }
+            result = -11;
+            flags = 0;
+            thread = Thread.currentThread();
+        }
+
+        @Override
+        public void onCompletion(int result, int flags, boolean terminal) {
+            if (!terminal) {
+                return;
+            }
+            this.result = result;
+            this.flags = flags;
+            Thread waitingThread = thread;
+            thread = null;
+            LockSupport.unpark(waitingThread);
+        }
+
+        int awaitResult() {
+            awaitCompletion();
+            return result;
+        }
+
+        int flags() {
+            return flags;
+        }
+
+        void abandon() {
+            thread = null;
+        }
+
+        private void awaitCompletion() {
+            boolean interrupted = false;
+            while (thread != null) {
+                LockSupport.park(this);
+                if (thread != null && Thread.interrupted()) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
