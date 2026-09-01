@@ -85,7 +85,7 @@ class EgressBufferLazyAllocationIntegrationTest {
             UringEventLoop loop,
             Supplier<T> operation) throws Exception {
         CompletableFuture<T> result = new CompletableFuture<>();
-        loop.execute(() -> {
+        loop.executeProtocol(() -> {
             try {
                 result.complete(operation.get());
             } catch (Throwable failure) {

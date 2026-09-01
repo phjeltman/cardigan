@@ -76,7 +76,7 @@ final class Http2Connection {
     private final InboundChunkStream inbound;
     private final ConnectionWriter writer;
     private final Router router;
-    private final ExchangeExecutor executor;
+    private final ApplicationDispatcher dispatcher;
     private final Http2ResponseWriter responseWriter;
     private final HpackDecoder hpackDecoder = new HpackDecoder(4096, MAX_HEADER_LIST_SIZE);
     private final HpackFields hpackFields = new HpackFields(64);
@@ -125,11 +125,11 @@ final class Http2Connection {
 
     Http2Connection(InboundChunkStream inbound, ConnectionWriter writer,
                     InboundChunk initialChunk, int initialOffset,
-                    Router router, ExchangeExecutor executor) {
+                    Router router, ApplicationDispatcher dispatcher) {
         this.inbound = inbound;
         this.writer = writer;
         this.router = router;
-        this.executor = executor;
+        this.dispatcher = dispatcher;
         this.responseWriter = new Http2ResponseWriter(writer);
         this.currentChunk = initialChunk;
         this.currentOffset = initialOffset;
@@ -900,7 +900,7 @@ final class Http2Connection {
         int streamId,
         int consumed
     ) {
-        writer.eventLoop().execute(
+        writer.eventLoop().executeProtocol(
             () -> {
                 if (failed) {
                     return;
@@ -1033,7 +1033,7 @@ final class Http2Connection {
         if (Http2ResourceStats.ENABLED) {
             Http2ResourceStats.streamStarted();
         }
-        if (!executor.submit(task)) {
+        if (!dispatcher.submit(task)) {
             setInFlight(inFlight() - 1);
             if (Http2ResourceStats.ENABLED) {
                 Http2ResourceStats.streamCompleted();

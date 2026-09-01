@@ -284,7 +284,7 @@ public final class TlsConnection implements AutoCloseable {
             barrier.countDown();
             if (waiter != null) {
                 try {
-                    loop.execute(waiter);
+                    loop.executeProtocol(waiter);
                 } catch (Throwable ignored) {
                     // The owning loop is already shutting down.
                 }

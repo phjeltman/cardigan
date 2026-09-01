@@ -41,12 +41,7 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
             boolean keepAliveHeader);
     }
 
-    @FunctionalInterface
-    interface TaskExecutor {
-        boolean submit(Runnable task);
-    }
-
-    private final TaskExecutor executor;
+    private final ApplicationDispatcher dispatcher;
     private final ResponseSender responseSender;
     private final int maxInFlight;
     private final int mask;
@@ -67,14 +62,11 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
     private volatile Thread waiter;
     private volatile StreamingBody activeResponseBody;
 
-    Http1ExchangeSequencer(ExchangeExecutor executor, int requestedMaxInFlight,
+    Http1ExchangeSequencer(
+            ApplicationDispatcher dispatcher,
+            int requestedMaxInFlight,
                            ResponseSender responseSender) {
-        this(executor::submit, requestedMaxInFlight, responseSender);
-    }
-
-    Http1ExchangeSequencer(TaskExecutor executor, int requestedMaxInFlight,
-                           ResponseSender responseSender) {
-        this.executor = executor;
+        this.dispatcher = dispatcher;
         this.responseSender = responseSender;
 
         int capacity = 1;
@@ -161,7 +153,7 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
         task.exchange.prepare(
             id, requestKeepAlive, requestKeepAliveHeader);
         task.setActive(true);
-        if (!executor.submit(task)) {
+        if (!dispatcher.submit(task)) {
             task.setActive(false);
             task.exchange.invocation().discard();
             releaseTask(task);

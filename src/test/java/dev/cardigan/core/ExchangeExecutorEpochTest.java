@@ -29,7 +29,7 @@ class ExchangeExecutorEpochTest {
             CompletableFuture<Boolean> deferredAccepted =
                 new CompletableFuture<>();
 
-            loop.execute(() -> firstAccepted.complete(executor.submit(() -> {
+            loop.executeProtocol(() -> firstAccepted.complete(executor.submit(() -> {
                     firstEpoch.complete(loop.schedulerEpoch());
                     deferredAccepted.complete(executor.submit(
                         () -> deferredEpoch.complete(loop.schedulerEpoch())));

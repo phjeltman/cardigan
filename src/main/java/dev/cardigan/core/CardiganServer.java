@@ -394,7 +394,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 UringEventLoop loop = eventLoops.get(i);
                 int cpuId = eventLoopCpus[i];
                 try {
-                    loop.execute(() -> {
+                    loop.executeProtocol(() -> {
                         try {
                             initializeListener(loop, cpuId);
                         } catch (Throwable failure) {
@@ -723,7 +723,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     socket.fixedSlot(), (result, flags, terminal) -> {
                     })) {
                 try {
-                    loop.startVirtualThread(
+                    loop.loomRuntime().startVirtualThread(
                         () -> loop.closeDirect(socket.fixedSlot()));
                 } catch (Throwable failure) {
                     System.err.println(
@@ -736,7 +736,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         private void beginStop() {
             CountDownLatch submitted = new CountDownLatch(1);
             try {
-                loop.execute(() -> {
+                loop.executeProtocol(() -> {
                     try {
                         if (acceptToken < 0) {
                             stopped.countDown();
@@ -773,7 +773,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         activeConnectionCount.incrementAndGet();
         activeConnections.add(control);
         try {
-            Thread owner = loop.startVirtualThread(
+            Thread owner = loop.loomRuntime().startVirtualThread(
                 () -> handleConnection(control));
             control.owner = owner;
         } catch (Throwable failure) {
@@ -782,7 +782,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 if (!loop.closeDirectAsync(
                         socket.fixedSlot(), (result, flags, terminal) -> {
                         })) {
-                    loop.startVirtualThread(
+                    loop.loomRuntime().startVirtualThread(
                         () -> loop.closeDirect(socket.fixedSlot()));
                 }
             } else {
@@ -913,7 +913,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                     currentChunk,
                     Http2Frames.CLIENT_PREFACE.length,
                     router,
-                    loop.exchangeExecutor()
+                    loop.applicationDispatcher()
                 );
                 control.http2 = http2;
                 control.protocol = ConnectionControl.HTTP2;
@@ -1085,7 +1085,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
 
                 if (exchangeSequencer == null) {
                     exchangeSequencer = new Http1ExchangeSequencer(
-                        session.loop.exchangeExecutor(),
+                        session.loop.applicationDispatcher(),
                         MAX_HTTP1_IN_FLIGHT,
                         (completedResponse, responseKeepAlive,
                                 responseKeepAliveHeader) ->
@@ -1458,7 +1458,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 if (router.isSafeMethod(request)) {
                     if (exchangeSequencer == null) {
                         exchangeSequencer = new Http1ExchangeSequencer(
-                            loop.exchangeExecutor(),
+                            loop.applicationDispatcher(),
                             MAX_HTTP1_IN_FLIGHT,
                             (completedResponse, responseKeepAlive,
                                     responseKeepAliveHeader) ->
@@ -1592,7 +1592,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             }
             scheduled = true;
             try {
-                session.loop.execute(this);
+                session.loop.executeProtocol(this);
             } catch (Throwable failure) {
                 scheduled = false;
                 finish(
@@ -1775,7 +1775,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
         control.http1 = state;
         Thread pump;
         try {
-            pump = loop.startVirtualThread(
+            pump = loop.loomRuntime().startVirtualThread(
                 () -> pumpHttp1Body(source, bridge));
         } catch (Throwable failure) {
             if (control.http1 == state) {
@@ -3126,13 +3126,13 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
                 "HTTP/1 CQE driver stats: "
                     + http1CqeDriverStats.snapshot().summary());
         }
-        if (UringEventLoop.VIRTUAL_THREAD_STATS_ENABLED) {
+        if (LoomRuntime.STATS_ENABLED) {
             long coreMounts = 0;
             long coreUnmounts = 0;
             long handlerMounts = 0;
             long handlerUnmounts = 0;
             for (UringEventLoop loop : eventLoops) {
-                UringEventLoop.VirtualThreadStats stats =
+                LoomRuntime.VirtualThreadStats stats =
                     loop.virtualThreadStats();
                 coreMounts += stats.coreMounts();
                 coreUnmounts += stats.coreUnmounts();
@@ -3316,12 +3316,12 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
 
         private void startLoopVirtualThread(Runnable task) {
             try {
-                loop.startVirtualThread(task);
+                loop.loomRuntime().startVirtualThread(task);
             } catch (Throwable ignored) {
                 try {
-                    loop.execute(() -> {
+                    loop.executeProtocol(() -> {
                         try {
-                            loop.startVirtualThread(task);
+                            loop.loomRuntime().startVirtualThread(task);
                         } catch (Throwable retryFailure) {
                             // The owner loop is no longer able to accept work.
                         }
@@ -3378,7 +3378,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             Object http1State = http1;
             if (http1State instanceof Http1ExchangeSequencer sequencer) {
                 try {
-                    loop.startVirtualThread(sequencer::cancelAll);
+                    loop.loomRuntime().startVirtualThread(sequencer::cancelAll);
                 } catch (Throwable ignored) {
                 }
             } else if (http1State
@@ -3388,7 +3388,7 @@ public class CardiganServer implements AutoCloseable, KtlsMultishotReceiver.Obse
             Http2Connection connection = http2;
             if (connection != null) {
                 try {
-                    loop.startVirtualThread(connection::forceClose);
+                    loop.loomRuntime().startVirtualThread(connection::forceClose);
                 } catch (Throwable ignored) {
                 }
             }

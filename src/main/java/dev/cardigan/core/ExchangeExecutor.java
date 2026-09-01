@@ -24,12 +24,13 @@ import java.util.concurrent.locks.LockSupport;
  * continuation. A hot worker consumes every task in each causal range during
  * one mount.
  */
-final class ExchangeExecutor implements AutoCloseable {
+final class ExchangeExecutor implements ApplicationLane, AutoCloseable {
     private static final int DEFAULT_QUEUE_CAPACITY = 65_536;
     private static final int DEFAULT_MAX_BATCH = 64;
     private static final int DEFAULT_MAX_IDLE_WORKERS = 64;
 
     private final UringEventLoop loop;
+    private final LoomRuntime loomRuntime;
     private final TaskQueue tasks;
     private final boolean epochScheduler;
     private final int maxBatch;
@@ -51,8 +52,9 @@ final class ExchangeExecutor implements AutoCloseable {
     private boolean handlerRangeActive;
     private volatile boolean closed;
 
-    ExchangeExecutor(UringEventLoop loop) {
+    ExchangeExecutor(UringEventLoop loop, LoomRuntime loomRuntime) {
         this.loop = loop;
+        this.loomRuntime = loomRuntime;
         int requestedCapacity = Integer.getInteger(
             "cardigan.exchange.queue.capacity",
             DEFAULT_QUEUE_CAPACITY
@@ -72,7 +74,8 @@ final class ExchangeExecutor implements AutoCloseable {
         );
     }
 
-    boolean submit(Runnable task) {
+    @Override
+    public boolean submit(Runnable task) {
         if (closed || !tasks.offer(task)) {
             return false;
         }
@@ -86,7 +89,8 @@ final class ExchangeExecutor implements AutoCloseable {
         return workerCount;
     }
 
-    long handlerTailSnapshot() {
+    @Override
+    public long tailSnapshot() {
         return tasks.tailSnapshot();
     }
 
@@ -94,7 +98,8 @@ final class ExchangeExecutor implements AutoCloseable {
      * Seals only work appended by one mounted completion/protocol producer.
      * Empty deltas deliberately create no range.
      */
-    boolean sealHandlerRange(long producerTail) {
+    @Override
+    public boolean sealRange(long producerTail) {
         if (closed) {
             return false;
         }
@@ -111,7 +116,8 @@ final class ExchangeExecutor implements AutoCloseable {
     }
 
     /** Seals handler-originated appends left beyond the prior epoch frontier. */
-    boolean sealDeferredHandlerRange() {
+    @Override
+    public boolean sealDeferredRange() {
         if (closed) {
             return false;
         }
@@ -123,8 +129,9 @@ final class ExchangeExecutor implements AutoCloseable {
         return true;
     }
 
-    /** Activates the oldest causal handler range for the phase about to run. */
-    void beginHandlerEpoch() {
+    /** Activates the oldest causal application range for the next phase. */
+    @Override
+    public void beginEpoch() {
         if (!epochScheduler || closed) {
             return;
         }
@@ -133,7 +140,8 @@ final class ExchangeExecutor implements AutoCloseable {
     }
 
     /** Reports whether a phase cutoff left queued work for the next epoch. */
-    boolean hasDeferredEpochWork() {
+    @Override
+    public boolean hasDeferredWork() {
         if (!epochScheduler || closed) {
             return false;
         }
@@ -198,7 +206,7 @@ final class ExchangeExecutor implements AutoCloseable {
         while (handlerRangeActive
                 && !tasks.hasWorkBefore(handlerEpochCutoff)) {
             handlerRangeActive = false;
-            loop.handlerRangeBoundary();
+            loop.applicationRangeBoundary();
             advanced = true;
             activateNextHandlerRange();
         }
@@ -308,7 +316,7 @@ final class ExchangeExecutor implements AutoCloseable {
             WorkerRunner worker = new WorkerRunner(slot);
             workers[slot] = worker;
             int workerId = ++nextWorkerId;
-            worker.thread = loop.newVirtualThread(
+            worker.thread = loomRuntime.newVirtualThread(
                 worker,
                 worker,
                 "cardigan-exchange-core" + loop.getCpuId() + "-" + workerId
@@ -354,7 +362,7 @@ final class ExchangeExecutor implements AutoCloseable {
         private boolean available;
         private Thread thread;
         private volatile Runnable continuation;
-        private final UringEventLoop.HandlerContinuation scheduledContinuation =
+        private final UringEventLoop.ApplicationTask scheduledContinuation =
             this::runContinuation;
 
         private WorkerRunner(int slot) {
@@ -366,7 +374,7 @@ final class ExchangeExecutor implements AutoCloseable {
             continuation = command;
             scheduledContinuations.incrementAndGet();
             try {
-                loop.executeHandler(scheduledContinuation);
+                loop.executeApplication(scheduledContinuation);
             } catch (Throwable t) {
                 scheduledContinuations.decrementAndGet();
                 throw t;
@@ -376,8 +384,8 @@ final class ExchangeExecutor implements AutoCloseable {
         private void runContinuation() {
             scheduledContinuations.decrementAndGet();
             try {
-                if (UringEventLoop.VIRTUAL_THREAD_STATS_ENABLED) {
-                    loop.runCountedHandlerContinuation(continuation);
+                if (LoomRuntime.STATS_ENABLED) {
+                    loomRuntime.runCountedApplicationTask(continuation);
                 } else {
                     continuation.run();
                 }

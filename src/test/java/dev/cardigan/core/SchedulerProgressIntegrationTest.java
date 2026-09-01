@@ -51,7 +51,7 @@ final class SchedulerProgressIntegrationTest {
                 new AtomicReference<>();
             CountDownLatch submitted = new CountDownLatch(1);
             AtomicBoolean submissionAccepted = new AtomicBoolean();
-            loop.execute(() -> {
+            loop.executeProtocol(() -> {
                 submissionAccepted.set(loop.exchangeExecutor().submit(() -> {
                     try (Socket socket = new Socket(
                             "127.0.0.1", listener.getLocalPort())) {
@@ -111,7 +111,7 @@ final class SchedulerProgressIntegrationTest {
             CountDownLatch completed = new CountDownLatch(1);
             AtomicReference<Throwable> clientFailure =
                 new AtomicReference<>();
-            Thread client = loop.startVirtualThread(() -> {
+            Thread client = loop.loomRuntime().startVirtualThread(() -> {
                 try (Socket socket = new Socket(
                         "127.0.0.1", listener.getLocalPort())) {
                     InputStream input = socket.getInputStream();
@@ -143,7 +143,7 @@ final class SchedulerProgressIntegrationTest {
         try (UringEventLoop loop = new UringEventLoop(0, 64)) {
             AtomicBoolean stop = new AtomicBoolean();
             CountDownLatch spinnerStarted = new CountDownLatch(1);
-            Thread spinner = loop.startVirtualThread(() -> {
+            Thread spinner = loop.loomRuntime().startVirtualThread(() -> {
                 spinnerStarted.countDown();
                 while (!stop.get()) {
                     Thread.yield();
@@ -154,7 +154,7 @@ final class SchedulerProgressIntegrationTest {
 
             CountDownLatch completed = new CountDownLatch(1);
             AtomicReference<Throwable> failure = new AtomicReference<>();
-            Thread ioWaiter = loop.startVirtualThread(() -> {
+            Thread ioWaiter = loop.loomRuntime().startVirtualThread(() -> {
                 try {
                     int result = loop.nop();
                     if (result != 0) {
@@ -189,8 +189,8 @@ final class SchedulerProgressIntegrationTest {
             CountDownLatch scheduled = new CountDownLatch(1);
             CountDownLatch ran = new CountDownLatch(1);
 
-            Thread ownerVirtual = loop.startVirtualThread(() -> {
-                loop.execute(ran::countDown);
+            Thread ownerVirtual = loop.loomRuntime().startVirtualThread(() -> {
+                loop.executeProtocol(ran::countDown);
                 scheduled.countDown();
             });
 

@@ -237,7 +237,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
             if (handoff == null) {
                 drainHandoff = handoff = this::signalIfDrained;
             }
-            loop.execute(handoff);
+            loop.executeProtocol(handoff);
         }
         if (interrupted) {
             current.interrupt();
@@ -357,7 +357,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
             if (TlsStats.ENABLED) {
                 TlsStats.sendTask(count);
             }
-            loop.startVirtualThread(() -> {
+            loop.loomRuntime().startVirtualThread(() -> {
                 int result = 0;
                 try {
                     for (int i = 0; i < count; i++) {
@@ -374,7 +374,7 @@ final class ConnectionWriter implements UringEventLoop.CompletionHandler,
                 }
                 int completionResult = result;
                 try {
-                    loop.execute(() -> onCompletion(
+                    loop.executeProtocol(() -> onCompletion(
                         completionResult, 0, true));
                 } catch (Throwable ignored) {
                     // The owning loop is already shutting down.

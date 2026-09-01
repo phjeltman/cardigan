@@ -25,14 +25,14 @@ final class EpochSchedulerIntegrationTest {
             CountDownLatch completed = new CountDownLatch(1);
 
             final class SelfAppendingHandler
-                    implements UringEventLoop.HandlerContinuation {
+                    implements UringEventLoop.ApplicationTask {
                 private int invocations;
 
                 @Override
                 public void run() {
                     if (invocations++ == 0) {
                         firstEpoch.set(loop.schedulerEpoch());
-                        loop.executeHandler(this);
+                        loop.executeApplication(this);
                     } else {
                         secondEpoch.set(loop.schedulerEpoch());
                         completed.countDown();
@@ -40,7 +40,7 @@ final class EpochSchedulerIntegrationTest {
                 }
             }
 
-            loop.executeHandler(new SelfAppendingHandler());
+            loop.executeApplication(new SelfAppendingHandler());
             assertTrue(completed.await(2, TimeUnit.SECONDS));
             assertTrue(secondEpoch.get() > firstEpoch.get(),
                 "a handler appended during its phase ran in the same epoch");
@@ -59,14 +59,14 @@ final class EpochSchedulerIntegrationTest {
                 egressEpoch.set(loop.schedulerEpoch());
                 completed.countDown();
             };
-            UringEventLoop.HandlerContinuation handler = () -> {
+            UringEventLoop.ApplicationTask handler = () -> {
                 handlerEpoch.set(loop.schedulerEpoch());
                 loop.executeEgress(egress);
             };
 
-            loop.execute(() -> {
+            loop.executeProtocol(() -> {
                 protocolEpoch.set(loop.schedulerEpoch());
-                loop.executeHandler(handler);
+                loop.executeApplication(handler);
             });
 
             assertTrue(completed.await(2, TimeUnit.SECONDS));
@@ -84,9 +84,9 @@ final class EpochSchedulerIntegrationTest {
             AtomicLong afterBoundary = new AtomicLong();
             CountDownLatch completed = new CountDownLatch(1);
 
-            Thread protocol = loop.startVirtualThread(() -> {
+            Thread protocol = loop.loomRuntime().startVirtualThread(() -> {
                 beforeBoundary.set(loop.schedulerEpoch());
-                loop.executeHandler(() ->
+                loop.executeApplication(() ->
                     handlerEpoch.set(loop.schedulerEpoch()));
                 loop.inboundChunkBoundary();
                 afterBoundary.set(loop.schedulerEpoch());
@@ -117,14 +117,14 @@ final class EpochSchedulerIntegrationTest {
                 buffer,
                 () -> {
                     receiveEpoch.set(loop.schedulerEpoch());
-                    loop.executeHandler(() -> {
+                    loop.executeApplication(() -> {
                         handlerEpoch.set(loop.schedulerEpoch());
                         handlerCompleted.countDown();
                     });
                 }
             );
 
-            Thread protocol = loop.startVirtualThread(() -> {
+            Thread protocol = loop.loomRuntime().startVirtualThread(() -> {
                 try (InboundChunkStream inbound =
                          new InboundChunkStream(loop, receiver);
                      InboundChunk ignored = inbound.nextChunk()) {
@@ -165,14 +165,14 @@ final class EpochSchedulerIntegrationTest {
                     // to defer this continuation to another epoch.
                     Thread.yield();
                     resumedEpoch.set(loop.schedulerEpoch());
-                    loop.executeHandler(() -> {
+                    loop.executeApplication(() -> {
                         handlerEpoch.set(loop.schedulerEpoch());
                         handlerCompleted.countDown();
                     });
                 }
             );
 
-            Thread protocol = loop.startVirtualThread(() -> {
+            Thread protocol = loop.loomRuntime().startVirtualThread(() -> {
                 try (InboundChunkStream inbound =
                          new InboundChunkStream(loop, receiver);
                      InboundChunk ignored = inbound.nextChunk()) {
@@ -200,7 +200,7 @@ final class EpochSchedulerIntegrationTest {
             AtomicInteger nopResult = new AtomicInteger(Integer.MIN_VALUE);
             CountDownLatch completed = new CountDownLatch(1);
 
-            loop.startVirtualThread(() -> {
+            loop.loomRuntime().startVirtualThread(() -> {
                 submissionEpoch.set(loop.schedulerEpoch());
                 nopResult.set(loop.nop());
                 completionEpoch.set(loop.schedulerEpoch());

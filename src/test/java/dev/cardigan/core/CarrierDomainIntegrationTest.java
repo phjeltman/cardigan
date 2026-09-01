@@ -19,13 +19,13 @@ final class CarrierDomainIntegrationTest {
         try (UringEventLoop loop = new UringEventLoop(0, 64)) {
             CompletableFuture<Boolean> ringThreadResult =
                 new CompletableFuture<>();
-            loop.execute(() -> ringThreadResult.complete(
+            loop.executeProtocol(() -> ringThreadResult.complete(
                 loop.inCarrierDomain()));
             assertTrue(ringThreadResult.get(5, TimeUnit.SECONDS));
 
             CompletableFuture<Boolean> ringVirtualResult =
                 new CompletableFuture<>();
-            Thread ringVirtual = loop.startVirtualThread(
+            Thread ringVirtual = loop.loomRuntime().startVirtualThread(
                 () -> ringVirtualResult.complete(loop.inCarrierDomain()));
             assertTrue(ringVirtualResult.get(5, TimeUnit.SECONDS));
             ringVirtual.join(5_000);

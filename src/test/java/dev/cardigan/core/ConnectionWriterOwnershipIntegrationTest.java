@@ -121,7 +121,7 @@ class ConnectionWriterOwnershipIntegrationTest {
             UringEventLoop loop,
             ConnectionWriter writer) throws Exception {
         CompletableFuture<Boolean> result = new CompletableFuture<>();
-        loop.startVirtualThread(
+        loop.loomRuntime().startVirtualThread(
             () -> result.complete(writer.awaitDrained()));
         return result.get(5, TimeUnit.SECONDS);
     }
@@ -130,7 +130,7 @@ class ConnectionWriterOwnershipIntegrationTest {
             UringEventLoop loop,
             Supplier<T> operation) throws Exception {
         CompletableFuture<T> result = new CompletableFuture<>();
-        loop.execute(() -> {
+        loop.executeProtocol(() -> {
             try {
                 result.complete(operation.get());
             } catch (Throwable failure) {

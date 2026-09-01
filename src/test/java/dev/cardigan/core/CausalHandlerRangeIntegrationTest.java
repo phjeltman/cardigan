@@ -172,7 +172,7 @@ final class CausalHandlerRangeIntegrationTest {
             AtomicLong secondEpoch = new AtomicLong();
             CountDownLatch completed = new CountDownLatch(1);
 
-            loop.execute(() -> assertTrue(executor.submit(() -> {
+            loop.executeProtocol(() -> assertTrue(executor.submit(() -> {
                 firstEpoch.set(loop.schedulerEpoch());
                 assertTrue(executor.submit(() -> {
                     secondEpoch.set(loop.schedulerEpoch());
@@ -229,9 +229,9 @@ final class CausalHandlerRangeIntegrationTest {
             UringEventLoop loop, Runnable first, Runnable second) {
         // Both appends occur from one owner-domain mount, so they enter the
         // next protocol phase snapshot together as distinct producers.
-        loop.execute(() -> {
-            loop.execute(first);
-            loop.execute(second);
+        loop.executeProtocol(() -> {
+            loop.executeProtocol(first);
+            loop.executeProtocol(second);
         });
     }
 }

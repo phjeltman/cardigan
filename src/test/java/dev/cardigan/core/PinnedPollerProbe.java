@@ -41,7 +41,7 @@ final class PinnedPollerProbe {
                 }
             });
 
-            loop.execute(() -> {
+            loop.executeProtocol(() -> {
                 submissionAccepted.set(loop.exchangeExecutor().submit(() -> {
                     try {
                         handlerProcessors.set(

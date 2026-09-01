@@ -70,7 +70,7 @@ final class Http1ExchangeSequencerReservationTest {
     }
 
     private static final class DeferredExecutor
-            implements Http1ExchangeSequencer.TaskExecutor {
+            implements ApplicationDispatcher {
         private final ArrayDeque<Runnable> tasks = new ArrayDeque<>();
 
         @Override

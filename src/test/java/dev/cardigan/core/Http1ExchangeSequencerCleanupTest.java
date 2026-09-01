@@ -86,7 +86,7 @@ final class Http1ExchangeSequencerCleanupTest {
             UringEventLoop loop, Runnable action) throws Exception {
         AtomicReference<Throwable> failure = new AtomicReference<>();
         CountDownLatch completed = new CountDownLatch(1);
-        loop.execute(() -> {
+        loop.executeProtocol(() -> {
             try {
                 action.run();
             } catch (Throwable thrown) {

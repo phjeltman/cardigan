@@ -126,7 +126,7 @@ public final class Http1ExchangeSequencerBenchmark {
     }
 
     private static final class DeferredExecutor
-            implements Http1ExchangeSequencer.TaskExecutor {
+            implements ApplicationDispatcher {
         private final Runnable[] tasks;
         private int size;
 
