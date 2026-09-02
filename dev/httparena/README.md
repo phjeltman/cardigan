@@ -3,7 +3,7 @@
 This directory is a submission tree ready to be copied directly under
 HttpArena's `frameworks/` directory. Its canonical `cardigan` directory is an
 independent Maven application pinned to the public
-`dev.cardigan:cardigan:0.1.0-alpha.4` artifact. Cardigan itself owns no
+`dev.cardigan:cardigan:0.1.0-alpha.5` artifact. Cardigan itself owns no
 HttpArena routes or dataset assumptions; this application supplies only the
 arena routes and selects its listener protocol through `ProtocolMode`.
 

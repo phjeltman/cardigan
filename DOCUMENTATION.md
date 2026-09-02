@@ -25,7 +25,7 @@ diagnostics remain experimental.
 <dependency>
     <groupId>dev.cardigan</groupId>
     <artifactId>cardigan</artifactId>
-    <version>0.1.0-alpha.4</version>
+    <version>0.1.0-alpha.5</version>
 </dependency>
 ```
 
