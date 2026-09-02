@@ -2010,6 +2010,34 @@ public class UringEventLoop implements AutoCloseable {
         );
     }
 
+    /**
+     * Starts a one-shot poll and returns its generation-tagged user-data
+     * token, or {@code -1} when the operation cannot be submitted.
+     */
+    long pollAsync(
+            int fd, int pollEvents,
+            CompletionHandler completionHandler) {
+        int taskId = acquireTaskId();
+        if (taskId < 0) {
+            return -1L;
+        }
+
+        UringTask task = tasks[taskId];
+        prepareTask(task);
+        task.completionHandler = completionHandler;
+        task.opcode = Opcodes.IORING_OP_POLL_ADD;
+        task.fd = fd;
+        task.rawFd = fd;
+        task.unionFlags = pollEvents;
+        if (resubmitTaskAsync(task)) {
+            return task.userData;
+        }
+
+        task.completionHandler = null;
+        releaseTaskId(taskId);
+        return -1L;
+    }
+
     public RecvResult recvSelectedBuffer(int fd, int len, short bgid) {
         return recvSelectedBuffer(fd, len, bgid, -1);
     }

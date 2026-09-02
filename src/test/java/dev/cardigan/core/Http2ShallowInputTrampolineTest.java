@@ -192,9 +192,9 @@ class Http2ShallowInputTrampolineTest {
         long deadline = System.nanoTime() + 2_000_000_000L;
         StackTraceElement[] last = new StackTraceElement[0];
         while (System.nanoTime() < deadline) {
-            Thread owner = connectionOwner(server);
+            ApplicationRuntime.RuntimeTask owner = connectionOwner(server);
             if (owner != null) {
-                last = owner.getStackTrace();
+                last = owner.stackTrace();
                 if (hasFrame(
                         last, MultishotReceiver.class.getName(), "receive")) {
                     return last;
@@ -213,9 +213,9 @@ class Http2ShallowInputTrampolineTest {
         long deadline = System.nanoTime() + 2_000_000_000L;
         StackTraceElement[] last = new StackTraceElement[0];
         while (System.nanoTime() < deadline) {
-            Thread owner = connectionOwner(server);
+            ApplicationRuntime.RuntimeTask owner = connectionOwner(server);
             if (owner != null) {
-                last = owner.getStackTrace();
+                last = owner.stackTrace();
                 if (hasFrame(last, className, methodName)) {
                     return last;
                 }
@@ -243,12 +243,13 @@ class Http2ShallowInputTrampolineTest {
                 Object connection = http2Field.get(control);
                 Field ownerField = control.getClass().getDeclaredField("owner");
                 ownerField.setAccessible(true);
-                Thread owner = (Thread) ownerField.get(control);
+                ApplicationRuntime.RuntimeTask owner =
+                    (ApplicationRuntime.RuntimeTask) ownerField.get(control);
                 if (connection != null) {
                     lastContinuation = connectionField.getInt(connection);
                 }
                 if (owner != null) {
-                    last = owner.getStackTrace();
+                    last = owner.stackTrace();
                 }
                 if (lastContinuation == streamId
                         && hasFrame(
@@ -265,7 +266,8 @@ class Http2ShallowInputTrampolineTest {
                 + java.util.Arrays.toString(last));
     }
 
-    private static Thread connectionOwner(CardiganServer server)
+    private static ApplicationRuntime.RuntimeTask connectionOwner(
+            CardiganServer server)
             throws Exception {
         Object connection = connectionControl(server);
         if (connection == null) {
@@ -273,7 +275,7 @@ class Http2ShallowInputTrampolineTest {
         }
         Field ownerField = connection.getClass().getDeclaredField("owner");
         ownerField.setAccessible(true);
-        return (Thread) ownerField.get(connection);
+        return (ApplicationRuntime.RuntimeTask) ownerField.get(connection);
     }
 
     private static Object connectionControl(CardiganServer server)

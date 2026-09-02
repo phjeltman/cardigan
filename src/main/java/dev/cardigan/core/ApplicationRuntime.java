@@ -29,6 +29,8 @@ interface ApplicationRuntime extends BlockingSupport, AutoCloseable {
         boolean isAlive();
 
         void wake();
+
+        StackTraceElement[] stackTrace();
     }
 
     interface CompletionWait extends UringEventLoop.CompletionHandler {

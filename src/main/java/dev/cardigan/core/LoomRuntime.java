@@ -368,5 +368,10 @@ final class LoomRuntime implements ApplicationRuntime {
         public void wake() {
             LockSupport.unpark(thread);
         }
+
+        @Override
+        public StackTraceElement[] stackTrace() {
+            return thread.getStackTrace();
+        }
     }
 }

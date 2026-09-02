@@ -2,7 +2,7 @@
 
 Cardigan supports HTTP/1.1 and HTTP/2, with optional TLS and kTLS acceleration
 when the host stack can provide it. It is an experimental, Linux-specific
-framework requiring JDK 26, the incubating Vector API, native access, OpenSSL 3
+framework requiring OpenJDK 27, the incubating Vector API, native access, OpenSSL 3
 for TLS, and a Linux kernel with the io_uring features listed below.
 
 The wire protocols and core transport have substantial correctness and stress
@@ -14,7 +14,7 @@ diagnostics remain experimental.
 - 64-bit Linux; x86-64 is the regularly exercised target.
 - Linux 6.1 or newer with the required io_uring operations and TCP listener
   options described below. Direct kTLS is optional.
-- JDK 26 with the incubating Vector API.
+- OpenJDK 27 with the incubating Vector API.
 - Maven 3.9 or newer.
 - OpenSSL 3 at runtime when TLS is enabled.
 - `wrk` and `h2load` for live benchmarks; `h2spec` for HTTP/2 conformance.

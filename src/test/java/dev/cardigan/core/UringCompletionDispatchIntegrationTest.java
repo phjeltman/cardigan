@@ -64,10 +64,13 @@ class UringCompletionDispatchIntegrationTest {
                     loop.applicationRuntime().beginCompletionWait();
                 task.completionHandler = waiter;
 
-                DISPATCH_COMPLETION.invoke(loop, task.userData, -123, 7);
+                int cqeFlags = Opcodes.IORING_CQE_F_BUFFER
+                    | (3 << Opcodes.IORING_CQE_BUFFER_SHIFT);
+                DISPATCH_COMPLETION.invoke(
+                    loop, task.userData, -123, cqeFlags);
 
                 assertEquals(-123, waiter.awaitResult());
-                assertEquals(7, waiter.flags());
+                assertEquals(cqeFlags, waiter.flags());
                 assertNull(task.completionHandler);
             }
         });

@@ -7,6 +7,8 @@ import java.lang.invoke.VarHandle;
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 
@@ -366,6 +368,7 @@ final class ExchangeExecutor implements ApplicationLane, AutoCloseable {
         private final int slot;
         private boolean available;
         private Thread thread;
+        private volatile Runnable ownerContinuation;
         private volatile Runnable continuation;
         private final UringEventLoop.ApplicationTask scheduledContinuation =
             this::runContinuation;
@@ -376,6 +379,21 @@ final class ExchangeExecutor implements ApplicationLane, AutoCloseable {
 
         @Override
         public void execute(Runnable command) {
+            // The first command is this worker's exchange continuation.
+            // Inherited virtual threads use the reactor on the same carrier.
+            if (ownerContinuation == null) {
+                ownerContinuation = command;
+            } else if (command != ownerContinuation) {
+                try {
+                    loop.executeProtocol(command);
+                } catch (RejectedExecutionException failure) {
+                    if (!closed) {
+                        throw failure;
+                    }
+                    ForkJoinPool.commonPool().execute(command);
+                }
+                return;
+            }
             continuation = command;
             scheduledContinuations.incrementAndGet();
             try {

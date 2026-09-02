@@ -40,7 +40,7 @@
     </licenses>
 
     <properties>
-        <maven.compiler.release>26</maven.compiler.release>
+        <maven.compiler.release>27</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <junit.jupiter.version>5.11.0</junit.jupiter.version>
         <cardigan.test.groups></cardigan.test.groups>
@@ -156,7 +156,7 @@
                         <artifactId>maven-javadoc-plugin</artifactId>
                         <version>3.12.0</version>
                         <configuration>
-                            <release>26</release>
+                            <release>27</release>
                             <additionalOptions>
                                 <additionalOption>--add-modules</additionalOption>
                                 <additionalOption>jdk.incubator.vector</additionalOption>

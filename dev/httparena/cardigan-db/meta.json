@@ -1,0 +1,15 @@
+{
+  "display_name": "cardigan",
+  "language": "Java",
+  "type": "engine",
+  "engine": "io_uring",
+  "description": "Cardigan HTTP/1.1 with the native pg-java PostgreSQL client.",
+  "repo": "https://github.com/phjeltman/cardigan",
+  "enabled": true,
+  "tests": [
+    "async-db"
+  ],
+  "maintainers": [
+    "phjeltman"
+  ]
+}

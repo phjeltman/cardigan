@@ -37,7 +37,7 @@ public final class HttpArenaMain {
         }
 
         int port = switch (mode) {
-            case "h1", "grpc" -> 8080;
+            case "h1", "grpc", "db" -> 8080;
             case "json-tls" -> 8081;
             case "h2c" -> 8082;
             case "h2", "grpc-tls" -> 8443;
@@ -56,7 +56,7 @@ public final class HttpArenaMain {
         ProtocolMode protocol = switch (mode) {
             case "h2", "h2c", "grpc", "grpc-tls" ->
                 ProtocolMode.HTTP2_ONLY;
-            case "h1", "json-tls" -> ProtocolMode.HTTP1_ONLY;
+            case "h1", "json-tls", "db" -> ProtocolMode.HTTP1_ONLY;
             default -> throw new AssertionError(mode);
         };
 
@@ -82,6 +82,15 @@ public final class HttpArenaMain {
             builder.routes(new HttpArenaGrpcController());
         }
 
+        HttpArenaDatabase database = mode.equals("db")
+            ? new HttpArenaDatabase(
+                HttpArenaDatabaseSettings.fromEnvironment(System.getenv()),
+                threads)
+            : null;
+        if (database != null) {
+            builder.routes(new HttpArenaDatabaseController(database));
+        }
+
         CardiganServer plaintext = mode.equals("json-tls")
             ? CardiganServer.builder()
                 .port(8080)
@@ -91,7 +100,7 @@ public final class HttpArenaMain {
                 .routes(new HttpArenaController())
                 .build()
             : null;
-        try (plaintext; CardiganServer server = builder.build()) {
+        try (database; plaintext; CardiganServer server = builder.build()) {
             Runtime.getRuntime().addShutdownHook(
                 Thread.ofPlatform()
                     .name("cardigan-httparena-shutdown")

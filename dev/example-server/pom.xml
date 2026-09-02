@@ -11,7 +11,7 @@
     <description>Example routes and executable used by Cardigan's development tools</description>
 
     <properties>
-        <maven.compiler.release>26</maven.compiler.release>
+        <maven.compiler.release>27</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.deploy.skip>true</maven.deploy.skip>
         <cardigan.version>0.1.0-alpha.4</cardigan.version>
