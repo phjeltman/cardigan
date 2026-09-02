@@ -78,9 +78,6 @@ final class PinnedPollerProbe {
                 throw new AssertionError("server did not accept the socket");
             }
             if (!completed.await(3, TimeUnit.SECONDS)) {
-                System.err.println("scheduler=" + loop.schedulerStats());
-                System.err.println(
-                    "virtualThreads=" + loop.virtualThreadStats());
                 throw new AssertionError(
                     "socket continuation stalled; handler processors="
                         + handlerProcessors.get());

@@ -1078,7 +1078,7 @@ if [ "$JVMTI" = true ]; then
     )
 fi
 
-# JIT-sensitive tuning: 150 retains the small stage-two JSON helpers, while 600
+# Measured on JDK 26: 150 retains the small stage-two JSON helpers, while 600
 # keeps the 699-byte HPACK request decoder out of processFrame's compiled graph.
 # The Vector API intrinsic path uses @ForceInline and does not require larger
 # global node budgets.

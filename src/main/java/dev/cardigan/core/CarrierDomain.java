@@ -56,7 +56,7 @@ final class CarrierDomain {
         }
     }
 
-    static Thread currentCarrierThread() {
+    private static Thread currentCarrierThread() {
         try {
             return (Thread) CURRENT_CARRIER_THREAD.invokeExact();
         } catch (Throwable failure) {

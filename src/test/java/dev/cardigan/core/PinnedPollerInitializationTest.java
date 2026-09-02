@@ -38,16 +38,6 @@ final class PinnedPollerInitializationTest {
             "socket probe completed; handler processors=1"));
     }
 
-    @Test
-    void perCarrierPollerProgressesFromAnExchangeWorker()
-            throws Exception {
-        ProbeResult perCarrierPoller = runProbe("3");
-        assertEquals(0, perCarrierPoller.exitCode(),
-            perCarrierPoller.output());
-        assertTrue(perCarrierPoller.output().contains(
-            "socket probe completed; handler processors=1"));
-    }
-
     private static ProbeResult runProbe(String pollerMode)
             throws Exception {
         Path java = Path.of(

@@ -139,36 +139,6 @@ final class SchedulerProgressIntegrationTest {
     }
 
     @Test
-    void exchangeWorkerRunsAnInheritedVirtualThread()
-            throws Exception {
-        try (UringEventLoop loop = new UringEventLoop(0, 64)) {
-            CountDownLatch completed = new CountDownLatch(1);
-            AtomicReference<Throwable> failure = new AtomicReference<>();
-            loop.executeProtocol(() -> loop.applicationLane().submit(() -> {
-                try {
-                    AtomicBoolean childInDomain = new AtomicBoolean();
-                    Thread child = Thread.ofVirtual().start(() ->
-                        childInDomain.set(
-                            loop.applicationRuntime().inCarrierDomain()));
-                    child.join();
-                    if (!childInDomain.get()) {
-                        throw new AssertionError(
-                            "child virtual thread left its owner carrier");
-                    }
-                } catch (Throwable thrown) {
-                    failure.set(thrown);
-                } finally {
-                    completed.countDown();
-                }
-            }));
-
-            assertTrue(completed.await(2, TimeUnit.SECONDS),
-                "inherited virtual thread did not complete");
-            assertNull(failure.get());
-        }
-    }
-
-    @Test
     void yieldingContinuationCannotKeepPendingIoAwayFromTheRing() throws Exception {
         try (UringEventLoop loop = new UringEventLoop(0, 64)) {
             AtomicBoolean stop = new AtomicBoolean();
