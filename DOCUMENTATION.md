@@ -58,6 +58,10 @@ the example launcher uses `.tlsFromSystemProperties()` for script
 compatibility. The HttpArena consumer is an independent Maven project under
 [`dev/httparena`](dev/httparena/README.md).
 
+A process with several listeners can create one `CardiganRuntime` and supply it
+to each server with `.runtime(runtime)`. The runtime owns one event-loop set for
+all attached listeners and is closed after its servers.
+
 ## Transport and execution model
 
 Cardigan drives io_uring directly through Panama. Ring geometry and mapping

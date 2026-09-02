@@ -75,6 +75,10 @@ public final class PreparedInvocation {
         return storage != null && requestStorage == storage;
     }
 
+    void retainRequestStorage(AutoCloseable storage) {
+        requestStorage = storage;
+    }
+
     public void discard() {
         releaseRequestStorage();
         clearReusableArguments();

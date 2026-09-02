@@ -107,7 +107,7 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
             return false;
         }
 
-        return submitReserved(
+        return submitReservedInternal(
             router,
             request,
             requestKeepAlive,
@@ -134,7 +134,7 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
             boolean requestKeepAlive,
             boolean requestKeepAliveHeader,
             AutoCloseable requestStorage) {
-        return submitReserved(
+        return submitReservedInternal(
             router,
             request,
             requestKeepAlive,
@@ -143,7 +143,22 @@ final class Http1ExchangeSequencer implements Exchange.Completion {
             true);
     }
 
-    private boolean submitReserved(
+    boolean submitReserved(
+            Router router,
+            HttpRequest request,
+            boolean requestKeepAlive,
+            boolean requestKeepAliveHeader,
+            AutoCloseable requestStorage) {
+        return submitReservedInternal(
+            router,
+            request,
+            requestKeepAlive,
+            requestKeepAliveHeader,
+            requestStorage,
+            false);
+    }
+
+    private boolean submitReservedInternal(
             Router router,
             HttpRequest request,
             boolean requestKeepAlive,

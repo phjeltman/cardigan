@@ -884,6 +884,10 @@ public class Router {
             Object bodyRecord = null;
             if (route.isStreamingBody) {
                 bodyRecord = request.bodyStream();
+                if (!route.requiresRequestStorage
+                        && requestStorage != null) {
+                    target.retainRequestStorage(requestStorage);
+                }
             } else if (route.isBodyRecord && request.bodyLength() > 0) {
                 bodyRecord = Serdes.fromJson(
                     request.segment(),
