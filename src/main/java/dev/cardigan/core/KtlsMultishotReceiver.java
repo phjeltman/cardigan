@@ -8,7 +8,6 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.util.concurrent.locks.LockSupport;
 
 /**
  * Bounded direct-kTLS receive queue using multishot RECVMSG so TLS control
@@ -25,7 +24,7 @@ final class KtlsMultishotReceiver
             QUEUE_SIZE = lookup.findVarHandle(
                 KtlsMultishotReceiver.class, "queueSize", int.class);
             RECEIVE_WAITER = lookup.findVarHandle(
-                KtlsMultishotReceiver.class, "receiveWaiter", Thread.class);
+                KtlsMultishotReceiver.class, "receiveWaiter", Runnable.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -67,8 +66,8 @@ final class KtlsMultishotReceiver
     private boolean failed;
     private boolean failureReported;
     private boolean closed;
-    private Thread receiveWaiter;
-    private volatile Thread closeWaiter;
+    private Runnable receiveWaiter;
+    private volatile Runnable closeWaiter;
     private TlsReceiver fallbackReceiver;
 
     KtlsMultishotReceiver(
@@ -103,7 +102,6 @@ final class KtlsMultishotReceiver
 
     @Override
     public InboundChunk receive() {
-        Thread current = Thread.currentThread();
         while (!closed) {
             InboundChunk chunk = poll();
             if (chunk != null) {
@@ -118,13 +116,13 @@ final class KtlsMultishotReceiver
             }
 
             maybeArm();
-            setReceiveWaiter(current);
-            if (queueSize() != 0 || fallback || eof || failed || closed) {
-                setReceiveWaiter(null);
-                continue;
-            }
-            LockSupport.park(this);
-            setReceiveWaiter(null);
+            loop.blockingSupport().await(
+                this,
+                () -> queueSize() == 0 && !fallback
+                    && !eof && !failed && !closed,
+                this::setReceiveWaiter,
+                wakeup -> setReceiveWaiter(null)
+            );
         }
         return null;
     }
@@ -317,12 +315,12 @@ final class KtlsMultishotReceiver
             return;
         }
 
-        Thread current = Thread.currentThread();
-        closeWaiter = current;
-        while (active) {
-            LockSupport.park(this);
-        }
-        closeWaiter = null;
+        loop.blockingSupport().await(
+            this,
+            () -> active,
+            wakeup -> closeWaiter = wakeup,
+            wakeup -> closeWaiter = null
+        );
     }
 
     private boolean offer(InboundChunk chunk) {
@@ -393,17 +391,17 @@ final class KtlsMultishotReceiver
     }
 
     private void signalReceiveWaiter() {
-        Thread waiter = receiveWaiter();
+        Runnable waiter = receiveWaiter();
         if (waiter != null) {
-            LockSupport.unpark(waiter);
+            waiter.run();
             setReceiveWaiter(null);
         }
     }
 
     private void signalCloseWaiter() {
-        Thread waiter = closeWaiter;
+        Runnable waiter = closeWaiter;
         if (waiter != null) {
-            LockSupport.unpark(waiter);
+            waiter.run();
         }
     }
 
@@ -415,11 +413,11 @@ final class KtlsMultishotReceiver
         QUEUE_SIZE.setRelease(this, value);
     }
 
-    private Thread receiveWaiter() {
-        return (Thread) RECEIVE_WAITER.getAcquire(this);
+    private Runnable receiveWaiter() {
+        return (Runnable) RECEIVE_WAITER.getAcquire(this);
     }
 
-    private void setReceiveWaiter(Thread waiter) {
+    private void setReceiveWaiter(Runnable waiter) {
         RECEIVE_WAITER.setRelease(this, waiter);
     }
 }

@@ -23,7 +23,7 @@ final class CausalHandlerRangeIntegrationTest {
     void eachProducerRangeHandsOffToEgressBeforeTheNextRange()
             throws Exception {
         try (UringEventLoop loop = epochLoop()) {
-            ExchangeExecutor executor = loop.exchangeExecutor();
+            ApplicationLane executor = loop.applicationLane();
             List<String> order = new CopyOnWriteArrayList<>();
             AtomicLong firstBoundarySubmits = new AtomicLong(-1);
             AtomicLong secondBoundarySubmits = new AtomicLong(-1);
@@ -52,7 +52,7 @@ final class CausalHandlerRangeIntegrationTest {
                 order);
             assertEquals(firstBoundarySubmits.get(), secondBoundarySubmits.get(),
                 "a causal range performed its own io_uring_enter");
-            assertEquals(0, executor.pendingHandlerRanges());
+            assertEquals(0, executor.pendingRanges());
             UringEventLoop.SchedulerStats stats = loop.schedulerStats();
             assertEquals(2, stats.handlerRanges());
             assertEquals(2, stats.handlerRangeBoundaries());
@@ -63,7 +63,7 @@ final class CausalHandlerRangeIntegrationTest {
     void parkedLastTaskDoesNotStrandTheNextSealedRange()
             throws Exception {
         try (UringEventLoop loop = epochLoop()) {
-            ExchangeExecutor executor = loop.exchangeExecutor();
+            ApplicationLane executor = loop.applicationLane();
             List<String> order = new CopyOnWriteArrayList<>();
             AtomicReference<Thread> firstWorker = new AtomicReference<>();
             AtomicBoolean releaseFirst = new AtomicBoolean();
@@ -102,7 +102,7 @@ final class CausalHandlerRangeIntegrationTest {
                     "handler-1-start", "handler-2", "egress-2",
                     "handler-1-finish", "egress-1"),
                 order);
-            assertEquals(0, executor.pendingHandlerRanges());
+            assertEquals(0, executor.pendingRanges());
         }
     }
 
@@ -110,7 +110,7 @@ final class CausalHandlerRangeIntegrationTest {
     void resumedParkedWorkerCanJoinAnotherActiveRange()
             throws Exception {
         try (UringEventLoop loop = epochLoop()) {
-            ExchangeExecutor executor = loop.exchangeExecutor();
+            ApplicationLane executor = loop.applicationLane();
             List<String> order = new CopyOnWriteArrayList<>();
             AtomicReference<Thread> firstWorker = new AtomicReference<>();
             AtomicBoolean releaseFirst = new AtomicBoolean();
@@ -147,7 +147,7 @@ final class CausalHandlerRangeIntegrationTest {
 
             assertTrue(firstStarted.await(5, TimeUnit.SECONDS));
             assertTrue(secondRangeStarted.await(5, TimeUnit.SECONDS));
-            assertTrue(executor.pendingHandlerRanges() > 0,
+            assertTrue(executor.pendingRanges() > 0,
                 "the second range was not active before the parked worker resumed");
 
             releaseFirst.set(true);
@@ -159,7 +159,7 @@ final class CausalHandlerRangeIntegrationTest {
 
             finishSecondRangeLeader.set(true);
             assertTrue(allCompleted.await(5, TimeUnit.SECONDS));
-            assertEquals(0, executor.pendingHandlerRanges());
+            assertEquals(0, executor.pendingRanges());
         }
     }
 
@@ -167,12 +167,12 @@ final class CausalHandlerRangeIntegrationTest {
     void handlerSelfOfferIsSealedOnlyByTheNextEpoch()
             throws Exception {
         try (UringEventLoop loop = epochLoop()) {
-            ExchangeExecutor executor = loop.exchangeExecutor();
+            ApplicationLane executor = loop.applicationLane();
             AtomicLong firstEpoch = new AtomicLong();
             AtomicLong secondEpoch = new AtomicLong();
             CountDownLatch completed = new CountDownLatch(1);
 
-            loop.execute(() -> assertTrue(executor.submit(() -> {
+            loop.executeProtocol(() -> assertTrue(executor.submit(() -> {
                 firstEpoch.set(loop.schedulerEpoch());
                 assertTrue(executor.submit(() -> {
                     secondEpoch.set(loop.schedulerEpoch());
@@ -182,7 +182,7 @@ final class CausalHandlerRangeIntegrationTest {
 
             assertTrue(completed.await(5, TimeUnit.SECONDS));
             assertTrue(secondEpoch.get() > firstEpoch.get());
-            assertEquals(0, executor.pendingHandlerRanges());
+            assertEquals(0, executor.pendingRanges());
             UringEventLoop.SchedulerStats stats = loop.schedulerStats();
             assertEquals(2, stats.handlerRanges());
             assertEquals(2, stats.handlerRangeBoundaries());
@@ -194,7 +194,7 @@ final class CausalHandlerRangeIntegrationTest {
             throws Exception {
         UringEventLoop loop = epochLoop();
         try {
-            ExchangeExecutor executor = loop.exchangeExecutor();
+            ApplicationLane executor = loop.applicationLane();
             CountDownLatch workersParked = new CountDownLatch(3);
 
             enqueueProtocolProducers(loop, () -> assertTrue(executor.submit(() -> {
@@ -229,9 +229,9 @@ final class CausalHandlerRangeIntegrationTest {
             UringEventLoop loop, Runnable first, Runnable second) {
         // Both appends occur from one owner-domain mount, so they enter the
         // next protocol phase snapshot together as distinct producers.
-        loop.execute(() -> {
-            loop.execute(first);
-            loop.execute(second);
+        loop.executeProtocol(() -> {
+            loop.executeProtocol(first);
+            loop.executeProtocol(second);
         });
     }
 }

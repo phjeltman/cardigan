@@ -5,10 +5,8 @@ package dev.cardigan.core;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.time.Duration;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.LockSupport;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceLock;
@@ -17,8 +15,6 @@ import org.junit.jupiter.api.parallel.Resources;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 @Tag("integration")
@@ -29,20 +25,14 @@ class UringCompletionDispatchIntegrationTest {
         "dispatchCompletion", long.class, int.class, int.class);
 
     @Test
-    void asyncHandlerReceivesCqeWithoutPublishingSynchronousTaskState() {
+    void asyncHandlerReceivesCqeDirectly() {
         assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
             try (UringEventLoop loop = new UringEventLoop(0, 64)) {
                 UringTask task = task(loop);
-                int resultSentinel = 0x1357_2468;
-                int flagsSentinel = 0x2468_1357;
-                Thread threadSentinel = Thread.currentThread();
                 AtomicInteger callbackResult = new AtomicInteger();
                 AtomicInteger callbackFlags = new AtomicInteger();
                 AtomicBoolean callbackTerminal = new AtomicBoolean(true);
 
-                task.result = resultSentinel;
-                task.flags = flagsSentinel;
-                task.thread = threadSentinel;
                 task.vectorSlot = -1;
                 task.completionHandler = (result, flags, terminal) -> {
                     callbackResult.set(result);
@@ -58,46 +48,30 @@ class UringCompletionDispatchIntegrationTest {
                     assertEquals(37, callbackResult.get());
                     assertEquals(cqeFlags, callbackFlags.get());
                     assertFalse(callbackTerminal.get());
-                    assertEquals(resultSentinel, task.result);
-                    assertEquals(flagsSentinel, task.flags);
-                    assertSame(threadSentinel, task.thread);
                 } finally {
                     task.completionHandler = null;
-                    task.thread = null;
                 }
             }
         });
     }
 
     @Test
-    void synchronousCompletionPublishesStateBeforeWakingWaiter() {
+    void loomWaiterOwnsSynchronousCompletionState() {
         assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
             try (UringEventLoop loop = new UringEventLoop(0, 64)) {
                 UringTask task = task(loop);
-                CountDownLatch parked = new CountDownLatch(1);
-                AtomicBoolean resumed = new AtomicBoolean();
-                Thread waiter = Thread.ofPlatform().start(() -> {
-                    parked.countDown();
-                    LockSupport.park(task);
-                    resumed.set(true);
-                });
-                assertTrue(parked.await(1, java.util.concurrent.TimeUnit.SECONDS));
+                ApplicationRuntime.CompletionWait waiter =
+                    loop.applicationRuntime().beginCompletionWait();
+                task.completionHandler = waiter;
 
-                task.completionHandler = null;
-                task.thread = waiter;
-                try {
-                    DISPATCH_COMPLETION.invoke(loop, task.userData, -123, 0);
-                    waiter.join(1_000);
+                int cqeFlags = Opcodes.IORING_CQE_F_BUFFER
+                    | (3 << Opcodes.IORING_CQE_BUFFER_SHIFT);
+                DISPATCH_COMPLETION.invoke(
+                    loop, task.userData, -123, cqeFlags);
 
-                    assertTrue(resumed.get());
-                    assertEquals(-123, task.result);
-                    assertEquals(0, task.flags);
-                    assertNull(task.thread);
-                } finally {
-                    LockSupport.unpark(waiter);
-                    waiter.join(1_000);
-                    task.thread = null;
-                }
+                assertEquals(-123, waiter.awaitResult());
+                assertEquals(cqeFlags, waiter.flags());
+                assertNull(task.completionHandler);
             }
         });
     }

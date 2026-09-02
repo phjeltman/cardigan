@@ -4,7 +4,6 @@ package dev.cardigan.core;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.util.concurrent.locks.LockSupport;
 
 /**
  * Bounded per-connection receive queue backed by one multishot RECV.
@@ -19,7 +18,7 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
             MethodHandles.Lookup lookup = MethodHandles.lookup();
             QUEUE_SIZE = lookup.findVarHandle(MultishotReceiver.class, "queueSize", int.class);
             RECEIVE_WAITER =
-                lookup.findVarHandle(MultishotReceiver.class, "receiveWaiter", Thread.class);
+                lookup.findVarHandle(MultishotReceiver.class, "receiveWaiter", Runnable.class);
             HANDOFF_CHUNK = lookup.findVarHandle(
                 MultishotReceiver.class, "handoffChunk", InboundChunk.class);
         } catch (ReflectiveOperationException e) {
@@ -60,9 +59,9 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
     private boolean eof;
     private boolean failed;
     private boolean closed;
-    private Thread receiveWaiter;
+    private Runnable receiveWaiter;
     private InboundChunk handoffChunk;
-    private volatile Thread closeWaiter;
+    private volatile Runnable closeWaiter;
     private Runnable availabilityListener;
 
     MultishotReceiver(UringEventLoop loop, int clientFd, int fixedSlot, Observer observer) {
@@ -91,7 +90,6 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
 
     @Override
     public InboundChunk receive() {
-        Thread current = Thread.currentThread();
         while (!closed) {
             InboundChunk chunk = takeHandoff();
             if (chunk == null) {
@@ -106,14 +104,13 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
             }
 
             maybeArm();
-            setReceiveWaiter(current);
-            if (handoffChunk() != null || queueSize() != 0
-                    || eof || failed || closed) {
-                setReceiveWaiter(null);
-                continue;
-            }
-            LockSupport.park(this);
-            setReceiveWaiter(null);
+            loop.blockingSupport().await(
+                this,
+                () -> handoffChunk() == null && queueSize() == 0
+                    && !eof && !failed && !closed,
+                this::setReceiveWaiter,
+                wakeup -> setReceiveWaiter(null)
+            );
         }
         return null;
     }
@@ -245,12 +242,12 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
             return;
         }
 
-        Thread current = Thread.currentThread();
-        closeWaiter = current;
-        while (active) {
-            LockSupport.park(this);
-        }
-        closeWaiter = null;
+        loop.blockingSupport().await(
+            this,
+            () -> active,
+            wakeup -> closeWaiter = wakeup,
+            wakeup -> closeWaiter = null
+        );
     }
 
     private boolean offer(InboundChunk chunk) {
@@ -277,17 +274,17 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
     }
 
     private boolean tryHandoff(InboundChunk chunk) {
-        Thread waiter = receiveWaiter();
+        Runnable waiter = receiveWaiter();
         if (waiter == null) {
             return false;
         }
-        // The receive continuation and CQ callback are mounted serially on the
-        // owning io_uring carrier, and there is exactly one receiver waiter.
+        // Receive progress and CQ callbacks run serially on the owner core,
+        // and there is exactly one receiver waiter.
         // An acquire read followed by a release clear therefore has no
         // intervening writer and does not need a locked compare-and-set.
         setReceiveWaiter(null);
         HANDOFF_CHUNK.setRelease(this, chunk);
-        LockSupport.unpark(waiter);
+        waiter.run();
         return true;
     }
 
@@ -343,12 +340,12 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
     }
 
     private void signalReceiveWaiter() {
-        Thread waiter = receiveWaiter();
+        Runnable waiter = receiveWaiter();
         if (waiter != null) {
             // See tryHandoff(): no second consumer can clear or replace this
             // single waiter while the owner callback is mounted.
             setReceiveWaiter(null);
-            LockSupport.unpark(waiter);
+            waiter.run();
         }
     }
 
@@ -362,9 +359,9 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
     }
 
     private void signalCloseWaiter() {
-        Thread waiter = closeWaiter;
+        Runnable waiter = closeWaiter;
         if (waiter != null) {
-            LockSupport.unpark(waiter);
+            waiter.run();
         }
     }
 
@@ -376,11 +373,11 @@ final class MultishotReceiver implements UringEventLoop.CompletionHandler, Inbou
         QUEUE_SIZE.setRelease(this, value);
     }
 
-    private Thread receiveWaiter() {
-        return (Thread) RECEIVE_WAITER.getAcquire(this);
+    private Runnable receiveWaiter() {
+        return (Runnable) RECEIVE_WAITER.getAcquire(this);
     }
 
-    private void setReceiveWaiter(Thread waiter) {
+    private void setReceiveWaiter(Runnable waiter) {
         RECEIVE_WAITER.setRelease(this, waiter);
     }
 }

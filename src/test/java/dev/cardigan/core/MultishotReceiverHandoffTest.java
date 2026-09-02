@@ -15,7 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class MultishotReceiverHandoffTest {
     private static final Method SET_RECEIVE_WAITER = method(
-        "setReceiveWaiter", Thread.class);
+        "setReceiveWaiter", Runnable.class);
     private static final Method RECEIVE_WAITER = method("receiveWaiter");
     private static final Method TRY_HANDOFF = method(
         "tryHandoff", InboundChunk.class);
@@ -35,13 +35,13 @@ class MultishotReceiverHandoffTest {
             InboundChunk second = new InboundChunk(
                 arena.allocate(8), 4, 8, ignored -> releases.incrementAndGet());
 
-            setWaiter(receiver, Thread.ofPlatform().unstarted(() -> {}));
+            setWaiter(receiver, () -> {});
             assertTrue(tryHandoff(receiver, first));
             assertNull(receiveWaiter(receiver));
             assertSame(first, takeHandoff(receiver));
             assertNull(takeHandoff(receiver));
 
-            setWaiter(receiver, Thread.ofPlatform().unstarted(() -> {}));
+            setWaiter(receiver, () -> {});
             assertTrue(tryHandoff(receiver, second));
             assertNull(receiveWaiter(receiver));
             assertSame(second, takeHandoff(receiver));
@@ -74,15 +74,17 @@ class MultishotReceiverHandoffTest {
     @Test
     void ownerSerializedSignalClearsExactlyOneWaiter() throws Exception {
         MultishotReceiver receiver = receiver();
-        Thread waiter = Thread.ofPlatform().unstarted(() -> {});
+        AtomicInteger wakeups = new AtomicInteger();
 
-        setWaiter(receiver, waiter);
+        setWaiter(receiver, wakeups::incrementAndGet);
         SIGNAL_RECEIVE_WAITER.invoke(receiver);
         assertNull(receiveWaiter(receiver));
+        assertEquals(1, wakeups.get());
 
         // A repeated terminal/error signal observes the already-cleared slot.
         SIGNAL_RECEIVE_WAITER.invoke(receiver);
         assertNull(receiveWaiter(receiver));
+        assertEquals(1, wakeups.get());
     }
 
     private static MultishotReceiver receiver() {
@@ -90,13 +92,13 @@ class MultishotReceiverHandoffTest {
     }
 
     private static void setWaiter(
-            MultishotReceiver receiver, Thread waiter) throws Exception {
+            MultishotReceiver receiver, Runnable waiter) throws Exception {
         SET_RECEIVE_WAITER.invoke(receiver, waiter);
     }
 
-    private static Thread receiveWaiter(MultishotReceiver receiver)
+    private static Runnable receiveWaiter(MultishotReceiver receiver)
             throws Exception {
-        return (Thread) RECEIVE_WAITER.invoke(receiver);
+        return (Runnable) RECEIVE_WAITER.invoke(receiver);
     }
 
     private static boolean tryHandoff(

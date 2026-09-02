@@ -25,7 +25,7 @@ diagnostics remain experimental.
 <dependency>
     <groupId>dev.cardigan</groupId>
     <artifactId>cardigan</artifactId>
-    <version>0.1.0-alpha.4</version>
+    <version>0.1.0-alpha.5</version>
 </dependency>
 ```
 
@@ -58,6 +58,10 @@ the example launcher uses `.tlsFromSystemProperties()` for script
 compatibility. The HttpArena consumer is an independent Maven project under
 [`dev/httparena`](dev/httparena/README.md).
 
+A process with several listeners can create one `CardiganRuntime` and supply it
+to each server with `.runtime(runtime)`. The runtime owns one event-loop set for
+all attached listeners and is closed after its servers.
+
 ## Transport and execution model
 
 Cardigan drives io_uring directly through Panama. Ring geometry and mapping
@@ -68,6 +72,10 @@ Every event loop is pinned to an allowed CPU, owns its connections and native
 resources, and runs application exchanges on virtual threads. Physical cores
 are selected before SMT siblings. Exact placement can be supplied with
 `eventLoopCpus("0,2,4,6")` or `cardigan.eventloop.cpus`.
+
+The transport and protocol core is a core-local callback reactor. Its Loom
+runtime maps completion and progress callbacks onto blocking operations and
+handler virtual threads.
 
 The server requires `IORING_SETUP_SINGLE_ISSUER`, `IORING_SETUP_SUBMIT_ALL`,
 `IORING_SETUP_DEFER_TASKRUN`, `IORING_SETUP_TASKRUN_FLAG`, registered files,

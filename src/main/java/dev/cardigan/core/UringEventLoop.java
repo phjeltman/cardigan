@@ -5,20 +5,16 @@ package dev.cardigan.core;
 import dev.cardigan.ffi.Libc;
 import dev.cardigan.ffi.RawUring;
 import dev.cardigan.ffi.ThreadAffinity;
-import dev.cardigan.ffi.UnsupportedKernelException;
 import dev.cardigan.http2.Http2Frames;
 import java.lang.foreign.*;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.ArrayDeque;
 import java.util.Objects;
 
-public class UringEventLoop implements AutoCloseable, java.util.concurrent.Executor {
+public class UringEventLoop implements AutoCloseable {
     enum SchedulerMode {
         BUDGETED,
         EPOCH
@@ -42,28 +38,16 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         Boolean.getBoolean("cardigan.uring.task.stats");
     private static final boolean SCHEDULER_STATS_ENABLED =
         Boolean.getBoolean("cardigan.scheduler.stats");
-    static final boolean VIRTUAL_THREAD_STATS_ENABLED =
-        Boolean.getBoolean("cardigan.virtual.thread.stats");
     private static final boolean FIXED_FILE_STATS_ENABLED =
         Boolean.getBoolean("cardigan.fixed.files.stats");
     private static final int CQE_TURN_BUDGET = 256;
     private static final int COMPLETION_TURN_BUDGET = 256;
     private static final int PROTOCOL_TURN_BUDGET = 128;
-    private static final int HANDLER_TURN_BUDGET = 32;
+    private static final int APPLICATION_TURN_BUDGET = 32;
     private static final int EGRESS_TURN_BUDGET = 256;
     private static final int EXTERNAL_TURN_BUDGET = 64;
     private static final VarHandle INT_HANDLE = ValueLayout.JAVA_INT.varHandle();
     private static final VarHandle SHORT_HANDLE = ValueLayout.JAVA_SHORT.varHandle();
-    private static final VarHandle TASK_THREAD_HANDLE;
-    static {
-        try {
-            MethodHandles.Lookup lookup = MethodHandles.lookup();
-            TASK_THREAD_HANDLE = lookup.findVarHandle(
-                UringTask.class, "thread", Thread.class);
-        } catch (ReflectiveOperationException e) {
-            throw new ExceptionInInitializerError(e);
-        }
-    }
 
     public static final int BUFFER_SIZE = Integer.getInteger("cardigan.buffer.size", 16 * 1024);
     public static final short BUF_GROUP = 1;
@@ -81,9 +65,9 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         void onCompletion(int result, int flags, boolean terminal);
     }
 
-    /** Stable marker used to retain the handler lane across an external wake. */
+    /** Stable marker used to retain the application lane across a wake. */
     @FunctionalInterface
-    interface HandlerContinuation extends Runnable {}
+    interface ApplicationTask extends Runnable {}
 
     /** Stable marker used to retain the egress lane across an external wake. */
     interface EgressTask extends Runnable {}
@@ -104,8 +88,9 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private int peakActiveTasks;
     private long taskPoolExhaustions;
 
-    private final Thread loopThread;
-    private final CarrierDomain carrierDomain;
+    private final ReactorRunner runner;
+    private final ApplicationRuntime applicationRuntime;
+    private final ApplicationLane applicationLane;
     private final SchedulerMode schedulerMode;
 
     /** Continuations made runnable by the current CQE batch. */
@@ -114,16 +99,14 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     /** Connection/protocol and generic owner-domain continuations. */
     private final ArrayDeque<Runnable> protocolReadyTasks =
         new ArrayDeque<>(1024);
-    /** Exchange worker continuations, separate from protocol progress. */
-    private final ArrayDeque<Runnable> handlerReadyTasks =
+    /** Application-runtime work in its causal scheduler lane. */
+    private final ArrayDeque<Runnable> applicationReadyTasks =
         new ArrayDeque<>(256);
     /** Connections with newly publishable output. */
     private final ArrayDeque<Runnable> egressReadyTasks =
         new ArrayDeque<>(256);
     private final MpscArrayQueue<Runnable> readyTasks = new MpscArrayQueue<>(131072);
     private boolean dispatchingCompletions;
-    private final java.util.concurrent.ThreadFactory virtualThreadFactory;
-    private final ExchangeExecutor exchangeExecutor;
     private final int maxHttp2ParkedSenders;
     private final AtomicInteger http2ParkedSenders = new AtomicInteger();
 
@@ -204,7 +187,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                     SEQUENCE_HANDLE.setRelease(sequences, index, t + 1);
                     return true;
                 }
-                Thread.onSpinWait();
+                ReactorRunner.onSpinWait();
             }
         }
 
@@ -326,19 +309,15 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private long schedulerCqes;
     private long schedulerCompletionTasks;
     private long schedulerProtocolTasks;
-    private long schedulerHandlerTasks;
-    private long schedulerHandlerRanges;
-    private long schedulerHandlerRangeBoundaries;
+    private long schedulerApplicationTasks;
+    private long schedulerApplicationRanges;
+    private long schedulerApplicationRangeBoundaries;
     private long schedulerEgressTasks;
     private long schedulerExternalTasks;
     private long schedulerTaskWorkEnters;
     private long schedulerSubmits;
     private long schedulerWaits;
     private volatile long schedulerEpoch;
-    private long coreVirtualThreadMounts;
-    private long coreVirtualThreadUnmounts;
-    private long handlerVirtualThreadMounts;
-    private long handlerVirtualThreadUnmounts;
 
     public UringEventLoop(int cpuId, int entries) {
         this(cpuId, entries, Math.max(entries, 512), false);
@@ -433,24 +412,14 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         this.freeVectorSlots = new IntIdPool(numVectorSlots);
         this.maxHttp2ParkedSenders = configuredMaxHttp2ParkedSenders();
 
-        java.util.concurrent.ThreadFactory factory;
+        this.runner = new ReactorRunner(this, entries, cpuId);
         try {
-            Class<?> builderClass = Class.forName("java.lang.ThreadBuilders$VirtualThreadBuilder");
-            java.lang.reflect.Constructor<?> ctor = builderClass.getDeclaredConstructor(java.util.concurrent.Executor.class);
-            ctor.setAccessible(true);
-            java.util.concurrent.Executor scheduler =
-                VIRTUAL_THREAD_STATS_ENABLED
-                    ? this::executeCountedCoreContinuation
-                    : this;
-            Thread.Builder.OfVirtual builder =
-                (Thread.Builder.OfVirtual) ctor.newInstance(scheduler);
-            factory = builder.name("cardigan-vt-core" + cpuId + "-", 0).factory();
-        } catch (Throwable t) {
+            this.applicationRuntime = runner.applicationRuntime(this, cpuId);
+            this.applicationLane = applicationRuntime.applicationLane();
+        } catch (Throwable failure) {
             arena.close();
-            throw new RuntimeException("Missing JVM argument: --add-opens java.base/java.lang=ALL-UNNAMED", t);
+            throw failure;
         }
-        this.virtualThreadFactory = factory;
-        this.exchangeExecutor = new ExchangeExecutor(this);
 
         int numTasks = configuredTaskCapacity(entries);
         this.tasks = new UringTask[numTasks];
@@ -467,103 +436,70 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         }
         this.emptyFdSegment = arena.allocate(4);
         this.emptyFdSegment.set(ValueLayout.JAVA_INT, 0, -1);
-        CountDownLatch initLatch = new CountDownLatch(1);
-        AtomicReference<Throwable> initError = new AtomicReference<>();
-
-        this.loopThread = Thread.ofPlatform()
-            .daemon(true)
-            .name("cardigan-loop-" + cpuId)
-            .unstarted(() -> runLoop(entries, initLatch, initError));
-        this.carrierDomain = new CarrierDomain(loopThread);
         try {
-            loopThread.start();
+            runner.startAndAwaitInitialization();
         } catch (RuntimeException | Error failure) {
             arena.close();
             throw failure;
         }
+    }
 
-        try {
-            initLatch.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            arena.close();
-            throw new RuntimeException("Interrupted initializing UringEventLoop for CPU " + cpuId, e);
+    void initialize(int entries) throws Throwable {
+        int affinityResult = ThreadAffinity.pinCurrentThread(cpuId);
+        if (affinityResult != 0) {
+            throw new IllegalStateException(
+                "Failed to pin cardigan-loop-" + cpuId
+                    + " to Linux CPU " + cpuId + ": error "
+                    + affinityResult
+                    + ". Cardigan requires pinned event loops; check the "
+                    + "process cpuset and cardigan.eventloop.cpus");
+        }
+        System.out.println(
+            "Pinned cardigan-loop-" + cpuId + " to Linux CPU " + cpuId);
+
+        this.ring = new RawUring(arena, entries, ringSetupFlags());
+
+        this.evfd = (int) Libc.eventfd.invokeExact(0, 0);
+        if (this.evfd < 0) {
+            throw new RuntimeException("eventfd creation failed: " + this.evfd);
         }
 
-        if (initError.get() != null) {
-            arena.close();
-            Throwable failure = initError.get();
-            if (failure instanceof UnsupportedKernelException unsupported) {
-                throw unsupported;
+        this.kheadSegment = ring.cqHead();
+        this.ktailSegment = ring.cqTail();
+        this.kmask = ring.cqMask();
+        this.cqesSegment = ring.cqes();
+
+        int registerResult = ring.registerFiles(
+            registeredFds, MAX_FIXED_FILES);
+        if (registerResult < 0) {
+            throw new IllegalStateException(
+                "IORING_REGISTER_FILES is required but failed for CPU "
+                    + cpuId + " with error " + registerResult
+                    + ". Check kernel support and process resource limits");
+        }
+        this.useFixedFiles = true;
+
+        submitEvfdRead();
+        initProvidedBuffers();
+    }
+
+    void abortInitialization() {
+        if (evfd >= 0) {
+            try {
+                int unused = (int) Libc.close.invokeExact(evfd);
+            } catch (Throwable ignored) {
             }
-            throw new RuntimeException(
-                "Failed to initialize UringEventLoop for CPU " + cpuId
-                    + ": " + failure.getMessage(),
-                failure);
+            evfd = -1;
+        }
+        if (ring != null) {
+            try {
+                ring.close();
+            } catch (Throwable ignored) {
+            }
         }
     }
 
-    private void runLoop(int entries, CountDownLatch initLatch, AtomicReference<Throwable> initError) {
-        try {
-            int affinityResult = ThreadAffinity.pinCurrentThread(cpuId);
-            if (affinityResult != 0) {
-                throw new IllegalStateException(
-                    "Failed to pin cardigan-loop-" + cpuId
-                        + " to Linux CPU " + cpuId + ": error "
-                        + affinityResult
-                        + ". Cardigan requires pinned event loops; check the "
-                        + "process cpuset and cardigan.eventloop.cpus");
-            }
-            System.out.println(
-                "Pinned cardigan-loop-" + cpuId + " to Linux CPU " + cpuId);
-
-            this.ring = new RawUring(
-                arena, entries, ringSetupFlags());
-
-            this.evfd = (int) Libc.eventfd.invokeExact(0, 0);
-            if (this.evfd < 0) {
-                throw new RuntimeException("eventfd creation failed: " + this.evfd);
-            }
-
-            this.kheadSegment = ring.cqHead();
-            this.ktailSegment = ring.cqTail();
-            this.kmask = ring.cqMask();
-            this.cqesSegment = ring.cqes();
-
-            int registerResult = ring.registerFiles(
-                registeredFds, MAX_FIXED_FILES);
-            if (registerResult < 0) {
-                throw new IllegalStateException(
-                    "IORING_REGISTER_FILES is required but failed for CPU "
-                        + cpuId + " with error " + registerResult
-                        + ". Check kernel support and process resource limits");
-            }
-            this.useFixedFiles = true;
-
-            submitEvfdRead();
-            initProvidedBuffers();
-
-        } catch (Throwable t) {
-            if (evfd >= 0) {
-                try {
-                    int unused = (int) Libc.close.invokeExact(evfd);
-                } catch (Throwable ignored) {
-                }
-                evfd = -1;
-            }
-            if (ring != null) {
-                try {
-                    ring.close();
-                } catch (Throwable ignored) {
-                }
-            }
-            initError.set(t);
-            initLatch.countDown();
-            return;
-        }
-
-        initLatch.countDown();
-
+    void runLoop() {
         while (!closed && wakeupFailure == null) {
             try {
                 if (!usesEpochScheduler()) {
@@ -689,8 +625,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             completionReadyTasks, COMPLETION_TURN_BUDGET, false);
         schedulerProtocolTasks += drainReadyTasks(
             protocolReadyTasks, PROTOCOL_TURN_BUDGET, false);
-        schedulerHandlerTasks += drainReadyTasks(
-            handlerReadyTasks, HANDLER_TURN_BUDGET, true);
+        schedulerApplicationTasks += drainReadyTasks(
+            applicationReadyTasks, APPLICATION_TURN_BUDGET, true);
         flushReturnedBuffers();
         schedulerEgressTasks += drainReadyTasks(
             egressReadyTasks, EGRESS_TURN_BUDGET, false);
@@ -722,7 +658,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private boolean hasSchedulerWork() {
         return !completionReadyTasks.isEmpty()
             || !protocolReadyTasks.isEmpty()
-            || !handlerReadyTasks.isEmpty()
+            || !applicationReadyTasks.isEmpty()
             || !egressReadyTasks.isEmpty()
             || !readyTasks.isEmpty()
             || returnedInboundBufferCount != 0
@@ -774,29 +710,28 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         schedulerExternalTasks += drainExternalTaskSnapshot(
             externalSnapshotTail);
 
-        // Handler submissions beyond the previous handler cutoff form the
+        // Application submissions beyond the previous cutoff form the
         // first causal range of this epoch. Seal that range before completion
         // and protocol producers append their ranges.
-        if (exchangeExecutor.sealDeferredHandlerRange()) {
-            schedulerHandlerRanges++;
+        if (applicationLane.sealDeferredRange()) {
+            schedulerApplicationRanges++;
         }
         schedulerCompletionTasks += drainProducerTaskSnapshot(
             completionReadyTasks);
         schedulerProtocolTasks += drainProducerTaskSnapshot(
             protocolReadyTasks);
 
-        // Flush direct protocol output before handler ranges. A range boundary
+        // Flush direct protocol output before application ranges. A boundary
         // then drains egress produced by that range without absorbing output
         // from the producer phases.
         flushReturnedBuffers();
         schedulerEgressTasks += drainReadyTaskSnapshot(egressReadyTasks);
 
-        exchangeExecutor.beginHandlerEpoch();
-        schedulerHandlerTasks += drainReadyTaskSnapshot(handlerReadyTasks);
+        applicationLane.beginEpoch();
+        schedulerApplicationTasks += drainReadyTaskSnapshot(applicationReadyTasks);
 
-        // Phase-end draining publishes output from handlers that parked before
-        // their range frontier and from handlers scheduled outside an
-        // exchange-worker range.
+        // Phase-end draining publishes output from application work that
+        // parked before its frontier and work scheduled outside a range.
         flushReturnedBuffers();
         schedulerEgressTasks += drainReadyTaskSnapshot(egressReadyTasks);
     }
@@ -809,10 +744,10 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             if (task == null) {
                 break;
             }
-            long handlerTail = exchangeExecutor.handlerTailSnapshot();
+            long applicationTail = applicationLane.tailSnapshot();
             runReadyTask(task);
-            if (exchangeExecutor.sealHandlerRange(handlerTail)) {
-                schedulerHandlerRanges++;
+            if (applicationLane.sealRange(applicationTail)) {
+                schedulerApplicationRanges++;
             }
             count++;
         }
@@ -820,18 +755,18 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     }
 
     /**
-     * Publishes downstream work from a mounted exchange worker. {@link EgressTask}
+     * Publishes downstream work from the application lane. {@link EgressTask}
      * is owner-internal, so draining it prepares SQEs and wakes framework waiters
      * without invoking a route. {@code io_uring_enter} publishes the prepared
      * SQEs at the epoch boundary; SQ exhaustion may publish them earlier to
      * obtain capacity.
      */
-    void handlerRangeBoundary() {
+    void applicationRangeBoundary() {
         if (!inCarrierDomain()) {
             throw new IllegalStateException(
-                "Handler range boundary escaped the epoch carrier");
+                "Application range boundary escaped the epoch carrier");
         }
-        schedulerHandlerRangeBoundaries++;
+        schedulerApplicationRangeBoundaries++;
         flushReturnedBuffers();
         schedulerEgressTasks += drainReadyTaskSnapshot(egressReadyTasks);
     }
@@ -859,7 +794,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     private boolean hasEpochSourceExcludingPendingSq() {
         return !completionReadyTasks.isEmpty()
             || !protocolReadyTasks.isEmpty()
-            || !handlerReadyTasks.isEmpty()
+            || !applicationReadyTasks.isEmpty()
             || !egressReadyTasks.isEmpty()
             || !readyTasks.isEmpty()
             || returnedInboundBufferCount != 0
@@ -867,7 +802,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             || hasCompletions()
             || ring.taskWorkPending()
             || ring.overflowPending()
-            || exchangeExecutor.hasDeferredEpochWork();
+            || applicationLane.hasDeferredWork();
     }
 
     private int drainExternalTasks(int taskLimit) {
@@ -891,8 +826,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     }
 
     private void enqueueExternalTask(Runnable task) {
-        if (task instanceof HandlerContinuation) {
-            handlerReadyTasks.addLast(task);
+        if (task instanceof ApplicationTask) {
+            applicationReadyTasks.addLast(task);
         } else if (task instanceof EgressTask) {
             egressReadyTasks.addLast(task);
         } else {
@@ -918,7 +853,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         }
         if (hasEpochSourceExcludingPendingSq()
                 || sqePending || ring.hasPendingSubmissions()) {
-            Thread.yield();
+            ReactorRunner.yieldCarrier();
         }
     }
 
@@ -1082,7 +1017,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                     task, res, flags, completionHandler);
                 return;
             }
-            if (task.opcode == Opcodes.IORING_OP_SEND) {
+            if (task.opcode == Opcodes.IORING_OP_SEND
+                    && task.retryPartialSend) {
                 handleAsyncSendCompletion(
                     task, res, flags, completionHandler);
                 return;
@@ -1091,24 +1027,15 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
                 (flags & Opcodes.IORING_CQE_F_MORE) == 0;
             if (terminal) {
                 task.completionHandler = null;
-                releaseTaskId(taskId);
+                if (!task.retainOnCompletion) {
+                    releaseTaskId(taskId);
+                }
             }
             completionHandler.onCompletion(res, flags, terminal);
             return;
         }
 
-        // Only synchronous operations publish completion state through the
-        // task before waking their parked virtual thread. Async handlers take
-        // result and flags directly and never acquire task.thread.
-        task.result = res;
-        task.flags = flags;
-        Thread vt = (Thread) TASK_THREAD_HANDLE.getAcquire(task);
-        if (vt != null
-                && (flags & Opcodes.IORING_CQE_F_MORE) == 0) {
-            TASK_THREAD_HANDLE.setRelease(task, null);
-            LockSupport.unpark(vt);
-        } else if (vt == null
-                && (flags & Opcodes.IORING_CQE_F_MORE) == 0) {
+        if ((flags & Opcodes.IORING_CQE_F_MORE) == 0) {
             releaseTaskId(taskId);
         }
     }
@@ -1317,10 +1244,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
         UringTask task = tasks[taskId];
         prepareTask(task);
-        TASK_THREAD_HANDLE.setRelease(task, null);
         task.completionHandler = completionHandler;
-        task.result = -11;
-        task.flags = 0;
+        task.retryPartialSend = opcode == Opcodes.IORING_OP_SEND;
         task.opcode = opcode;
         task.opFlags = flags;
         task.fd = fd;
@@ -1372,6 +1297,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         task.generation = generation;
         task.userData = ((long) generation << 32) | (task.id & 0xffff_ffffL);
         task.completionHandler = null;
+        task.retainOnCompletion = false;
+        task.retryPartialSend = false;
         task.vectorSlot = -1;
     }
 
@@ -1453,10 +1380,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
         UringTask task = tasks[taskId];
         prepareTask(task);
-        TASK_THREAD_HANDLE.setRelease(task, null);
         task.completionHandler = completionHandler;
-        task.result = -11;
-        task.flags = 0;
         task.vectorSlot = vectorSlot;
         task.vectorIndex = 0;
         task.vectorCount = count;
@@ -1497,9 +1421,11 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
         UringTask task = tasks[taskId];
         prepareTask(task);
-        TASK_THREAD_HANDLE.setRelease(task, Thread.currentThread());
-        task.result = -11;
-        task.flags = 0;
+        ApplicationRuntime.CompletionWait waiter =
+            applicationRuntime.beginCompletionWait();
+        task.completionHandler = waiter;
+        task.retainOnCompletion = true;
+        task.opcode = opcode;
 
         try {
             MemorySegment sqeRaw = ring.getSqe();
@@ -1525,23 +1451,18 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             sqe.set(ValueLayout.JAVA_SHORT, 40, bufGroup);
             sqePending = true;
         } catch (Throwable t) {
-            task.result = -5;
-            TASK_THREAD_HANDLE.setRelease(task, null);
+            task.completionHandler = null;
+            waiter.abandon();
             releaseTaskId(taskId);
             return -5;
         }
 
-        awaitCompletion(task);
-        int result = task.result;
+        int result = waiter.awaitResult();
         releaseTaskId(taskId);
         return result;
     }
 
-    /**
-     * Asynchronously installs a raw descriptor into a kernel-selected fixed
-     * slot. The calling virtual thread parks until the FILES_UPDATE CQE, so
-     * registration never pins the fused carrier in io_uring_register.
-     */
+    /** Installs a descriptor into a kernel-selected fixed-file slot. */
     public int registerFixedFd(int clientFd) {
         if (!useFixedFiles) {
             throw new IllegalStateException(
@@ -1554,9 +1475,10 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         }
         UringTask task = tasks[taskId];
         prepareTask(task);
-        TASK_THREAD_HANDLE.setRelease(task, Thread.currentThread());
-        task.result = -11;
-        task.flags = 0;
+        ApplicationRuntime.CompletionWait waiter =
+            applicationRuntime.beginCompletionWait();
+        task.completionHandler = waiter;
+        task.retainOnCompletion = true;
 
         long valueOffset = (long) taskId * 4;
         fileUpdateValues.set(ValueLayout.JAVA_INT, valueOffset, clientFd);
@@ -1570,15 +1492,15 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             );
             sqePending = true;
         } catch (Throwable failure) {
-            TASK_THREAD_HANDLE.setRelease(task, null);
+            task.completionHandler = null;
+            waiter.abandon();
             releaseTaskId(taskId);
             throw new IllegalStateException(
                 "Submitting asynchronous fixed-file allocation failed",
                 failure);
         }
 
-        awaitCompletion(task);
-        int result = task.result;
+        int result = waiter.awaitResult();
         int slot = result == 1
             ? fileUpdateValues.get(ValueLayout.JAVA_INT, valueOffset)
             : -1;
@@ -1616,9 +1538,10 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         }
         UringTask task = tasks[taskId];
         prepareTask(task);
-        TASK_THREAD_HANDLE.setRelease(task, Thread.currentThread());
-        task.result = -11;
-        task.flags = 0;
+        ApplicationRuntime.CompletionWait waiter =
+            applicationRuntime.beginCompletionWait();
+        task.completionHandler = waiter;
+        task.retainOnCompletion = true;
         long valueOffset = (long) taskId * 4;
         fileUpdateValues.set(ValueLayout.JAVA_INT, valueOffset, clientFd);
         try {
@@ -1631,14 +1554,14 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             );
             sqePending = true;
         } catch (Throwable failure) {
-            TASK_THREAD_HANDLE.setRelease(task, null);
+            task.completionHandler = null;
+            waiter.abandon();
             releaseTaskId(taskId);
             freeFixedSlots.offer(slot);
             throw new IllegalStateException(
                 "Submitting asynchronous fixed-file update failed", failure);
         }
-        awaitCompletion(task);
-        int result = task.result;
+        int result = waiter.awaitResult();
         releaseTaskId(taskId);
         if (result != 1) {
             freeFixedSlots.offer(slot);
@@ -1754,20 +1677,21 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         }
         UringTask task = tasks[taskId];
         prepareTask(task);
-        TASK_THREAD_HANDLE.setRelease(task, Thread.currentThread());
-        task.result = -11;
-        task.flags = 0;
+        ApplicationRuntime.CompletionWait waiter =
+            applicationRuntime.beginCompletionWait();
+        task.completionHandler = waiter;
+        task.retainOnCompletion = true;
         try {
             MemorySegment sqe = reserveSqe();
             prepareDirectCloseSqe(sqe, slot, task.userData);
             sqePending = true;
         } catch (Throwable failure) {
-            TASK_THREAD_HANDLE.setRelease(task, null);
+            task.completionHandler = null;
+            waiter.abandon();
             releaseTaskId(taskId);
             return -5;
         }
-        awaitCompletion(task);
-        int result = task.result;
+        int result = waiter.awaitResult();
         releaseTaskId(taskId);
         if (directCloseSucceeded(result)) {
             fixedFileReleased(slot);
@@ -1786,9 +1710,6 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         }
         UringTask task = tasks[taskId];
         prepareTask(task);
-        TASK_THREAD_HANDLE.setRelease(task, null);
-        task.result = -11;
-        task.flags = 0;
         task.completionHandler = (result, flags, terminal) -> {
             if (terminal && directCloseSucceeded(result)) {
                 fixedFileReleased(slot);
@@ -1921,9 +1842,10 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
         UringTask task = tasks[taskId];
         prepareTask(task);
-        TASK_THREAD_HANDLE.setRelease(task, Thread.currentThread());
-        task.result = -11; 
-        task.flags = 0;
+        ApplicationRuntime.CompletionWait waiter =
+            applicationRuntime.beginCompletionWait();
+        task.completionHandler = waiter;
+        task.retainOnCompletion = true;
 
         try {
             MemorySegment sqeRaw = ring.getSqe();
@@ -1949,15 +1871,14 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             sqe.set(ValueLayout.JAVA_SHORT, 40, bgid);
             sqePending = true;
         } catch (Throwable t) {
-            task.result = -5;
-            TASK_THREAD_HANDLE.setRelease(task, null);
+            task.completionHandler = null;
+            waiter.abandon();
             releaseTaskId(taskId);
             return new RecvResult(-5, -1);
         }
 
-        awaitCompletion(task);
-        int res = task.result;
-        int flags = task.flags;
+        int res = waiter.awaitResult();
+        int flags = waiter.flags();
         releaseTaskId(taskId);
 
         int bid = ((flags & Opcodes.IORING_CQE_F_BUFFER) != 0) ? ((flags >> Opcodes.IORING_CQE_BUFFER_SHIFT) & 0xFFFF) : -1;
@@ -1976,7 +1897,6 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
         UringTask task = tasks[taskId];
         prepareTask(task);
-        TASK_THREAD_HANDLE.setRelease(task, null);
         task.completionHandler = completionHandler;
         task.opcode = Opcodes.IORING_OP_RECV;
         task.opFlags = fixedSlot >= 0
@@ -2031,7 +1951,6 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
         UringTask task = tasks[taskId];
         prepareTask(task);
-        TASK_THREAD_HANDLE.setRelease(task, null);
         task.completionHandler = completionHandler;
         task.opcode = Opcodes.IORING_OP_RECVMSG;
         task.opFlags = fixedSlot >= 0
@@ -2105,11 +2024,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         return recvTargeted(fd, buf, len, -1);
     }
 
-    /**
-     * Parks the current virtual thread until a socket becomes readable or
-     * writable. This is primarily used to resume nonblocking native protocol
-     * engines such as OpenSSL after WANT_READ/WANT_WRITE.
-     */
+    /** Waits for socket readiness through an io_uring poll operation. */
     public int awaitSocketReady(int fd, int fixedSlot, int pollEvents) {
         byte opFlags = fixedSlot >= 0
             ? Opcodes.IOSQE_FIXED_FILE
@@ -2335,7 +2250,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             return;
         }
         chunk.beginExternalReturn();
-        execute(chunk);
+        executeProtocol(chunk);
     }
 
     private int validatePooledInboundChunk(InboundChunk chunk) {
@@ -2431,7 +2346,6 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
         UringTask task = tasks[taskId];
         prepareTask(task);
-        TASK_THREAD_HANDLE.setRelease(task, null);
         task.completionHandler = completionHandler;
         task.opcode = Opcodes.IORING_OP_ACCEPT;
         task.fd = serverFd;
@@ -2514,34 +2428,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         return submitOp(Opcodes.IORING_OP_NOP, (byte) 0, -1, 0L, 0, 0L, 0, (short) 0);
     }
 
-    public Thread startVirtualThread(Runnable task) {
-        Thread vt = virtualThreadFactory.newThread(task);
-        vt.start();
-        return vt;
-    }
-
-    Thread newVirtualThread(java.util.concurrent.Executor scheduler, Runnable task, String name) {
-        try {
-            Class<?> builderClass = Class.forName("java.lang.ThreadBuilders$VirtualThreadBuilder");
-            java.lang.reflect.Constructor<?> ctor =
-                builderClass.getDeclaredConstructor(java.util.concurrent.Executor.class);
-            ctor.setAccessible(true);
-            Thread.Builder.OfVirtual builder = (Thread.Builder.OfVirtual) ctor.newInstance(scheduler);
-            return builder.name(name).unstarted(task);
-        } catch (Throwable t) {
-            throw new RuntimeException(
-                "Missing JVM argument: --add-opens java.base/java.lang=ALL-UNNAMED",
-                t
-            );
-        }
-    }
-
-    public java.util.concurrent.ThreadFactory getVirtualThreadFactory() {
-        return virtualThreadFactory;
-    }
-
     boolean inCarrierDomain() {
-        return carrierDomain.containsCurrentThread();
+        return applicationRuntime.inCarrierDomain();
     }
 
     boolean usesEpochScheduler() {
@@ -2552,12 +2440,24 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         return schedulerEpoch;
     }
 
-    ExchangeExecutor exchangeExecutor() {
-        return exchangeExecutor;
+    ApplicationLane applicationLane() {
+        return applicationLane;
+    }
+
+    ApplicationDispatcher applicationDispatcher() {
+        return applicationLane;
+    }
+
+    BlockingSupport blockingSupport() {
+        return applicationRuntime;
     }
 
     int exchangeWorkerCount() {
-        return exchangeExecutor.workerCount();
+        return applicationRuntime.workerCount();
+    }
+
+    ApplicationRuntime applicationRuntime() {
+        return applicationRuntime;
     }
 
     static int configuredMaxHttp2ParkedSenders() {
@@ -2638,21 +2538,6 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         int admissionWaiters
     ) {}
 
-    record VirtualThreadStats(
-        long coreMounts,
-        long coreUnmounts,
-        long handlerMounts,
-        long handlerUnmounts
-    ) {
-        long mounts() {
-            return coreMounts + handlerMounts;
-        }
-
-        long unmounts() {
-            return coreUnmounts + handlerUnmounts;
-        }
-    }
-
     TaskPoolStats taskPoolStats() {
         return new TaskPoolStats(
             tasks.length,
@@ -2669,9 +2554,9 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             schedulerCqes,
             schedulerCompletionTasks,
             schedulerProtocolTasks,
-            schedulerHandlerTasks,
-            schedulerHandlerRanges,
-            schedulerHandlerRangeBoundaries,
+            schedulerApplicationTasks,
+            schedulerApplicationRanges,
+            schedulerApplicationRangeBoundaries,
             schedulerEgressTasks,
             schedulerExternalTasks,
             schedulerTaskWorkEnters,
@@ -2691,13 +2576,8 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         );
     }
 
-    VirtualThreadStats virtualThreadStats() {
-        return new VirtualThreadStats(
-            coreVirtualThreadMounts,
-            coreVirtualThreadUnmounts,
-            handlerVirtualThreadMounts,
-            handlerVirtualThreadUnmounts
-        );
+    ApplicationRuntime.VirtualThreadStats virtualThreadStats() {
+        return applicationRuntime.stats();
     }
 
     boolean tryAcquireHttp2ParkedSender() {
@@ -2717,19 +2597,6 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
 
     int http2ParkedSenderCount() {
         return http2ParkedSenders.get();
-    }
-
-    private static void awaitCompletion(UringTask task) {
-        boolean interrupted = false;
-        while (TASK_THREAD_HANDLE.getAcquire(task) != null) {
-            LockSupport.park(task);
-            if (TASK_THREAD_HANDLE.getAcquire(task) != null && Thread.interrupted()) {
-                interrupted = true;
-            }
-        }
-        if (interrupted) {
-            Thread.currentThread().interrupt();
-        }
     }
 
     private void triggerWakeup() {
@@ -2764,7 +2631,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         // A permanent eventfd failure leaves no normal way to interrupt the
         // blocking enter. Mark the loop failed first, then make a best-effort
         // attempt to break the carrier out of the syscall.
-        loopThread.interrupt();
+        runner.interrupt();
         return new RejectedExecutionException(
             "Event loop wakeup channel failed", failure);
     }
@@ -2787,16 +2654,9 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         }
     }
 
-    @Override
-    public void execute(Runnable command) {
+    void enqueueCoreContinuation(Runnable command) {
         if (inCarrierDomain()) {
-            if (command instanceof HandlerContinuation) {
-                handlerReadyTasks.addLast(command);
-            } else if (command instanceof EgressTask) {
-                egressReadyTasks.addLast(command);
-            } else if (command instanceof ProtocolTask) {
-                protocolReadyTasks.addLast(command);
-            } else if (dispatchingCompletions) {
+            if (dispatchingCompletions) {
                 completionReadyTasks.addLast(command);
             } else {
                 protocolReadyTasks.addLast(command);
@@ -2807,40 +2667,17 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
         enqueueExternal(command);
     }
 
-    private void executeCountedCoreContinuation(Runnable continuation) {
-        execute(new CountedCoreContinuation(continuation));
-    }
-
-    void runCountedHandlerContinuation(Runnable continuation) {
-        handlerVirtualThreadMounts++;
-        try {
-            continuation.run();
-        } finally {
-            handlerVirtualThreadUnmounts++;
-        }
-    }
-
-    private final class CountedCoreContinuation implements Runnable {
-        private final Runnable continuation;
-
-        private CountedCoreContinuation(Runnable continuation) {
-            this.continuation = continuation;
-        }
-
-        @Override
-        public void run() {
-            coreVirtualThreadMounts++;
-            try {
-                continuation.run();
-            } finally {
-                coreVirtualThreadUnmounts++;
-            }
-        }
-    }
-
-    void executeHandler(HandlerContinuation command) {
+    public void executeProtocol(Runnable command) {
         if (inCarrierDomain()) {
-            handlerReadyTasks.addLast(command);
+            protocolReadyTasks.addLast(command);
+            return;
+        }
+        enqueueExternal(command);
+    }
+
+    void executeApplication(ApplicationTask command) {
+        if (inCarrierDomain()) {
+            applicationReadyTasks.addLast(command);
             return;
         }
         enqueueExternal(command);
@@ -2876,9 +2713,9 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
     public synchronized void close() {
         if (resourcesClosed) return;
         if (!closed) {
-            exchangeExecutor.close();
+            applicationRuntime.close();
             boolean workersStopped =
-                exchangeExecutor.awaitTermination(2_000);
+                applicationRuntime.awaitTermination(2_000);
             if (!workersStopped) {
                 throw new IllegalStateException(
                     "Exchange workers for CPU " + cpuId
@@ -2889,23 +2726,7 @@ public class UringEventLoop implements AutoCloseable, java.util.concurrent.Execu
             writeWakeupEvent();
         }
 
-        try {
-            loopThread.join(2000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-
-        if (loopThread.isAlive()) {
-            StackTraceElement[] carrierStack = loopThread.getStackTrace();
-            String carrierLocation = carrierStack.length == 0
-                ? "unknown"
-                : carrierStack[0].toString();
-            throw new IllegalStateException(
-                "Event-loop carrier for CPU " + cpuId
-                    + " did not terminate; retaining its live io_uring "
-                    + "and native memory (state=" + loopThread.getState()
-                    + ", at=" + carrierLocation + ")");
-        }
+        runner.awaitTermination();
 
         if (TASK_POOL_STATS_ENABLED) {
             TaskPoolStats stats = taskPoolStats();

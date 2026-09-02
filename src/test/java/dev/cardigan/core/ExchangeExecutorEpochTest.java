@@ -21,7 +21,7 @@ class ExchangeExecutorEpochTest {
         try (UringEventLoop loop = new UringEventLoop(
                 0, 64, 512, false,
                 UringEventLoop.SchedulerMode.EPOCH)) {
-            ExchangeExecutor executor = loop.exchangeExecutor();
+            ApplicationLane executor = loop.applicationLane();
             CompletableFuture<Long> firstEpoch = new CompletableFuture<>();
             CompletableFuture<Long> deferredEpoch = new CompletableFuture<>();
             CompletableFuture<Boolean> firstAccepted =
@@ -29,7 +29,7 @@ class ExchangeExecutorEpochTest {
             CompletableFuture<Boolean> deferredAccepted =
                 new CompletableFuture<>();
 
-            loop.execute(() -> firstAccepted.complete(executor.submit(() -> {
+            loop.executeProtocol(() -> firstAccepted.complete(executor.submit(() -> {
                     firstEpoch.complete(loop.schedulerEpoch());
                     deferredAccepted.complete(executor.submit(
                         () -> deferredEpoch.complete(loop.schedulerEpoch())));

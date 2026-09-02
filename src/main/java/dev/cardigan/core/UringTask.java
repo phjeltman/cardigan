@@ -6,10 +6,9 @@ public class UringTask {
     public final int id;
     public int generation;
     public long userData;
-    public Thread thread;
     public UringEventLoop.CompletionHandler completionHandler;
-    public int result;
-    public int flags;
+    public boolean retainOnCompletion;
+    public boolean retryPartialSend;
     public int vectorSlot = -1;
     public int vectorIndex;
     public int vectorCount;

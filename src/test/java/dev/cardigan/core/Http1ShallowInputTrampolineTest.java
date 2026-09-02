@@ -244,9 +244,9 @@ class Http1ShallowInputTrampolineTest {
         long deadline = System.nanoTime() + 2_000_000_000L;
         StackTraceElement[] last = new StackTraceElement[0];
         while (System.nanoTime() < deadline) {
-            Thread owner = connectionOwner(server);
+            ApplicationRuntime.RuntimeTask owner = connectionOwner(server);
             if (owner != null) {
-                last = owner.getStackTrace();
+                last = owner.stackTrace();
                 boolean cqeDriver =
                     CardiganServer.http1CqeDriverEnabled();
                 if (cqeDriver && hasFrame(last, "awaitOutcome")) {
@@ -266,7 +266,8 @@ class Http1ShallowInputTrampolineTest {
                 + java.util.Arrays.toString(last));
     }
 
-    private static Thread connectionOwner(CardiganServer server)
+    private static ApplicationRuntime.RuntimeTask connectionOwner(
+            CardiganServer server)
         throws Exception {
         Field connectionsField =
             CardiganServer.class.getDeclaredField("activeConnections");
@@ -278,7 +279,7 @@ class Http1ShallowInputTrampolineTest {
         }
         Field ownerField = connection.getClass().getDeclaredField("owner");
         ownerField.setAccessible(true);
-        return (Thread) ownerField.get(connection);
+        return (ApplicationRuntime.RuntimeTask) ownerField.get(connection);
     }
 
     private static boolean hasFrame(

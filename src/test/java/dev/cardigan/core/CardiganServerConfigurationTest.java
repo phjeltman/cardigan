@@ -12,6 +12,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -58,8 +59,44 @@ class CardiganServerConfigurationTest {
         }
     }
 
+    @Test
+    void listenersShareOneRuntimeLoopSet() throws Exception {
+        int firstPort = PORT + 1;
+        int secondPort = PORT + 2;
+        try (CardiganRuntime runtime = CardiganRuntime.builder()
+                .eventLoops(1)
+                .build();
+             CardiganServer first = CardiganServer.builder()
+                .port(firstPort)
+                .runtime(runtime)
+                .protocol(ProtocolMode.HTTP1_ONLY)
+                .plaintext()
+                .routes(new ApplicationController())
+                .build();
+             CardiganServer second = CardiganServer.builder()
+                .port(secondPort)
+                .runtime(runtime)
+                .protocol(ProtocolMode.HTTP1_ONLY)
+                .plaintext()
+                .routes(new ApplicationController())
+                .build()) {
+            first.start();
+            second.start();
+
+            assertEquals(1, runtime.eventLoops().size());
+            assertTrue(request(firstPort, "/application").startsWith(
+                "HTTP/1.1 200 OK"));
+            assertTrue(request(secondPort, "/application").startsWith(
+                "HTTP/1.1 200 OK"));
+        }
+    }
+
     private static String request(String path) throws Exception {
-        try (Socket socket = new Socket("127.0.0.1", PORT)) {
+        return request(PORT, path);
+    }
+
+    private static String request(int port, String path) throws Exception {
+        try (Socket socket = new Socket("127.0.0.1", port)) {
             socket.setSoTimeout(2_000);
             socket.getOutputStream().write((
                 "GET " + path + " HTTP/1.1\r\n"
